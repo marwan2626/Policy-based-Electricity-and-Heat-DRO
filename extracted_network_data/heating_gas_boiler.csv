@@ -1,0 +1,2 @@
+boiler_id,name,return_junction,flow_junction,p_flow_bar,t_flow_k,mdot_flow_kg_per_s,in_service,type
+0,central_circulation_pump,124,28,15.0,358.15,6.0,True,pt

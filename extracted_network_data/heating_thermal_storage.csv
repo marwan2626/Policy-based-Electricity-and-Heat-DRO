@@ -1,0 +1,2 @@
+storage_id,junction_from,junction_to,capacity_kwh,max_power_kw,efficiency,initial_soc,min_soc,max_soc,name,location_note
+0,121,124,100,50,0.9,0.5,0.1,0.9,thermal_storage_hp_to_circ,Between heat_pump(121) and thermal_storage_supply(124)

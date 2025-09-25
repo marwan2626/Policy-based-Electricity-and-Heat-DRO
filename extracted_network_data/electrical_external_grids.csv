@@ -1,0 +1,2 @@
+ext_grid_id,name,bus,vm_pu,va_degree,slack_weight,in_service,profile,min_p_mw,subnet,sn_mva,phys_type,voltLvl,type,p_disp_mw,max_p_mw,min_q_mvar,max_q_mvar
+0,MV1.101 grid at LV4.101,0,1.0,0.0,1.0,True,,,LV4.101_MV1.101_eq,,ExternalNet,5,,,,,

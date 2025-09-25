@@ -1,0 +1,2 @@
+device_type,device_name,electrical_bus_id,electrical_load_name,thermal_junction_id,thermal_hx_name,coupling_factor_cop,thermal_power_w,notes
+heat_pump,HP.101,29,HP.101 Load 2,121,central_heat_pump_main_return,2.0,9000.0,Central heat pump coupling electrical bus 29 to thermal junction 121
