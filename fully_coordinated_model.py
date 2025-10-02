@@ -70,7 +70,7 @@ print("LOADING AND PROCESSING LOAD PROFILE")
 print("="*80)
 
 # Default optimization parameters
-START_DATE = "2023-01-10 00:00:00"  # Can be modified when running the optimization
+START_DATE = "2023-06-10 00:00:00"  # Can be modified when running the optimization
 DURATION_HOURS = 24  # Can be modified when running the optimization
 
 # Allow runtime override of START_DATE/DURATION_HOURS via CLI args or environment
@@ -2661,9 +2661,6 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     print(f"Added variables: {len(all_junctions) * NUM_PERIODS} temperature vars + {NUM_PERIODS} heat pump vars + {NUM_PERIODS} slack vars + {4 * NUM_PERIODS} thermal storage vars + {len(actual_pipe_keys) * NUM_PERIODS} pipe vars")
     print(f"Total variables: {model.NumVars}")
     
-    # COST-BASED OBJECTIVE: Minimize total operational cost
-    # Heat pump cost: 10 (cheaper, preferred operation)
-    # Slack heat cost: 100 (expensive, only when heat pump insufficient)
     
     ####################################################################################################
     # THERMAL STORAGE PARAMETERS (Series Configuration)
@@ -3251,6 +3248,15 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     
     # Optimize
     print(f"\nStarting multi-period optimization...")
+
+    # Determine timestep duration in hours for energy-based costs
+    try:
+        if 'time_index' in globals() and len(time_index) >= 2:
+            dt_hours = max(1/60.0, (time_index[1] - time_index[0]).total_seconds() / 3600.0)
+        else:
+            dt_hours = 1.0
+    except Exception:
+        dt_hours = 1.0
     
     COST_SLACK = 100         # Cost per Wh of slack heat (expensive backup)
     
@@ -3258,10 +3264,11 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     
     print(f"COST-BASED Objective: Minimize total operational cost over {NUM_PERIODS} periods")
 
-    electricity_cost =  gp.quicksum(electricity_price[t] * (ext_grid_import_P_vars[t] + ext_grid_export_P_vars[t]) for t in time_steps)
-    bess_cost = gp.quicksum(bess_cost_per_mwh * (bess_charge_vars[t][bus] + bess_discharge_vars[t][bus]) for bus in bess_buses for t in time_steps) if len(bess_buses) > 0 else 0
-    y_cap_cost = gp.quicksum(2 * electricity_price[t] * flex_curtail_P_vars[t] for t in time_steps)
-    pv_curtail_cost = gp.quicksum(electricity_price[t] * curtailment_vars[t][bus] for bus in pv_buses for t in time_steps) if len(pv_buses) > 0 else 0
+    electricity_cost =  gp.quicksum(electricity_price[t] * (ext_grid_import_P_vars[t] + ext_grid_export_P_vars[t]) * dt_hours for t in time_steps)
+    bess_cost = gp.quicksum(bess_cost_per_mwh * (bess_charge_vars[t][bus] + bess_discharge_vars[t][bus]) * dt_hours for bus in bess_buses for t in time_steps) if len(bess_buses) > 0 else 0
+    # Aggregate flexible curtailment cost (if any flexible curtail vars were created)
+    y_cap_cost = gp.quicksum(2 * electricity_price[t] * flex_curtail_P_vars[t] * dt_hours for t in flex_curtail_P_vars.keys()) if len(flex_curtail_P_vars) > 0 else 0
+    pv_curtail_cost = gp.quicksum(electricity_price[t] * curtailment_vars[t][bus] * dt_hours for bus in pv_buses for t in time_steps) if len(pv_buses) > 0 else 0
 
     # Objective: Minimize total cost (import, export, and curtailment costs)
     total_cost = electricity_cost + bess_cost + y_cap_cost + pv_curtail_cost + total_slack_cost

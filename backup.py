@@ -1904,23 +1904,28 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         R = np.real(Zbus_reduced)
         X = np.imag(Zbus_reduced)
 
-        # Build per-bus active power uncertainty sigma (MW) for DRCC tightening using PV/HP info
+        # Build per-bus active/reactive power uncertainty for DRCC tightening using PV/HP info
         sigmaP_MW_by_bus = None
+        sigmaQ_MVar_by_bus = None
         sigmaP_pu_vec = None
         if ENABLE_DRCC_NETWORK_TIGHTENING and (k_epsilon is not None):
             const_pv_std_arr = globals().get('const_pv_std', np.zeros(len(time_steps)))
             T_amb_std_arr = globals().get('T_amb_std', np.zeros(len(time_steps)))
             hp_temp_sens = abs(0.30 * (-0.010871))  # MW per K
             sigmaP_MW_by_bus = {bus: 0.0 for bus in net.bus.index}
+            sigmaQ_MVar_by_bus = {bus: 0.0 for bus in net.bus.index}
             # PV deviations per PV bus
             for bus in pv_buses:
                 sigmaP_MW_by_bus[bus] += float(const_pv_std_arr[t]) * float(base_pv_bus_limits.get(bus, 0.0))
+                # PV assumed unity PF here => no reactive deviation contribution
             # HP deviations spread across HP load buses
             if len(hp_load_buses) > 0:
                 total_hp_sigma = hp_temp_sens * float(T_amb_std_arr[t])
                 per_bus_hp_sigma = total_hp_sigma / float(len(hp_load_buses))
                 for bus in hp_load_buses:
                     sigmaP_MW_by_bus[bus] += per_bus_hp_sigma
+                    # Map HP P sigma to Q sigma using fixed PF (inductive): Q = P * tan(arccos(pf_HP))
+                    sigmaQ_MVar_by_bus[bus] += per_bus_hp_sigma * qfactor_heatpump
             # Per-unit vector aligned to non_slack_buses order
             sigmaP_pu_vec = np.array([sigmaP_MW_by_bus[bus] / net.sn_mva for bus in non_slack_buses], dtype=float)
 
@@ -1943,9 +1948,15 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
 
                 # Optional DRCC tightening on voltages using linear LDF sensitivity proxy
                 if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_VOLTAGES and (k_epsilon is not None) and (sigmaP_pu_vec is not None):
-                    # Linear LDF on squared voltage: V^2 ≈ 1 + 2*(R·P_pu + X·Q_pu); consider only P uncertainty
+                    # Linear LDF on squared voltage: V^2 ≈ 1 + 2*(R·P_pu + X·Q_pu); include P and Q uncertainty
                     R_row = np.array([R[i, j] for j in range(len(non_slack_buses))], dtype=float)
-                    delta_v = float(2.0 * k_epsilon * np.sqrt(np.sum((R_row * sigmaP_pu_vec) ** 2)))
+                    X_row = np.array([X[i, j] for j in range(len(non_slack_buses))], dtype=float)
+                    # Build sigmaQ per-unit vector aligned to non_slack_buses if available
+                    if 'sigmaQ_MVar_by_bus' in locals() and sigmaQ_MVar_by_bus is not None:
+                        sigmaQ_pu_vec = np.array([sigmaQ_MVar_by_bus.get(b, 0.0) / net.sn_mva for b in non_slack_buses], dtype=float)
+                    else:
+                        sigmaQ_pu_vec = np.zeros_like(sigmaP_pu_vec)
+                    delta_v = float(2.0 * k_epsilon * np.sqrt(np.sum((R_row * sigmaP_pu_vec) ** 2) + np.sum((X_row * sigmaQ_pu_vec) ** 2)))
                     tight_v_min = max(0.0, base_v_min + delta_v)
                     tight_v_max = max(0.0, base_v_max - delta_v)
                 else:
@@ -2004,8 +2015,12 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_LINES and (k_epsilon is not None) and (sigmaP_MW_by_bus is not None):
                 # Radial approximation: branch P deviation equals sum of downstream bus deviations on 'to_bus' side
                 downstream_set = set(downstream_map[to_bus]) | {to_bus}
-                sigmaP_branch = float(sum(sigmaP_MW_by_bus.get(b, 0.0) for b in downstream_set))
-                S_branch_limit = 0.8 * S_rated_line - k_epsilon * sigmaP_branch
+                sigmaP_branch = float(np.sqrt(np.sum([sigmaP_MW_by_bus.get(b, 0.0)**2 for b in downstream_set])))
+                sigmaQ_branch = 0.0
+                if 'sigmaQ_MVar_by_bus' in locals() and sigmaQ_MVar_by_bus is not None:
+                    sigmaQ_branch = float(np.sqrt(np.sum([sigmaQ_MVar_by_bus.get(b, 0.0)**2 for b in downstream_set])))
+                sigmaS_branch = float(np.sqrt(sigmaP_branch**2 + sigmaQ_branch**2))
+                S_branch_limit = 0.8 * S_rated_line - k_epsilon * sigmaS_branch
                 S_branch_limit = max(0.0, S_branch_limit)
             else:
                 S_branch_limit = 0.8 * S_rated_line
@@ -2040,9 +2055,15 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             S_rated = net.trafo.sn_mva.iloc[trafo_idx]
         
             if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_TRAFO and (k_epsilon is not None) and (sigmaP_MW_by_bus is not None):
-                # Aggregate transformer deviation as sqrt of per-bus variances (independent approximation)
-                sigma_trafo = float(np.sqrt(np.sum(np.array(list(sigmaP_MW_by_bus.values()), dtype=float) ** 2)))
-                S_limit = 0.8*S_rated - k_epsilon * sigma_trafo
+                # Downstream-only propagation for radial LDF: use LV bus downstream set
+                downstream_set = set(downstream_map[lv_bus]) | {lv_bus}
+                # Active and reactive std aggregations (independent across buses)
+                sigmaP_trafo = float(np.sqrt(np.sum([sigmaP_MW_by_bus.get(b, 0.0)**2 for b in downstream_set])))
+                sigmaQ_trafo = 0.0
+                if sigmaQ_MVar_by_bus is not None:
+                    sigmaQ_trafo = float(np.sqrt(np.sum([sigmaQ_MVar_by_bus.get(b, 0.0)**2 for b in downstream_set])))
+                sigmaS_trafo = float(np.sqrt(sigmaP_trafo**2 + sigmaQ_trafo**2))
+                S_limit = 0.8*S_rated - k_epsilon * sigmaS_trafo
                 S_limit = max(0.0, S_limit)
             else:
                 S_limit = 0.8*S_rated
@@ -2155,11 +2176,11 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         # --- Robust no-scenario affine recourse: budgets, variables, constraints, and proxy costs ---
         alpha_plus = 0.10
         alpha_minus = 0.10
-        cap_price_factor = 0.20
-        imb_up_factor = 1.30
-        imb_dn_factor = 1.00
-        pv_curt_price_factor = 1.00
-        bess_rt_price_per_mw = 2.0
+        cap_price_factor = 20
+        imb_up_factor = 130
+        imb_dn_factor = 100
+        pv_curt_price_factor = 100
+        bess_rt_price_per_mw = 200
 
         try:
             if len(time_index) >= 2:
@@ -2299,6 +2320,74 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     if model.status == GRB.OPTIMAL:
         print(f"OPF Optimal Objective Value: {model.ObjVal}")
         #print("\n--- Debugging P_abs and P_branch Values ---\n")
+        # Post-solve quick summary (as requested): epsilon, kappa, max transformer and line loading
+        try:
+            eps_val = float(DRCC_EPSILON) if 'DRCC_EPSILON' in globals() else None
+        except Exception:
+            eps_val = None
+        try:
+            if eps_val is not None and 0.0 < eps_val < 1.0:
+                kappa_val = float(np.sqrt((1.0 - eps_val) / eps_val))
+            else:
+                kappa_val = None
+        except Exception:
+            kappa_val = None
+
+        # Compute maximum transformer loading (%) across all periods/transformers
+        max_trafo_loading_pct = None
+        try:
+            if len(net.trafo.index) > 0:
+                max_trafo_loading_pct = 0.0
+                for t in time_steps:
+                    for trafo in net.trafo.itertuples():
+                        idx = trafo.Index
+                        s_mva = float(trafo.sn_mva)
+                        p = float(P_trafo_vars[t, idx].X)
+                        q = float(Q_trafo_vars[t, idx].X)
+                        loading_pct = (np.sqrt(p*p + q*q) / max(1e-9, s_mva)) * 100.0
+                        if loading_pct > max_trafo_loading_pct:
+                            max_trafo_loading_pct = loading_pct
+        except Exception:
+            max_trafo_loading_pct = None
+
+        # Compute maximum line loading (%) across all periods/lines
+        max_line_loading_pct = None
+        try:
+            if len(net.line.index) > 0:
+                max_line_loading_pct = 0.0
+                for t in time_steps:
+                    for line in net.line.itertuples():
+                        idx = line.Index
+                        from_bus = int(line.from_bus)
+                        vn_kv = float(net.bus.at[from_bus, 'vn_kv'])
+                        imax_ka = float(line.max_i_ka)
+                        p = float(P_branch_vars[t, idx].X)
+                        q = float(Q_branch_vars[t, idx].X)
+                        v_pu = float(V_vars[t, from_bus].X)
+                        s_mag = np.sqrt(p*p + q*q)
+                        denom = (np.sqrt(3.0) * max(1e-6, v_pu) * vn_kv * max(1e-9, imax_ka))
+                        loading_pct = (s_mag / denom) * 100.0
+                        if loading_pct > max_line_loading_pct:
+                            max_line_loading_pct = loading_pct
+        except Exception:
+            max_line_loading_pct = None
+
+        # Print the summary line before the cost breakdown
+        try:
+            eps_text = f"epsilon={eps_val:.4f}" if eps_val is not None else "epsilon=N/A"
+            kap_text = f"kappa={kappa_val:.4f}" if kappa_val is not None else "kappa=N/A"
+        except Exception:
+            eps_text = f"epsilon={eps_val}" if eps_val is not None else "epsilon=N/A"
+            kap_text = f"kappa={kappa_val}" if kappa_val is not None else "kappa=N/A"
+
+        try:
+            trafo_text = f"max_trafo_loading={max_trafo_loading_pct:.2f}%" if max_trafo_loading_pct is not None else "max_trafo_loading=N/A"
+            line_text = f"max_line_loading={max_line_loading_pct:.2f}%" if max_line_loading_pct is not None else "max_line_loading=N/A"
+        except Exception:
+            trafo_text = f"max_trafo_loading={max_trafo_loading_pct}%" if max_trafo_loading_pct is not None else "max_trafo_loading=N/A"
+            line_text = f"max_line_loading={max_line_loading_pct}%" if max_line_loading_pct is not None else "max_line_loading=N/A"
+
+        print(f"{eps_text} | {kap_text} | {trafo_text} | {line_text}")
     
         # Extract optimized values for PV generation, external grid power, loads, and theta
         for t in time_steps:
@@ -2579,8 +2668,27 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         except Exception:
             pass
         
-        results_df.to_csv('dso_model_v2_results.csv', index=False)
-        print(f"\nResults saved to: dso_model_v2_results.csv")
+        # Build DRCC-aware suffix for CSV filename
+        try:
+            eps_val = float(DRCC_EPSILON)
+        except Exception:
+            eps_val = None
+        try:
+            drcc_active = bool(ENABLE_DRCC_NETWORK_TIGHTENING or ENABLE_DRCC_RT_BUDGETS)
+        except Exception:
+            drcc_active = False
+        if drcc_active:
+            if eps_val is not None and 0.0 < eps_val < 1.0:
+                eps_token = f"{eps_val:.2f}".replace('.', '_')
+                suffix = f"drcc_true_epsilon_{eps_token}"
+            else:
+                suffix = "drcc_true_epsilon_NA"
+        else:
+            suffix = "drcc_false"
+
+        csv_filename = f"dso_model_v2_results_{suffix}.csv"
+        results_df.to_csv(csv_filename, index=False)
+        print(f"\nResults saved to: {csv_filename}")
         
         # Expose pv_gen results at module level for plotting helpers that read globals()
         try:

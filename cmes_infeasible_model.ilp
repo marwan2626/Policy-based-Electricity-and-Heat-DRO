@@ -1,0 +1,60 @@
+\ Model opf_with_ldf_lc_copy
+\ LP format - for model browsing. Use MPS format to capture full model detail.
+Minimize
+ 
+Subject To
+ P_accumulated_47_15: - pv_gen_47[1] - pv_gen_47[3] - pv_gen_47[4]
+   - pv_gen_47[5] - pv_gen_47[6] - pv_gen_47[7] - pv_gen_47[8]
+   - pv_gen_47[10] - pv_gen_47[11] - pv_gen_47[12] - pv_gen_47[13]
+   - pv_gen_47[16] - pv_gen_47[17] - pv_gen_47[20] - pv_gen_47[22]
+   - pv_gen_47[23] - pv_gen_47[24] - pv_gen_47[25] - pv_gen_47[26]
+   - pv_gen_47[27] - pv_gen_47[28] - pv_gen_47[30] - pv_gen_47[31]
+   - pv_gen_47[32] - pv_gen_47[33] - pv_gen_47[35] - pv_gen_47[36]
+   - pv_gen_47[37] - pv_gen_47[39] - pv_gen_47[40] - pv_gen_47[41]
+   - pv_gen_47[42] - pv_gen_47[43] + bess_charge_47[21]
+   - bess_discharge_47[21] + p_hp_47[29] + P_accumulated[47,15]
+   = -0.0363460493889246
+ R32541: P_trafo[47,0] - P_accumulated[47,15] = 0
+ predicted_p_hp_t47_bus29: p_hp_47[29] = 0.1888393332217188
+ S_trafo_limit_47_0: [ P_trafo[47,0] ^2 + Q_trafo[47,0] ^2 ]
+   <= 0.00347209164341254
+Bounds
+ -infinity <= pv_gen_47[1] <= 0.0022256364998567
+ -infinity <= pv_gen_47[3] <= 0.0022256364998567
+ -infinity <= pv_gen_47[4] <= 8.9025459994268076e-04
+ -infinity <= pv_gen_47[5] <= 0.0022256364998567
+ -infinity <= pv_gen_47[6] <= 8.9025459994268076e-04
+ -infinity <= pv_gen_47[7] <= 0.0022256364998567
+ -infinity <= pv_gen_47[8] <= 0.0022256364998567
+ -infinity <= pv_gen_47[10] <= 8.9025459994268076e-04
+ -infinity <= pv_gen_47[11] <= 0.0022256364998567
+ -infinity <= pv_gen_47[12] <= 0.0022256364998567
+ -infinity <= pv_gen_47[13] <= 0.0022256364998567
+ -infinity <= pv_gen_47[16] <= 0.0022256364998567
+ -infinity <= pv_gen_47[17] <= 0.0022256364998567
+ -infinity <= pv_gen_47[20] <= 0.0022256364998567
+ -infinity <= pv_gen_47[22] <= 8.9025459994268076e-04
+ -infinity <= pv_gen_47[23] <= 0.0022256364998567
+ -infinity <= pv_gen_47[24] <= 0.0022256364998567
+ -infinity <= pv_gen_47[25] <= 0.0022256364998567
+ -infinity <= pv_gen_47[26] <= 0.0022256364998567
+ -infinity <= pv_gen_47[27] <= 0.0022256364998567
+ -infinity <= pv_gen_47[28] <= 8.9025459994268076e-04
+ -infinity <= pv_gen_47[30] <= 8.9025459994268076e-04
+ -infinity <= pv_gen_47[31] <= 0.0022256364998567
+ -infinity <= pv_gen_47[32] <= 0.0022256364998567
+ -infinity <= pv_gen_47[33] <= 0.0022256364998567
+ -infinity <= pv_gen_47[35] <= 0.00667690949957011
+ -infinity <= pv_gen_47[36] <= 0.0044512729997134
+ -infinity <= pv_gen_47[37] <= 0.0044512729997134
+ -infinity <= pv_gen_47[39] <= 0.00667690949957011
+ -infinity <= pv_gen_47[40] <= 0.0044512729997134
+ -infinity <= pv_gen_47[41] <= 0.00667690949957011
+ -infinity <= pv_gen_47[42] <= 0.0044512729997134
+ -infinity <= pv_gen_47[43] <= 0.0044512729997134
+ -infinity <= bess_discharge_47[21] <= 0.05
+ p_hp_47[29] free
+ P_trafo[47,0] free
+ Q_trafo[47,0] free
+ P_accumulated[47,15] free
+End

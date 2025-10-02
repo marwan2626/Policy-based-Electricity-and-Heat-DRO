@@ -92,7 +92,7 @@ DRCC_TIGHTEN_LINES = True
 DRCC_TIGHTEN_VOLTAGES = True
 PV_STD_FROM_CSV = True         # try to read pv std from pv_profiles_output.csv
 PV_RELATIVE_STD = 0.20         # fallback relative std of PV availability (fraction of avail)
-PV_STD_CORRELATION = 0.50      # used only if constructing from per-bus stds (not CSV aggregate)
+PV_STD_CORRELATION = 1.00      # used only if constructing from per-bus stds (not CSV aggregate)
 HP_FULLY_CORRELATED = True     # temperature is common across HPs
 # =====================================================================
 
@@ -1465,7 +1465,62 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     non_flexible_time_synchronized_loads_P = {t: {} for t in time_steps}
     non_flexible_time_synchronized_loads_Q = {t: {} for t in time_steps}
 
-    # Note: Avoid auto-injecting BEV loads into net.load to preserve original model baseline
+
+
+    # Add BEV loads from CSV into net.load (if present) so they behave like electrical_loads.csv entries
+    try:
+        bev_csv_path = os.path.join('extracted_network_data', 'electrical_BEV.csv')
+        if os.path.exists(bev_csv_path):
+            bev_df = pd.read_csv(bev_csv_path)
+            bev_rows = []
+            for _, r in bev_df.iterrows():
+                # tolerate common column names
+                name = r.get('name') if 'name' in r.index else (r.get('Name') if 'Name' in r.index else None)
+                if name is None:
+                    continue
+                # bus may be int-like
+                try:
+                    bus = int(r.get('bus'))
+                except Exception:
+                    # skip invalid bus
+                    continue
+                # p_mw may be provided in MW or kW ('p_mw' or 'p_kw')
+                p_mw = 0.0
+                if 'p_mw' in r.index and not pd.isna(r.get('p_mw')):
+                    p_mw = float(r.get('p_mw'))
+                elif 'p_kw' in r.index and not pd.isna(r.get('p_kw')):
+                    p_mw = float(r.get('p_kw')) / 1000.0
+                # reactive power
+                q_mvar = 0.0
+                if 'q_mvar' in r.index and not pd.isna(r.get('q_mvar')):
+                    q_mvar = float(r.get('q_mvar'))
+                # controllable flag
+                controllable = True
+                if 'controllable' in r.index and not pd.isna(r.get('controllable')):
+                    try:
+                        controllable = bool(r.get('controllable'))
+                    except Exception:
+                        controllable = str(r.get('controllable')).strip().lower() in ('1','true','yes')
+                in_service = True
+                if 'in_service' in r.index and not pd.isna(r.get('in_service')):
+                    try:
+                        in_service = bool(r.get('in_service'))
+                    except Exception:
+                        in_service = str(r.get('in_service')).strip().lower() in ('1','true','yes')
+
+                bev_rows.append({'bus': bus, 'p_mw': p_mw, 'q_mvar': q_mvar, 'controllable': controllable, 'name': name, 'in_service': in_service})
+
+            if bev_rows:
+                bev_loads_df = pd.DataFrame(bev_rows)
+                # avoid adding duplicate names already present in net.load
+                existing_names = set(net.load['name'].astype(str).tolist()) if 'name' in net.load.columns else set()
+                bev_loads_df = bev_loads_df[~bev_loads_df['name'].astype(str).isin(existing_names)]
+                if not bev_loads_df.empty:
+                    # append rows to net.load, preserve index semantics
+                    net.load = pd.concat([net.load, bev_loads_df], ignore_index=True)
+                    #print(f"Added {len(bev_loads_df)} BEV loads to net.load from '{bev_csv_path}'")
+    except Exception as _e:
+        print(f"Warning: failed to append BEV loads to net.load: {_e}")
 
     # Identify buses with flexible loads
     flexible_load_buses = list(set(net.load[net.load['controllable'] == True].bus.values))
@@ -1543,6 +1598,21 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         sin24 = np.sin(2*np.pi*tod/24.0)
         cos24 = np.cos(2*np.pi*tod/24.0)
 
+        # Debug: print the full net.load table only for the first timestep to avoid huge output
+        if t == time_steps[0]:
+            try:
+                print('\nDEBUG: net.load (first timestep) - showing all load rows:')
+                # use to_string to ensure full DataFrame printing
+                print(net.load.to_string())
+                print('\nDEBUG: net.sgen (first timestep) - showing all sgen rows:')
+                print(net.sgen.to_string())
+            except Exception:
+                # Fallback: lightweight repr to avoid exceptions
+                try:
+                    print('\nDEBUG: net.load (first timestep):', repr(net.load))
+                except Exception:
+                    print('\nDEBUG: net.load (first timestep): <unprintable>')
+
         # plug in your chosen model’s coefficients (example: ridge dev_norm_Tavg_tod)
         Pmax = 0.30
         b0   = 0.065855
@@ -1556,9 +1626,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         P_t = P_base + Pmax * y_dev
         P_t = min(max(P_t, 0.0), Pmax)      # clip to [0, Pmax]
 
-    p_hp_pred = P_t
-    # Track nominal HP aggregate for budgets
-    hp_pred_nominal[t] = float(P_t * len(hp_load_buses)) if len(hp_load_buses) > 0 else 0.0
+        # Track nominal HP aggregate for budgets for every timestep
+        hp_pred_nominal[t] = float(P_t * len(hp_load_buses)) if len(hp_load_buses) > 0 else 0.0
 
     # Precompute DRCC k and an aggregate sigma for network tightening (PV + HP) if enabled
     use_net_drcc = bool(ENABLE_DRCC_NETWORK_TIGHTENING)
@@ -1920,8 +1989,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 # PV assumed unity PF here => no reactive deviation contribution
             # HP deviations spread across HP load buses
             if len(hp_load_buses) > 0:
-                total_hp_sigma = hp_temp_sens * float(T_amb_std_arr[t])
-                per_bus_hp_sigma = total_hp_sigma / float(len(hp_load_buses))
+                # Per-HP per-bus sigma from temperature uncertainty
+                per_bus_hp_sigma = hp_temp_sens * float(T_amb_std_arr[t])
                 for bus in hp_load_buses:
                     sigmaP_MW_by_bus[bus] += per_bus_hp_sigma
                     # Map HP P sigma to Q sigma using fixed PF (inductive): Q = P * tan(arccos(pf_HP))
@@ -1946,17 +2015,54 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 base_v_min = 0.90**2
                 base_v_max = 1.10**2
 
-                # Optional DRCC tightening on voltages using linear LDF sensitivity proxy
+                # Optional DRCC tightening on voltages using linear LDF sensitivity proxy with correlation knobs
                 if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_VOLTAGES and (k_epsilon is not None) and (sigmaP_pu_vec is not None):
-                    # Linear LDF on squared voltage: V^2 ≈ 1 + 2*(R·P_pu + X·Q_pu); include P and Q uncertainty
                     R_row = np.array([R[i, j] for j in range(len(non_slack_buses))], dtype=float)
                     X_row = np.array([X[i, j] for j in range(len(non_slack_buses))], dtype=float)
-                    # Build sigmaQ per-unit vector aligned to non_slack_buses if available
-                    if 'sigmaQ_MVar_by_bus' in locals() and sigmaQ_MVar_by_bus is not None:
-                        sigmaQ_pu_vec = np.array([sigmaQ_MVar_by_bus.get(b, 0.0) / net.sn_mva for b in non_slack_buses], dtype=float)
+                    # Split into PV P and HP P/Q contributions using earlier sigma maps if present
+                    try:
+                        rho_pv = float(PV_STD_CORRELATION)
+                    except Exception:
+                        rho_pv = 0.0
+                    rho_pv = max(0.0, min(1.0, rho_pv))
+
+                    # Build per-unit vectors per source if available, else fallback to combined RSS
+                    if 'sigmaP_MW_by_bus' in locals():
+                        # Recompute per-source per-unit arrays
+                        const_pv_std_arr = globals().get('const_pv_std', np.zeros(len(time_steps)))
+                        T_amb_std_arr = globals().get('T_amb_std', np.zeros(len(time_steps)))
+                        hp_temp_sens_local = abs(0.30 * (-0.010871))
+                        sigmaP_PV_pu = np.zeros(len(non_slack_buses))
+                        sigmaP_HP_pu = np.zeros(len(non_slack_buses))
+                        sigmaQ_HP_pu = np.zeros(len(non_slack_buses))
+                        # PV per-bus
+                        for j, b in enumerate(non_slack_buses):
+                            if b in pv_buses:
+                                sigmaP_PV_pu[j] = (float(const_pv_std_arr[t]) * float(base_pv_bus_limits.get(b, 0.0))) / net.sn_mva
+                        # HP per-bus (even spread)
+                        if len(hp_load_buses) > 0:
+                            per_bus_hp_sigma = hp_temp_sens_local * float(T_amb_std_arr[t])
+                            for j, b in enumerate(non_slack_buses):
+                                if b in hp_load_buses:
+                                    sigmaP_HP_pu[j] = per_bus_hp_sigma / net.sn_mva
+                                    sigmaQ_HP_pu[j] = (per_bus_hp_sigma * qfactor_heatpump) / net.sn_mva
+                        # PV contribution (equicorrelated aggregation)
+                        wPV = R_row * sigmaP_PV_pu
+                        var_PV = (1.0 - rho_pv) * float(np.sum(wPV**2)) + rho_pv * float(np.sum(wPV))**2
+                        # HP P contribution
+                        wHP_P = R_row * sigmaP_HP_pu
+                        var_HP_P = float(np.sum(wHP_P))**2 if HP_FULLY_CORRELATED else float(np.sum(wHP_P**2))
+                        # HP Q contribution
+                        wHP_Q = X_row * sigmaQ_HP_pu
+                        var_HP_Q = float(np.sum(wHP_Q))**2 if HP_FULLY_CORRELATED else float(np.sum(wHP_Q**2))
+                        delta_v = float(2.0 * k_epsilon * np.sqrt(max(0.0, var_PV + var_HP_P + var_HP_Q)))
                     else:
-                        sigmaQ_pu_vec = np.zeros_like(sigmaP_pu_vec)
-                    delta_v = float(2.0 * k_epsilon * np.sqrt(np.sum((R_row * sigmaP_pu_vec) ** 2) + np.sum((X_row * sigmaQ_pu_vec) ** 2)))
+                        # Fallback to the earlier combined RSS behavior
+                        if 'sigmaQ_MVar_by_bus' in locals() and sigmaQ_MVar_by_bus is not None:
+                            sigmaQ_pu_vec = np.array([sigmaQ_MVar_by_bus.get(b, 0.0) / net.sn_mva for b in non_slack_buses], dtype=float)
+                        else:
+                            sigmaQ_pu_vec = np.zeros_like(sigmaP_pu_vec)
+                        delta_v = float(2.0 * k_epsilon * np.sqrt(np.sum((R_row * sigmaP_pu_vec) ** 2) + np.sum((X_row * sigmaQ_pu_vec) ** 2)))
                     tight_v_min = max(0.0, base_v_min + delta_v)
                     tight_v_max = max(0.0, base_v_max - delta_v)
                 else:
@@ -2012,13 +2118,34 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             )
 
             S_rated_line = np.sqrt(3) * line.max_i_ka * net.bus.at[from_bus, 'vn_kv']
-            if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_LINES and (k_epsilon is not None) and (sigmaP_MW_by_bus is not None):
-                # Radial approximation: branch P deviation equals sum of downstream bus deviations on 'to_bus' side
+            if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_LINES and (k_epsilon is not None):
+                # Correlation-aware aggregation over downstream set
+                const_pv_std_arr = globals().get('const_pv_std', np.zeros(len(time_steps)))
+                T_amb_std_arr = globals().get('T_amb_std', np.zeros(len(time_steps)))
+                hp_temp_sens_local = abs(0.30 * (-0.010871))
+                rho_pv = max(0.0, min(1.0, float(PV_STD_CORRELATION))) if 'PV_STD_CORRELATION' in globals() else 0.0
                 downstream_set = set(downstream_map[to_bus]) | {to_bus}
-                sigmaP_branch = float(np.sqrt(np.sum([sigmaP_MW_by_bus.get(b, 0.0)**2 for b in downstream_set])))
-                sigmaQ_branch = 0.0
-                if 'sigmaQ_MVar_by_bus' in locals() and sigmaQ_MVar_by_bus is not None:
-                    sigmaQ_branch = float(np.sqrt(np.sum([sigmaQ_MVar_by_bus.get(b, 0.0)**2 for b in downstream_set])))
+                # Build per-bus sigmas
+                sigmaP_PV = [float(const_pv_std_arr[t]) * float(base_pv_bus_limits.get(b, 0.0)) if b in pv_buses else 0.0 for b in downstream_set]
+                if len(hp_load_buses) > 0:
+                    per_bus_hp_sigma = hp_temp_sens_local * float(T_amb_std_arr[t])
+                    sigmaP_HP = [per_bus_hp_sigma if b in hp_load_buses else 0.0 for b in downstream_set]
+                    sigmaQ_HP = [per_bus_hp_sigma * qfactor_heatpump if b in hp_load_buses else 0.0 for b in downstream_set]
+                else:
+                    sigmaP_HP = [0.0 for _ in downstream_set]
+                    sigmaQ_HP = [0.0 for _ in downstream_set]
+
+                sumPV = float(np.sum(sigmaP_PV)); sumsqPV = float(np.sum(np.array(sigmaP_PV)**2))
+                varPV = (1.0 - rho_pv) * sumsqPV + rho_pv * (sumPV ** 2)
+                stdPV = float(np.sqrt(max(0.0, varPV)))
+                if HP_FULLY_CORRELATED:
+                    stdHP_P = float(np.sum(sigmaP_HP)); stdHP_Q = float(np.sum(sigmaQ_HP))
+                else:
+                    stdHP_P = float(np.sqrt(np.sum(np.array(sigmaP_HP)**2)))
+                    stdHP_Q = float(np.sqrt(np.sum(np.array(sigmaQ_HP)**2)))
+
+                sigmaP_branch = float(np.sqrt(stdPV**2 + stdHP_P**2))
+                sigmaQ_branch = float(stdHP_Q)
                 sigmaS_branch = float(np.sqrt(sigmaP_branch**2 + sigmaQ_branch**2))
                 S_branch_limit = 0.8 * S_rated_line - k_epsilon * sigmaS_branch
                 S_branch_limit = max(0.0, S_branch_limit)
@@ -2054,14 +2181,33 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             # Compute transformer loading percentage
             S_rated = net.trafo.sn_mva.iloc[trafo_idx]
         
-            if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_TRAFO and (k_epsilon is not None) and (sigmaP_MW_by_bus is not None):
-                # Downstream-only propagation for radial LDF: use LV bus downstream set
+            if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_TRAFO and (k_epsilon is not None):
+                # Correlation-aware aggregation over LV downstream set
+                const_pv_std_arr = globals().get('const_pv_std', np.zeros(len(time_steps)))
+                T_amb_std_arr = globals().get('T_amb_std', np.zeros(len(time_steps)))
+                hp_temp_sens_local = abs(0.30 * (-0.010871))
+                rho_pv = max(0.0, min(1.0, float(PV_STD_CORRELATION))) if 'PV_STD_CORRELATION' in globals() else 0.0
                 downstream_set = set(downstream_map[lv_bus]) | {lv_bus}
-                # Active and reactive std aggregations (independent across buses)
-                sigmaP_trafo = float(np.sqrt(np.sum([sigmaP_MW_by_bus.get(b, 0.0)**2 for b in downstream_set])))
-                sigmaQ_trafo = 0.0
-                if sigmaQ_MVar_by_bus is not None:
-                    sigmaQ_trafo = float(np.sqrt(np.sum([sigmaQ_MVar_by_bus.get(b, 0.0)**2 for b in downstream_set])))
+                sigmaP_PV = [float(const_pv_std_arr[t]) * float(base_pv_bus_limits.get(b, 0.0)) if b in pv_buses else 0.0 for b in downstream_set]
+                if len(hp_load_buses) > 0:
+                    per_bus_hp_sigma = hp_temp_sens_local * float(T_amb_std_arr[t])
+                    sigmaP_HP = [per_bus_hp_sigma if b in hp_load_buses else 0.0 for b in downstream_set]
+                    sigmaQ_HP = [per_bus_hp_sigma * qfactor_heatpump if b in hp_load_buses else 0.0 for b in downstream_set]
+                else:
+                    sigmaP_HP = [0.0 for _ in downstream_set]
+                    sigmaQ_HP = [0.0 for _ in downstream_set]
+
+                sumPV = float(np.sum(sigmaP_PV)); sumsqPV = float(np.sum(np.array(sigmaP_PV)**2))
+                varPV = (1.0 - rho_pv) * sumsqPV + rho_pv * (sumPV ** 2)
+                stdPV = float(np.sqrt(max(0.0, varPV)))
+                if HP_FULLY_CORRELATED:
+                    stdHP_P = float(np.sum(sigmaP_HP)); stdHP_Q = float(np.sum(sigmaQ_HP))
+                else:
+                    stdHP_P = float(np.sqrt(np.sum(np.array(sigmaP_HP)**2)))
+                    stdHP_Q = float(np.sqrt(np.sum(np.array(sigmaQ_HP)**2)))
+
+                sigmaP_trafo = float(np.sqrt(stdPV**2 + stdHP_P**2))
+                sigmaQ_trafo = float(stdHP_Q)
                 sigmaS_trafo = float(np.sqrt(sigmaP_trafo**2 + sigmaQ_trafo**2))
                 S_limit = 0.8*S_rated - k_epsilon * sigmaS_trafo
                 S_limit = max(0.0, S_limit)
@@ -2091,7 +2237,17 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         )
 
     print(f"adding coupling constraint between dhn and electrical network...")
-    print(f"Flags — RT:{ENABLE_RT_POLICIES} | DRCC budgets:{ENABLE_DRCC_RT_BUDGETS} | DRCC network tighten:{ENABLE_DRCC_NETWORK_TIGHTENING} [trafo={DRCC_TIGHTEN_TRAFO}, lines={DRCC_TIGHTEN_LINES}, volts={DRCC_TIGHTEN_VOLTAGES}]")
+    # Include correlation knobs in the flags printout
+    try:
+        _rho_pv_txt = f"{float(PV_STD_CORRELATION):.2f}"
+    except Exception:
+        _rho_pv_txt = str(PV_STD_CORRELATION)
+    _hp_corr_mode = 'full' if HP_FULLY_CORRELATED else 'rss'
+    print(
+        f"Flags — RT:{ENABLE_RT_POLICIES} | DRCC budgets:{ENABLE_DRCC_RT_BUDGETS} | DRCC network tighten:{ENABLE_DRCC_NETWORK_TIGHTENING} "
+        f"[trafo={DRCC_TIGHTEN_TRAFO}, lines={DRCC_TIGHTEN_LINES}, volts={DRCC_TIGHTEN_VOLTAGES}] | "
+        f"rho_PV={_rho_pv_txt}, HP_corr={_hp_corr_mode}"
+    )
     # Coupling constraint: Electrical power consumption of heat pump
     # Parameters for COP formula (fixed per user)
     DELTA_THETA = 2.1966   # ΔΘ in K (updated per user)
@@ -2141,12 +2297,9 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             print(f"  t={t}: P_base={P_base:.4f} MW, y_dev={y_dev:.4f} -> HP={P_t:.4f} MW")
 
     
-    if len(flexible_load_buses) > 0:
-            # Treat flexible electrical loads as an aggregated curtailable resource (capacity buyback).
-            # Individual buses are allowed to be reduced, but curtailment is constrained only at the aggregate level.
-            # Per-bus: 0 <= flexible_load_P_vars[t][bus] <= baseline_P_bus
-            # Aggregate: sum_b flexible_load_P_vars[t][b] == sum_b baseline_P_b - flex_curtail_P_vars[t]
-            # Create one aggregated curtailment variable for this timestep
+    # Treat flexible electrical loads as an aggregated curtailable resource (capacity buyback) per timestep
+    for t in time_steps:
+        if len(flexible_load_buses) > 0:
             flex_curtail_P_vars[t] = model.addVar(
                 lb=0,
                 ub=sum(float(flexible_time_synchronized_loads_P[t][bus]) for bus in flexible_load_buses),
@@ -2176,10 +2329,11 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         # --- Robust no-scenario affine recourse: budgets, variables, constraints, and proxy costs ---
         alpha_plus = 0.10
         alpha_minus = 0.10
-        cap_price_factor = 0.20
-        imb_up_factor = 1.30
-        imb_dn_factor = 1.00
-        pv_curt_price_factor = 1.00
+        # Buy-back activation removed: no RT capacity pricing
+        cap_price_factor = 0.0
+        imb_up_factor = 1.3
+        imb_dn_factor = 1.3
+        pv_curt_price_factor = 1.0
         bess_rt_price_per_mw = 2.0
 
         try:
@@ -2230,9 +2384,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 D_plus_max[t] = alpha_plus * (base_demand_t + base_pv_t)
                 D_minus_max[t] = alpha_minus * (base_demand_t + base_pv_t)
 
-            y_cap_vars[t] = model.addVar(lb=0.0, name=f'y_cap_{t}')
-            gamma0_vars[t] = model.addVar(lb=0.0, name=f'gamma0_{t}')
-            gamma_plus_vars[t] = model.addVar(lb=0.0, name=f'gamma_plus_{t}')
+            # Buy-back activation disabled: remove y_cap and gamma variables
             chi0_vars[t] = model.addVar(lb=0.0, name=f'chi0_{t}')
             chi_minus_vars[t] = model.addVar(lb=0.0, name=f'chi_minus_{t}')
             lambda0_vars[t] = model.addVar(lb=0.0, name=f'lambda0_{t}')
@@ -2246,8 +2398,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             z_ch_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'z_ch_{t}')
 
             model.addConstr(
-                gamma0_vars[t] + gamma_plus_vars[t] * D_plus_max[t]
-                + lambda_plus_vars[t] * D_plus_max[t]
+                # No buy-back activation: cover deficit with BESS proxies and imbalance proxies only
+                lambda_plus_vars[t] * D_plus_max[t]
                 + rho_plus0_vars[t] + rho_plus1_vars[t] * D_plus_max[t]
                 >= D_plus_max[t],
                 name=f'coverage_deficit_t{t}'
@@ -2260,9 +2412,6 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 >= D_minus_max[t],
                 name=f'coverage_surplus_t{t}'
             )
-
-            model.addConstr(gamma0_vars[t] <= y_cap_vars[t], name=f'bb_baseline_leq_cap_t{t}')
-            model.addConstr(gamma0_vars[t] + gamma_plus_vars[t] * D_plus_max[t] <= y_cap_vars[t], name=f'bb_max_leq_cap_t{t}')
             model.addConstr(chi0_vars[t] + chi_minus_vars[t] * D_minus_max[t] <= pv_avail_sum_by_t.get(t, 0.0), name=f'pv_curt_leq_avail_t{t}')
             model.addConstr(lambda_plus_vars[t] * D_plus_max[t] <= z_dis_vars[t], name=f'bess_deficit_proxy_t{t}')
             model.addConstr(lambda_minus_vars[t] * D_minus_max[t] <= z_ch_vars[t], name=f'bess_surplus_proxy_t{t}')
@@ -2276,25 +2425,37 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 model.addConstr(gp.quicksum(z_dis_vars[t] * dt_hours for t in time_steps) <= total_bess_energy, name='rt_bess_dis_energy_cap')
                 model.addConstr(gp.quicksum(z_ch_vars[t] * dt_hours for t in time_steps) <= total_bess_energy, name='rt_bess_ch_energy_cap')
 
+    # Determine timestep duration in hours for energy-based costs
+    try:
+        if 'time_index' in globals() and len(time_index) >= 2:
+            dt_hours = max(1/60.0, (time_index[1] - time_index[0]).total_seconds() / 3600.0)
+        else:
+            dt_hours = 1.0
+    except Exception:
+        dt_hours = 1.0
+
     # Build objective components (original + robust policy proxies)
     print(f"\nStarting multi-period optimization...")
     print(f"COST-BASED Objective: Minimize total operational cost over {NUM_PERIODS} periods")
-    electricity_cost =  gp.quicksum(electricity_price[t] * (ext_grid_import_P_vars[t] + ext_grid_export_P_vars[t]) for t in time_steps)
-    bess_cost = gp.quicksum(bess_cost_per_mwh * (bess_charge_vars[t][bus] + bess_discharge_vars[t][bus]) for bus in bess_buses for t in time_steps) if len(bess_buses) > 0 else 0
+    # Convert MW to MWh using dt_hours when multiplying by prices in EUR/MWh
+    electricity_cost =  gp.quicksum(electricity_price[t] * (ext_grid_import_P_vars[t] + ext_grid_export_P_vars[t]) * dt_hours for t in time_steps)
+    bess_cost = gp.quicksum(bess_cost_per_mwh * (bess_charge_vars[t][bus] + bess_discharge_vars[t][bus]) * dt_hours for bus in bess_buses for t in time_steps) if len(bess_buses) > 0 else 0
     # Aggregate flexible curtailment cost (if any flexible curtail vars were created)
-    y_cap_cost = gp.quicksum(2 * electricity_price[t] * flex_curtail_P_vars[t] for t in flex_curtail_P_vars.keys()) if len(flex_curtail_P_vars) > 0 else 0
-    pv_curtail_cost = gp.quicksum(electricity_price[t] * curtailment_vars[t][bus] for bus in pv_buses for t in time_steps) if len(pv_buses) > 0 else 0
+    # Day-ahead flexible curtailment penalty (separate from RT capacity); renamed for clarity
+    flex_curtail_cost = gp.quicksum(2 * electricity_price[t] * flex_curtail_P_vars[t] * dt_hours for t in flex_curtail_P_vars.keys()) if len(flex_curtail_P_vars) > 0 else 0
+    pv_curtail_cost = gp.quicksum(electricity_price[t] * curtailment_vars[t][bus] * dt_hours for bus in pv_buses for t in time_steps) if len(pv_buses) > 0 else 0
 
     # New: first-stage capacity and RT proxy costs for robust policies (only if enabled)
     if ENABLE_RT_POLICIES:
-        cap_cost = gp.quicksum((cap_price_factor * electricity_price[t]) * y_cap_vars[t] for t in time_steps)
+        # No RT capacity cost (buy-back removed)
+        cap_cost = 0
         imb_proxy_cost = gp.quicksum(
-            (imb_up_factor * electricity_price[t]) * (rho_plus0_vars[t] + rho_plus1_vars[t] * D_plus_max[t])
-            + (imb_dn_factor * electricity_price[t]) * (rho_minus0_vars[t] + rho_minus1_vars[t] * D_minus_max[t])
+            (imb_up_factor * electricity_price[t]) * (rho_plus0_vars[t] + rho_plus1_vars[t] * D_plus_max[t]) * dt_hours
+            + (imb_dn_factor * electricity_price[t]) * (rho_minus0_vars[t] + rho_minus1_vars[t] * D_minus_max[t]) * dt_hours
             for t in time_steps
         )
-        pv_curt_proxy_cost = gp.quicksum((pv_curt_price_factor * electricity_price[t]) * (chi0_vars[t] + chi_minus_vars[t] * D_minus_max[t]) for t in time_steps)
-        bess_rt_proxy_cost = gp.quicksum(bess_rt_price_per_mw * (z_dis_vars[t] + z_ch_vars[t]) for t in time_steps)
+        pv_curt_proxy_cost = gp.quicksum((pv_curt_price_factor * electricity_price[t]) * (chi0_vars[t] + chi_minus_vars[t] * D_minus_max[t]) * dt_hours for t in time_steps)
+        bess_rt_proxy_cost = gp.quicksum(bess_rt_price_per_mw * (z_dis_vars[t] + z_ch_vars[t]) * dt_hours for t in time_steps)
     else:
         cap_cost = 0
         imb_proxy_cost = 0
@@ -2302,7 +2463,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         bess_rt_proxy_cost = 0
 
     # Objective: Minimize total cost (import, export, and curtailment costs)
-    total_cost = electricity_cost + bess_cost + y_cap_cost + pv_curtail_cost 
+    total_cost = electricity_cost + bess_cost + flex_curtail_cost + pv_curtail_cost 
     total_cost += cap_cost + imb_proxy_cost + pv_curt_proxy_cost + bess_rt_proxy_cost
     model.setObjective(total_cost, GRB.MINIMIZE)
 
@@ -2482,28 +2643,28 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         # Compute and print cost breakdown from the solved variables/results
         try:
             # Electricity cost (uses import+export as in objective)
-            electricity_cost_value = sum(electricity_price[t] * (ext_grid_import_P_results.get(t, 0.0) + ext_grid_export_P_results.get(t, 0.0)) for t in time_steps)
+            electricity_cost_value = sum(electricity_price[t] * (ext_grid_import_P_results.get(t, 0.0) + ext_grid_export_P_results.get(t, 0.0)) * dt_hours for t in time_steps)
         except Exception:
             electricity_cost_value = None
 
         try:
             if len(bess_buses) > 0:
-                bess_cost_value = sum(bess_cost_per_mwh * (sum(bess_charge_results[t].values()) + sum(bess_discharge_results[t].values())) for t in time_steps)
+                bess_cost_value = sum(bess_cost_per_mwh * (sum(bess_charge_results[t].values()) + sum(bess_discharge_results[t].values())) * dt_hours for t in time_steps)
             else:
                 bess_cost_value = 0.0
         except Exception:
             bess_cost_value = None
 
         try:
-            y_cap_cost_value = sum(electricity_price[t] * flex_curtail_P_results.get(t, 0.0) for t in time_steps)
+            flex_curtail_cost_value = sum(electricity_price[t] * flex_curtail_P_results.get(t, 0.0) * dt_hours for t in time_steps)
         except Exception:
-            y_cap_cost_value = None
+            flex_curtail_cost_value = None
 
         try:
             pv_curtail_cost_value = 0.0
             if len(pv_buses) > 0:
                 for t in time_steps:
-                    pv_curtail_cost_value += electricity_price[t] * sum(curtailment_vars[t][bus].x for bus in pv_buses)
+                    pv_curtail_cost_value += electricity_price[t] * sum(curtailment_vars[t][bus].x for bus in pv_buses) * dt_hours
         except Exception:
             pv_curtail_cost_value = None
 
@@ -2511,8 +2672,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         base_total_value = None
         grand_total_value = None
         try:
-            if None not in (electricity_cost_value, bess_cost_value, y_cap_cost_value, pv_curtail_cost_value):
-                base_total_value = electricity_cost_value + bess_cost_value + y_cap_cost_value + pv_curtail_cost_value
+            if None not in (electricity_cost_value, bess_cost_value, flex_curtail_cost_value, pv_curtail_cost_value):
+                base_total_value = electricity_cost_value + bess_cost_value + flex_curtail_cost_value + pv_curtail_cost_value
             else:
                 base_total_value = None
         except Exception:
@@ -2521,39 +2682,32 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         print("\nCOST BREAKDOWN:")
         print(f"  electricity_cost = {electricity_cost_value}")
         print(f"  bess_cost = {bess_cost_value}")
-        print(f"  y_cap_cost (flex curtail) = {y_cap_cost_value}")
+        print(f"  flex_curtail_cost_DA = {flex_curtail_cost_value}")
         print(f"  pv_curtail_cost = {pv_curtail_cost_value}")
         if ENABLE_RT_POLICIES:
             try:
-                # Recompute proxy components from the built expressions (robust block)
-                cap_cost_value = sum((cap_price_factor * float(electricity_price[t])) * y_cap_vars[t].x for t in time_steps)
-            except Exception:
-                cap_cost_value = None
-            try:
                 imb_proxy_cost_value = sum(
-                    (imb_up_factor * float(electricity_price[t])) * (rho_plus0_vars[t].x + rho_plus1_vars[t].x * D_plus_max[t])
-                    + (imb_dn_factor * float(electricity_price[t])) * (rho_minus0_vars[t].x + rho_minus1_vars[t].x * D_minus_max[t])
+                    (imb_up_factor * float(electricity_price[t])) * (rho_plus0_vars[t].x + rho_plus1_vars[t].x * D_plus_max[t]) * dt_hours
+                    + (imb_dn_factor * float(electricity_price[t])) * (rho_minus0_vars[t].x + rho_minus1_vars[t].x * D_minus_max[t]) * dt_hours
                     for t in time_steps
                 )
             except Exception:
                 imb_proxy_cost_value = None
             try:
-                pv_curt_proxy_cost_value = sum((pv_curt_price_factor * float(electricity_price[t])) * (chi0_vars[t].x + chi_minus_vars[t].x * D_minus_max[t]) for t in time_steps)
+                pv_curt_proxy_cost_value = sum((pv_curt_price_factor * float(electricity_price[t])) * (chi0_vars[t].x + chi_minus_vars[t].x * D_minus_max[t]) * dt_hours for t in time_steps)
             except Exception:
                 pv_curt_proxy_cost_value = None
             try:
-                bess_rt_proxy_cost_value = sum(bess_rt_price_per_mw * (z_dis_vars[t].x + z_ch_vars[t].x) for t in time_steps)
+                bess_rt_proxy_cost_value = sum(bess_rt_price_per_mw * (z_dis_vars[t].x + z_ch_vars[t].x) * dt_hours for t in time_steps)
             except Exception:
                 bess_rt_proxy_cost_value = None
-
-            print(f"  cap_cost (RT capacity) = {cap_cost_value}")
             print(f"  imb_proxy_cost (RT imbalance proxies) = {imb_proxy_cost_value}")
             print(f"  pv_curt_proxy_cost (RT PV curtail proxies) = {pv_curt_proxy_cost_value}")
             print(f"  bess_rt_proxy_cost (RT BESS proxies) = {bess_rt_proxy_cost_value}")
             # If we have a base total, also print a grand total including RT proxies
             try:
-                if base_total_value is not None and None not in (cap_cost_value, imb_proxy_cost_value, pv_curt_proxy_cost_value, bess_rt_proxy_cost_value):
-                    grand_total_value = base_total_value + cap_cost_value + imb_proxy_cost_value + pv_curt_proxy_cost_value + bess_rt_proxy_cost_value
+                if base_total_value is not None and None not in (imb_proxy_cost_value, pv_curt_proxy_cost_value, bess_rt_proxy_cost_value):
+                    grand_total_value = base_total_value + imb_proxy_cost_value + pv_curt_proxy_cost_value + bess_rt_proxy_cost_value
             except Exception:
                 grand_total_value = None
 
@@ -2651,9 +2805,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         # Append robust recourse policy summaries for transparency
         try:
             if ENABLE_RT_POLICIES:
-                results_df['y_cap_mw'] = [y_cap_vars[t].x for t in time_steps]
-                results_df['gamma0_mw'] = [gamma0_vars[t].x for t in time_steps]
-                results_df['gamma_plus'] = [gamma_plus_vars[t].x for t in time_steps]
+                # Buy-back removed: exclude y_cap and gamma columns
                 results_df['chi0_mw'] = [chi0_vars[t].x for t in time_steps]
                 results_df['chi_minus'] = [chi_minus_vars[t].x for t in time_steps]
                 results_df['lambda0_mw'] = [lambda0_vars[t].x for t in time_steps]
@@ -2665,6 +2817,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 results_df['rho_minus1'] = [rho_minus1_vars[t].x for t in time_steps]
                 results_df['D_plus_max_mw'] = [D_plus_max[t] for t in time_steps]
                 results_df['D_minus_max_mw'] = [D_minus_max[t] for t in time_steps]
+                # Also expose DA aggregated flexible curtailment to verify the tie to y_cap
+                results_df['flex_curtail_da_mw'] = [flex_curtail_P_results.get(t, 0.0) for t in time_steps]
         except Exception:
             pass
         
