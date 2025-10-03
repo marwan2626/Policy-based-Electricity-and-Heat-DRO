@@ -36,7 +36,7 @@ import pandas as pd
 # ===========================
 # Epsilon used in the v2 filename suffix: dso_model_v2_results_drcc_true_epsilon_{EPSILON_TOKEN}.csv
 # The token uses two decimals with underscore as decimal separator, e.g., 0.05 -> "0_05"
-EPSILON: float = 0.15
+EPSILON: float = 0.30
 
 # If RESULTS_CSV is None, we'll try to find a file named with the epsilon token in the current folder.
 RESULTS_CSV: Optional[str] = None
@@ -58,6 +58,9 @@ OUTDIR: str = "v3_oos"
 
 # Threshold (in percent) above which a line or transformer loading counts as a violation step
 LOADING_VIOLATION_THRESHOLD_PCT: float = 80.0
+
+# Phase 1: Use mean-centered residual for policy activation (instead of schedule-referenced residual)
+USE_MEAN_CENTERED_POLICY: bool = True
 
 
 # ===========================
@@ -769,8 +772,15 @@ def main() -> None:
 
         # Components of deviation per trajectory (arrays length = horizon)
         hp_dev = hp_temp_dev_total + hp_resid_total
-        pv_dev = base_pv_da_total - pv_total_rt  # signed PV deviation
-        base_residual = hp_dev + pv_dev
+        pv_dev = base_pv_da_total - pv_total_rt  # signed PV deviation vs DA schedule (for reporting)
+        base_residual = hp_dev + pv_dev          # schedule-based residual
+
+        # Mean-centered policy residual (hp mean = hp_pred_total, hp residual adds zero mean; pv mean = base_pv_da_total)
+        # Realized pre-action net stochastic deviation relative to forecast mean:
+        #   hp_mean_dev = -hp_resid_total (since hp_pred_total is mean)
+        #   pv_mean_dev = (base_pv_da_total - pv_total_rt) = pv_dev
+        # Combine for a mean-centered residual: hp_mean_dev + pv_mean_dev
+        residual_policy_array = (-hp_resid_total) + pv_dev
 
         # Accumulators for metrics and voltages
         net_import_rt = np.zeros(len(index))
@@ -784,13 +794,23 @@ def main() -> None:
         E_mwh = max(0.0, min(1.0, bess_initial_soc)) * max(0.0, total_bess_capacity_mwh)
         bess_soc_clip_steps = 0; u_plus_energy = 0.0; u_minus_energy = 0.0
 
+        # Collect policy residual stats if enabled
+        residual_policy_vals = [] if USE_MEAN_CENTERED_POLICY else None
+
         for t, ts in enumerate(index):
             row = df.iloc[t]
             pv_sched_t = float(base_pv_da_total[t])
-            resid_t = float(base_residual[t])  # initial signed residual
+            resid_t = float(base_residual[t])  # schedule-referenced residual used for settlement evolution
 
-            # Policy open-loop commands from affine recourse (based on initial residual)
-            p_bess_cmd, extra_curt_cmd = apply_recourse_for_step(resid_t, row, pv_sched_t)
+            # Choose residual signal for policy activation
+            if USE_MEAN_CENTERED_POLICY:
+                resid_policy_t = float(residual_policy_array[t])
+                residual_policy_vals.append(resid_policy_t)
+            else:
+                resid_policy_t = resid_t
+
+            # Policy open-loop commands from affine recourse (based on chosen residual)
+            p_bess_cmd, extra_curt_cmd = apply_recourse_for_step(resid_policy_t, row, pv_sched_t)
 
             # --- Battery-first: project affine command onto feasible (power + energy) band ---
             p_cmd = float(p_bess_cmd)
@@ -966,6 +986,13 @@ def main() -> None:
         summ['bess_rt_energy_throughput_mwh'] = bess_rt_energy_throughput
         summ['imbalance_mwh'] = float(u_plus_energy + u_minus_energy)
         summ['bess_soc_clip_steps'] = int(bess_soc_clip_steps)
+        if USE_MEAN_CENTERED_POLICY and residual_policy_vals:
+            rp_arr = np.array(residual_policy_vals, dtype=float)
+            summ['residual_policy_std'] = float(np.std(rp_arr))
+            summ['residual_policy_frac_negative'] = float(np.mean(rp_arr < 0))
+        else:
+            summ['residual_policy_std'] = np.nan
+            summ['residual_policy_frac_negative'] = np.nan
         # Cost components (DA energy cost constant; store for clarity)
         summ['da_energy_cost_eur'] = float(da_energy_cost_eur_const)
         summ['rt_pv_curtail_cost_eur'] = float(pv_rt_curt_cost_eur)

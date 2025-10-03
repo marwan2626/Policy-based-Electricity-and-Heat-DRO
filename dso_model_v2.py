@@ -94,7 +94,29 @@ PV_STD_FROM_CSV = True         # try to read pv std from pv_profiles_output.csv
 PV_RELATIVE_STD = 0.20         # fallback relative std of PV availability (fraction of avail)
 PV_STD_CORRELATION = 1.00      # used only if constructing from per-bus stds (not CSV aggregate)
 HP_FULLY_CORRELATED = True     # temperature is common across HPs
+RHO_TEMP_AVG = 0             # 0=independent, 1=fully correlated within day
 # =====================================================================
+
+# --- Heat Pump predictor and DRCC constants (single source of truth) ---
+# Affine predictor (Baseline + Deviation normalized by Pmax, with daily T_avg)
+HP_PRED_PMAX = 0.30           # MW
+HP_PRED_TBASE_C = 10.0        # °C for HDD
+HP_COEFF_B0 = 0.331877
+HP_COEFF_BHDD = 0.015908
+HP_COEFF_BPI = -0.000492
+HP_COEFF_BTAV = -0.014595
+HP_COEFF_A1 = 0.013139
+HP_COEFF_A2 = -0.006540
+
+# DRCC/uncertainty sizing uses same sensitivities as predictor
+HP_DRCC_PMAX = HP_PRED_PMAX
+HP_DRCC_BTAV = HP_COEFF_BTAV
+HP_DRCC_BHDD = HP_COEFF_BHDD
+
+# Residual uncertainty for HP predictor (normalized units, multiply by HP_PRED_PMAX to get MW)
+HP_INCLUDE_RESIDUAL = True
+HP_RESIDUAL_SIGMA_NORM = 0.01617 # std of predictor residual in normalized y_dev units
+HP_RESIDUAL_CORRELATION = 0.0     # 0=independent across HP buses, 1=fully correlated (not used in current RSS)
 
 # Allow runtime override of START_DATE/DURATION_HOURS via CLI args or environment
 try:
@@ -250,6 +272,15 @@ temp_profile_k = temp_profile_c + 273.15  # Convert to Kelvin
 print(f"Using {len(temp_profile_c)} temperature periods for optimization")
 print(f"Temperature profile preview: {temp_profile_c[:5]} ... {temp_profile_c[-5:]} °C")
 print(f"Temperature in Kelvin: {temp_profile_k[:5]} ... {temp_profile_k[-5:]} K")
+
+# Precompute uncertainty metrics from temperature std for HP DRCC sizing
+try:
+    # Aligned std array (K) added later in load_input_data_from_csv; build placeholders now
+    # We'll overwrite these after load_input_data_from_csv is called in __main__.
+    globals()['sigma_Tavg_by_day'] = {}
+    globals()['Var_HDD_by_t'] = {}
+except Exception:
+    pass
 
 # Verify alignment
 # print(f"\nDATA ALIGNMENT VERIFICATION (first 5 periods):")
@@ -1362,7 +1393,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
 
     bess_eff = 0.95  # Round-trip efficiency
     bess_initial_soc = 0.5  # Initial state of charge as a percentage of capacity
-    bess_capacity_mwh = 0.1  # BESS capacity in MWh
+    bess_capacity_mwh = 0.25  # BESS capacity in MWh
     bess_cost_per_mwh = 5 # Cost per MWh of BESS capacity
 
     ### Define the variables ###
@@ -1613,18 +1644,17 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 except Exception:
                     print('\nDEBUG: net.load (first timestep): <unprintable>')
 
-        # plug in your chosen model’s coefficients (example: ridge dev_norm_Tavg_tod)
-        Pmax = 0.30
-        b0   = 0.065855
-        bHDD = 0.013056
-        bpi  = -0.000494
-        bTav = -0.010871
-        a1   = -0.017413
-        a2   = -0.009293
-
-        y_dev = b0 + bHDD*HDD_t + bpi*price_t + bTav*T_avg_d + a1*sin24 + a2*cos24
-        P_t = P_base + Pmax * y_dev
-        P_t = min(max(P_t, 0.0), Pmax)      # clip to [0, Pmax]
+        # HP predictor: baseline + deviation using shared constants
+        y_dev = (
+            HP_COEFF_B0
+            + HP_COEFF_BHDD * HDD_t
+            + HP_COEFF_BPI * price_t
+            + HP_COEFF_BTAV * T_avg_d
+            + HP_COEFF_A1 * sin24
+            + HP_COEFF_A2 * cos24
+        )
+        P_t = P_base + HP_PRED_PMAX * y_dev
+        P_t = min(max(P_t, 0.0), HP_PRED_PMAX)      # clip to [0, Pmax]
 
         # Track nominal HP aggregate for budgets for every timestep
         hp_pred_nominal[t] = float(P_t * len(hp_load_buses)) if len(hp_load_buses) > 0 else 0.0
@@ -1653,9 +1683,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             pv_installed_mw = 0.0
 
         # HP predictor sensitivity wrt daily mean temperature (same used earlier)
-        Pmax = 0.30
-        bTav = -0.010871
-        hp_temp_sens = abs(Pmax * bTav)  # MW per K
+        hp_temp_sens = abs(HP_PRED_PMAX * HP_COEFF_BTAV)  # MW per K
 
         for t in time_steps:
             sigma_pv = float(const_pv_std[t]) * pv_installed_mw
@@ -1980,7 +2008,16 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         if ENABLE_DRCC_NETWORK_TIGHTENING and (k_epsilon is not None):
             const_pv_std_arr = globals().get('const_pv_std', np.zeros(len(time_steps)))
             T_amb_std_arr = globals().get('T_amb_std', np.zeros(len(time_steps)))
-            hp_temp_sens = abs(0.30 * (-0.010871))  # MW per K
+            # Combined HP std per timestep (MW): includes daily-average and HDD variance
+            try:
+                sigma_Tavg_by_day = globals().get('sigma_Tavg_by_day', {})
+                Var_HDD_by_t = globals().get('Var_HDD_by_t', {})
+            except Exception:
+                sigma_Tavg_by_day = {}
+                Var_HDD_by_t = {}
+            Pmax_HP = HP_DRCC_PMAX
+            bTav_loc = HP_DRCC_BTAV
+            bHDD_loc = HP_DRCC_BHDD
             sigmaP_MW_by_bus = {bus: 0.0 for bus in net.bus.index}
             sigmaQ_MVar_by_bus = {bus: 0.0 for bus in net.bus.index}
             # PV deviations per PV bus
@@ -1989,8 +2026,23 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 # PV assumed unity PF here => no reactive deviation contribution
             # HP deviations spread across HP load buses
             if len(hp_load_buses) > 0:
-                # Per-HP per-bus sigma from temperature uncertainty
-                per_bus_hp_sigma = hp_temp_sens * float(T_amb_std_arr[t])
+                # Per-timestep HP std combining T_avg and HDD variance
+                try:
+                    dt_local = time_index[t]
+                    sigma_Tavg_d = float(sigma_Tavg_by_day.get(dt_local.date(), 0.0))
+                    var_HDD_t = float(Var_HDD_by_t.get(t, 0.0))
+                    sigma_HP_temp = float(np.sqrt(max(0.0, (Pmax_HP*bTav_loc*sigma_Tavg_d)**2 + (Pmax_HP*bHDD_loc)**2 * var_HDD_t)))
+                except Exception:
+                    sigma_HP_temp = abs(Pmax_HP * bTav_loc) * float(T_amb_std_arr[t])
+                # Add residual in quadrature if enabled
+                if bool(HP_INCLUDE_RESIDUAL):
+                    sigma_hp_resid = float(HP_PRED_PMAX * HP_RESIDUAL_SIGMA_NORM)
+                    sigma_HP_t = float(np.sqrt(max(0.0, sigma_HP_temp**2 + sigma_hp_resid**2)))
+                else:
+                    sigma_HP_t = sigma_HP_temp
+                # Distribute equally across HP buses
+                split = sigma_HP_t / max(1, len(hp_load_buses))
+                per_bus_hp_sigma = split
                 for bus in hp_load_buses:
                     sigmaP_MW_by_bus[bus] += per_bus_hp_sigma
                     # Map HP P sigma to Q sigma using fixed PF (inductive): Q = P * tan(arccos(pf_HP))
@@ -2031,7 +2083,9 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                         # Recompute per-source per-unit arrays
                         const_pv_std_arr = globals().get('const_pv_std', np.zeros(len(time_steps)))
                         T_amb_std_arr = globals().get('T_amb_std', np.zeros(len(time_steps)))
-                        hp_temp_sens_local = abs(0.30 * (-0.010871))
+                        sigma_Tavg_by_day = globals().get('sigma_Tavg_by_day', {})
+                        Var_HDD_by_t = globals().get('Var_HDD_by_t', {})
+                        Pmax_HP = HP_DRCC_PMAX; bTav_loc = HP_DRCC_BTAV; bHDD_loc = HP_DRCC_BHDD
                         sigmaP_PV_pu = np.zeros(len(non_slack_buses))
                         sigmaP_HP_pu = np.zeros(len(non_slack_buses))
                         sigmaQ_HP_pu = np.zeros(len(non_slack_buses))
@@ -2041,7 +2095,16 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                                 sigmaP_PV_pu[j] = (float(const_pv_std_arr[t]) * float(base_pv_bus_limits.get(b, 0.0))) / net.sn_mva
                         # HP per-bus (even spread)
                         if len(hp_load_buses) > 0:
-                            per_bus_hp_sigma = hp_temp_sens_local * float(T_amb_std_arr[t])
+                            try:
+                                dt_local = time_index[t]
+                                sigma_Tavg_d = float(sigma_Tavg_by_day.get(dt_local.date(), 0.0))
+                                var_HDD_t = float(Var_HDD_by_t.get(t, 0.0))
+                                sigma_HP_temp = float(np.sqrt(max(0.0, (Pmax_HP*bTav_loc*sigma_Tavg_d)**2 + (Pmax_HP*bHDD_loc)**2 * var_HDD_t)))
+                            except Exception:
+                                sigma_HP_temp = abs(Pmax_HP * bTav_loc) * float(T_amb_std_arr[t])
+                            sigma_hp_resid = float(HP_PRED_PMAX * HP_RESIDUAL_SIGMA_NORM) if bool(HP_INCLUDE_RESIDUAL) else 0.0
+                            sigma_HP_t = float(np.sqrt(max(0.0, sigma_HP_temp**2 + sigma_hp_resid**2)))
+                            per_bus_hp_sigma = sigma_HP_t / max(1, len(hp_load_buses))
                             for j, b in enumerate(non_slack_buses):
                                 if b in hp_load_buses:
                                     sigmaP_HP_pu[j] = per_bus_hp_sigma / net.sn_mva
@@ -2122,13 +2185,24 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 # Correlation-aware aggregation over downstream set
                 const_pv_std_arr = globals().get('const_pv_std', np.zeros(len(time_steps)))
                 T_amb_std_arr = globals().get('T_amb_std', np.zeros(len(time_steps)))
-                hp_temp_sens_local = abs(0.30 * (-0.010871))
+                sigma_Tavg_by_day = globals().get('sigma_Tavg_by_day', {})
+                Var_HDD_by_t = globals().get('Var_HDD_by_t', {})
+                Pmax_HP = HP_DRCC_PMAX; bTav_loc = HP_DRCC_BTAV; bHDD_loc = HP_DRCC_BHDD
                 rho_pv = max(0.0, min(1.0, float(PV_STD_CORRELATION))) if 'PV_STD_CORRELATION' in globals() else 0.0
                 downstream_set = set(downstream_map[to_bus]) | {to_bus}
                 # Build per-bus sigmas
                 sigmaP_PV = [float(const_pv_std_arr[t]) * float(base_pv_bus_limits.get(b, 0.0)) if b in pv_buses else 0.0 for b in downstream_set]
                 if len(hp_load_buses) > 0:
-                    per_bus_hp_sigma = hp_temp_sens_local * float(T_amb_std_arr[t])
+                    try:
+                        dt_local = time_index[t]
+                        sigma_Tavg_d = float(sigma_Tavg_by_day.get(dt_local.date(), 0.0))
+                        var_HDD_t = float(Var_HDD_by_t.get(t, 0.0))
+                        sigma_HP_temp = float(np.sqrt(max(0.0, (Pmax_HP*bTav_loc*sigma_Tavg_d)**2 + (Pmax_HP*bHDD_loc)**2 * var_HDD_t)))
+                    except Exception:
+                        sigma_HP_temp = abs(Pmax_HP * bTav_loc) * float(T_amb_std_arr[t])
+                    sigma_hp_resid = float(HP_PRED_PMAX * HP_RESIDUAL_SIGMA_NORM) if bool(HP_INCLUDE_RESIDUAL) else 0.0
+                    sigma_HP_t = float(np.sqrt(max(0.0, sigma_HP_temp**2 + sigma_hp_resid**2)))
+                    per_bus_hp_sigma = sigma_HP_t / max(1, len(hp_load_buses))
                     sigmaP_HP = [per_bus_hp_sigma if b in hp_load_buses else 0.0 for b in downstream_set]
                     sigmaQ_HP = [per_bus_hp_sigma * qfactor_heatpump if b in hp_load_buses else 0.0 for b in downstream_set]
                 else:
@@ -2185,12 +2259,23 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 # Correlation-aware aggregation over LV downstream set
                 const_pv_std_arr = globals().get('const_pv_std', np.zeros(len(time_steps)))
                 T_amb_std_arr = globals().get('T_amb_std', np.zeros(len(time_steps)))
-                hp_temp_sens_local = abs(0.30 * (-0.010871))
+                sigma_Tavg_by_day = globals().get('sigma_Tavg_by_day', {})
+                Var_HDD_by_t = globals().get('Var_HDD_by_t', {})
+                Pmax_HP = HP_DRCC_PMAX; bTav_loc = HP_DRCC_BTAV; bHDD_loc = HP_DRCC_BHDD
                 rho_pv = max(0.0, min(1.0, float(PV_STD_CORRELATION))) if 'PV_STD_CORRELATION' in globals() else 0.0
                 downstream_set = set(downstream_map[lv_bus]) | {lv_bus}
                 sigmaP_PV = [float(const_pv_std_arr[t]) * float(base_pv_bus_limits.get(b, 0.0)) if b in pv_buses else 0.0 for b in downstream_set]
                 if len(hp_load_buses) > 0:
-                    per_bus_hp_sigma = hp_temp_sens_local * float(T_amb_std_arr[t])
+                    try:
+                        dt_local = time_index[t]
+                        sigma_Tavg_d = float(sigma_Tavg_by_day.get(dt_local.date(), 0.0))
+                        var_HDD_t = float(Var_HDD_by_t.get(t, 0.0))
+                        sigma_HP_temp = float(np.sqrt(max(0.0, (Pmax_HP*bTav_loc*sigma_Tavg_d)**2 + (Pmax_HP*bHDD_loc)**2 * var_HDD_t)))
+                    except Exception:
+                        sigma_HP_temp = abs(Pmax_HP * bTav_loc) * float(T_amb_std_arr[t])
+                    sigma_hp_resid = float(HP_PRED_PMAX * HP_RESIDUAL_SIGMA_NORM) if bool(HP_INCLUDE_RESIDUAL) else 0.0
+                    sigma_HP_t = float(np.sqrt(max(0.0, sigma_HP_temp**2 + sigma_hp_resid**2)))
+                    per_bus_hp_sigma = sigma_HP_t / max(1, len(hp_load_buses))
                     sigmaP_HP = [per_bus_hp_sigma if b in hp_load_buses else 0.0 for b in downstream_set]
                     sigmaQ_HP = [per_bus_hp_sigma * qfactor_heatpump if b in hp_load_buses else 0.0 for b in downstream_set]
                 else:
@@ -2261,14 +2346,14 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     print("Using baseline+deviation (normalized by Pmax, with daily T_avg) predictor for HP (deterministic).")
 
     # Coeffs from learn_affine.py "Baseline + Deviation (normalized by Pmax, with daily T_avg) — Ridge"
-    Pmax = 0.30  # MW
-    Tbase = 10.0 # °C (from the fit)
-    b0   = 0.065855
-    bHDD = 0.013056
-    bpi  = -0.000494
-    bTav = -0.010871
-    a1   = -0.017413
-    a2   = -0.009293
+    Pmax = HP_PRED_PMAX
+    Tbase = HP_PRED_TBASE_C # °C (from the fit)
+    b0   = HP_COEFF_B0
+    bHDD = HP_COEFF_BHDD
+    bpi  = HP_COEFF_BPI
+    bTav = HP_COEFF_BTAV
+    a1   = HP_COEFF_A1
+    a2   = HP_COEFF_A2
 
     for t in time_steps:
         dt = time_index[t]  # pandas Timestamp
@@ -2370,12 +2455,24 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 # PV std in MW: std of normalized factor * installed PV (MW)
                 pv_installed_mw = float(base_pv_bus_limits.get(pv_buses[0], 0.0)) if len(pv_buses) == 1 else float(sum(base_pv_bus_limits.get(b, 0.0) for b in pv_buses))
                 sigma_pv = float(const_pv_std[t]) * pv_installed_mw
-                # HP std proxy: linearize P_t = P_base + Pmax*y_dev ≈ Pmax*(bTav*T_avg_d), use T std scaled
-                # Conservative: use sensitivity S_T = |Pmax * bTav| per °C (T_avg in °C), convert K std to °C std ~ same magnitude
-                Pmax = 0.30
-                bTav = -0.010871
-                sigma_hp = abs(Pmax * bTav) * float(T_amb_std[t])
-                # Aggregate std assuming independence (or moderate correlation could be added later)
+                # HP std from combined model: daily-average and HDD variance
+                sigma_Tavg_by_day = globals().get('sigma_Tavg_by_day', {})
+                Var_HDD_by_t = globals().get('Var_HDD_by_t', {})
+                Pmax_HP = HP_DRCC_PMAX; bTav_loc = HP_DRCC_BTAV; bHDD_loc = HP_DRCC_BHDD
+                try:
+                    dt_local = time_index[t]
+                    sigma_Tavg_d = float(sigma_Tavg_by_day.get(dt_local.date(), 0.0))
+                    var_HDD_t = float(Var_HDD_by_t.get(t, 0.0))
+                    sigma_hp_temp = float(np.sqrt(max(0.0, (Pmax_HP*bTav_loc*sigma_Tavg_d)**2 + (Pmax_HP*bHDD_loc)**2 * var_HDD_t)))
+                except Exception:
+                    sigma_hp_temp = abs(Pmax_HP * bTav_loc) * float(T_amb_std[t])
+                # Add residual sigma (normalized * Pmax) in quadrature if enabled
+                if bool(HP_INCLUDE_RESIDUAL):
+                    sigma_hp_resid = float(HP_PRED_PMAX * HP_RESIDUAL_SIGMA_NORM)
+                    sigma_hp = float(np.sqrt(max(0.0, sigma_hp_temp**2 + sigma_hp_resid**2)))
+                else:
+                    sigma_hp = sigma_hp_temp
+                # Aggregate std assuming independence
                 sigma_tot = np.sqrt(max(0.0, sigma_pv**2 + sigma_hp**2))
                 # Set symmetric budgets as k * sigma
                 D_plus_max[t] = k_e * sigma_tot
@@ -2728,6 +2825,12 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             'period': [t+1 for t in time_steps],
         }
 
+        # Add timestamp column for exact time alignment in downstream simulators
+        try:
+            results_data['timestamp'] = [str(pd.to_datetime(time_index[t])) for t in time_steps]
+        except Exception:
+            pass
+
         # Add COP profile (per-timestep) to results if available
         try:
             # cop_profile was computed earlier as a list indexed by time_steps
@@ -2755,7 +2858,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 trafo_col_name = f"transformer_{trafo_idx}_loading_pct"
                 results_data[trafo_col_name] = [results['transformer_loading'][t][trafo_idx] for t in time_steps]
         
-        # Add electrical grid import/export data
+    # Add electrical grid import/export data
         results_data['ext_grid_import_mw'] = [results['ext_grid_import_p'][t] for t in time_steps]
         results_data['ext_grid_export_mw'] = [results['ext_grid_export_p'][t] for t in time_steps]
         results_data['net_grid_power_mw'] = [results['ext_grid_import_p'][t] - results['ext_grid_export_p'][t] for t in time_steps]
@@ -2771,6 +2874,14 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         else:
             results_data['transformer_signed_p_mw'] = [0.0 for t in time_steps]
             results_data['transformer_grid_mw'] = [0.0 for t in time_steps]
+        # Add electricity price and ambient temperature for self-contained cost/simulation
+        # Export electricity price unconditionally (must align with time_steps)
+        results_data['electricity_price_eur_mwh'] = [float(electricity_price[t]) for t in time_steps]
+        try:
+            results_data['ambient_temp_c'] = [float(temp_profile_c[t]) for t in time_steps]
+        except Exception:
+            pass
+
         # Total HP electrical MW (sum across buses)
         results_data['hp_elec_mw'] = [sum(results['p_hp'][t].values()) if t in results['p_hp'] else 0.0 for t in time_steps]
         # Gross load MW (flexible + non-flexible + hp)
@@ -2780,6 +2891,41 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             (sum(results['p_hp'][t].values()) if t in results.get('p_hp', {}) else 0.0)
             for t in time_steps
         ]
+
+        # Export per-bus schedules needed for v3 OOS simulation
+        # PV generation per bus (DA schedule)
+        try:
+            if 'pv_gen' in results and len(pv_buses) > 0:
+                for bus in pv_buses:
+                    col = f'pv_gen_bus_{bus}_mw'
+                    results_data[col] = [results['pv_gen'][t].get(bus, 0.0) if t in results['pv_gen'] else 0.0 for t in time_steps]
+        except Exception:
+            pass
+        # PV available per bus (mean forecast without DA curtailment)
+        try:
+            if len(pv_buses) > 0:
+                for bus in pv_buses:
+                    col = f'pv_avail_bus_{bus}_mw'
+                    results_data[col] = [float(base_pv_bus_limits.get(bus, 0.0)) * float(const_pv[t]) for t in time_steps]
+        except Exception:
+            pass
+        # Flexible and non-flexible loads per bus (P and Q)
+        try:
+            for bus in net.bus.index:
+                # P components
+                results_data[f'load_flex_p_bus_{bus}_mw'] = [results.get('flexible_load_p', {}).get(t, {}).get(bus, 0.0) for t in time_steps]
+                results_data[f'load_nonflex_p_bus_{bus}_mw'] = [results.get('non_flexible_load_p', {}).get(t, {}).get(bus, 0.0) for t in time_steps]
+                # Q components
+                results_data[f'load_flex_q_bus_{bus}_mvar'] = [results.get('flexible_load_q', {}).get(t, {}).get(bus, 0.0) for t in time_steps]
+                results_data[f'load_nonflex_q_bus_{bus}_mvar'] = [results.get('non_flexible_load_q', {}).get(t, {}).get(bus, 0.0) for t in time_steps]
+        except Exception:
+            pass
+        # HP electrical consumption per bus (MW)
+        try:
+            for bus in net.bus.index:
+                results_data[f'hp_elec_bus_{bus}_mw'] = [results.get('p_hp', {}).get(t, {}).get(bus, 0.0) for t in time_steps]
+        except Exception:
+            pass
         
         # Expand BESS results into explicit per-bus columns (units: MWh for energy, MW for power)
         if 'bess_energy' in results and len(bess_buses) > 0:
@@ -2802,6 +2948,88 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 results_data[col_name_d] = [results['bess_discharge'][t].get(bus, 0.0) if t in results['bess_discharge'] else 0.0 for t in time_steps]
 
         results_df = pd.DataFrame(results_data)
+        # Attach metadata columns for full self-containment (repeat per row)
+        try:
+            # DRCC / RT policy flags
+            results_df['meta_enable_rt_policies'] = [bool(ENABLE_RT_POLICIES)] * len(results_df)
+            results_df['meta_enable_drcc_rt_budgets'] = [bool(ENABLE_DRCC_RT_BUDGETS)] * len(results_df)
+            results_df['meta_enable_drcc_network_tightening'] = [bool(ENABLE_DRCC_NETWORK_TIGHTENING)] * len(results_df)
+            results_df['meta_drcc_tighten_trafo'] = [bool(DRCC_TIGHTEN_TRAFO)] * len(results_df)
+            results_df['meta_drcc_tighten_lines'] = [bool(DRCC_TIGHTEN_LINES)] * len(results_df)
+            results_df['meta_drcc_tighten_voltages'] = [bool(DRCC_TIGHTEN_VOLTAGES)] * len(results_df)
+            # DRCC parameters
+            try:
+                eps_val = float(DRCC_EPSILON)
+            except Exception:
+                eps_val = np.nan
+            results_df['meta_drcc_epsilon'] = [eps_val] * len(results_df)
+            try:
+                k_eps = float(np.sqrt((1.0 - eps_val) / eps_val)) if (eps_val is not None and eps_val > 0.0 and eps_val < 1.0) else np.nan
+            except Exception:
+                k_eps = np.nan
+            results_df['meta_drcc_k_epsilon'] = [k_eps] * len(results_df)
+            # PV uncertainty handling
+            results_df['meta_pv_std_from_csv'] = [bool(PV_STD_FROM_CSV)] * len(results_df)
+            try:
+                results_df['meta_pv_relative_std'] = [float(PV_RELATIVE_STD)] * len(results_df) if 'PV_RELATIVE_STD' in globals() else [np.nan] * len(results_df)
+            except Exception:
+                results_df['meta_pv_relative_std'] = [np.nan] * len(results_df)
+            try:
+                results_df['meta_pv_std_correlation'] = [float(PV_STD_CORRELATION)] * len(results_df)
+            except Exception:
+                results_df['meta_pv_std_correlation'] = [np.nan] * len(results_df)
+            # HP predictor and uncertainty
+            results_df['meta_hp_fully_correlated'] = [bool(HP_FULLY_CORRELATED)] * len(results_df)
+            try:
+                results_df['meta_rho_temp_avg'] = [float(RHO_TEMP_AVG)] * len(results_df)
+            except Exception:
+                results_df['meta_rho_temp_avg'] = [np.nan] * len(results_df)
+            results_df['meta_hp_include_residual'] = [bool(HP_INCLUDE_RESIDUAL)] * len(results_df)
+            try:
+                results_df['meta_hp_residual_sigma_norm'] = [float(HP_RESIDUAL_SIGMA_NORM)] * len(results_df)
+            except Exception:
+                results_df['meta_hp_residual_sigma_norm'] = [np.nan] * len(results_df)
+            try:
+                results_df['meta_hp_pred_pmax_mw'] = [float(HP_PRED_PMAX)] * len(results_df)
+            except Exception:
+                results_df['meta_hp_pred_pmax_mw'] = [np.nan] * len(results_df)
+            # HP coefficients
+            for name, val in (
+                ('meta_hp_coeff_b0', 'HP_COEFF_B0'),
+                ('meta_hp_coeff_bhdd', 'HP_COEFF_BHDD'),
+                ('meta_hp_coeff_bpi', 'HP_COEFF_BPI'),
+                ('meta_hp_coeff_btav', 'HP_COEFF_BTAV'),
+                ('meta_hp_coeff_a1', 'HP_COEFF_A1'),
+                ('meta_hp_coeff_a2', 'HP_COEFF_A2'),
+            ):
+                try:
+                    results_df[name] = [float(globals().get(val))] * len(results_df)
+                except Exception:
+                    results_df[name] = [np.nan] * len(results_df)
+            # Time resolution and window
+            try:
+                results_df['meta_dt_hours'] = [float(dt_hours)] * len(results_df)
+            except Exception:
+                results_df['meta_dt_hours'] = [np.nan] * len(results_df)
+            try:
+                results_df['meta_time_start'] = [str(pd.to_datetime(time_index[0]))] * len(results_df)
+                results_df['meta_time_end'] = [str(pd.to_datetime(time_index[-1]))] * len(results_df)
+            except Exception:
+                pass
+            # BESS parameters used in DA plan
+            try:
+                results_df['meta_bess_eff'] = [float(bess_eff)] * len(results_df)
+                results_df['meta_bess_initial_soc'] = [float(bess_initial_soc)] * len(results_df)
+                results_df['meta_bess_capacity_mwh'] = [float(bess_capacity_mwh)] * len(results_df)
+            except Exception:
+                pass
+            # Also copy price into a meta-prefixed column for robustness
+            try:
+                results_df['meta_electricity_price_eur_mwh'] = results_df['electricity_price_eur_mwh']
+            except Exception:
+                pass
+        except Exception:
+            pass
         # Append robust recourse policy summaries for transparency
         try:
             if ENABLE_RT_POLICIES:
@@ -2931,6 +3159,61 @@ def load_input_data_from_csv(time_index):
         T_amb_std = np.zeros(len(time_index))
     # Expose as global for solve_opf (to avoid changing function signature)
     globals()['T_amb_std'] = T_amb_std
+
+    # Compute per-day std of daily average temperature using equicorrelation RHO_TEMP_AVG
+    try:
+        rho = float(globals().get('RHO_TEMP_AVG', 1.0))
+    except Exception:
+        rho = 1.0
+    rho = max(0.0, min(1.0, rho))
+
+    # Group temperature std by day aligned to time_index and compute std of the average
+    ti = pd.to_datetime(time_index)
+    sigma_Tavg_by_day = {}
+    # For each day, obtain stds of the samples belonging to that day
+    for day, idx in pd.Series(range(len(ti)), index=ti).groupby(ti.date):
+        inds = idx.values
+        sigmas = np.asarray(T_amb_std[inds], dtype=float)
+        if len(sigmas) == 0:
+            sigma_Tavg_by_day[day] = 0.0
+            continue
+        N = len(sigmas)
+        sumsig = float(np.sum(sigmas))
+        sumsqs = float(np.sum(sigmas**2))
+        var_avg = (1.0/(N*N)) * ((1.0 - rho) * sumsqs + rho * (sumsig**2))
+        sigma_Tavg_by_day[day] = float(np.sqrt(max(0.0, var_avg)))
+    globals()['sigma_Tavg_by_day'] = sigma_Tavg_by_day
+
+    # Compute Var(HDD_t) for each t using closed forms for positive part of normal
+    # HDD_t = max(0, Tbase - T_C_t). We approximate μ_t = T_C_t (Celsius forecast)
+    # and s_t = T_amb_std[t] (K/C). Then set m = a - μ_t, s = s_t, η = m/s.
+    Tbase = 10.0
+    Var_HDD_by_t = {}
+    # Convert Kelvin to Celsius for the mean temperature series
+    T_C = (T_amb - 273.15) if isinstance(T_amb, np.ndarray) else np.asarray(T_amb, dtype=float) - 273.15
+    from math import sqrt
+    import math
+    # Standard normal pdf and cdf
+    def _phi(x):
+        return 1.0/math.sqrt(2.0*math.pi) * math.exp(-0.5*x*x)
+    def _Phi(x):
+        # Use error function
+        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+    for t, dt in enumerate(ti):
+        s = float(T_amb_std[t])
+        m = float(Tbase - T_C[t])
+        if s <= 1e-12:
+            # Deterministic HDD variance 0 (unless m crosses 0, but s=0 ⇒ no randomness)
+            Var_HDD_by_t[t] = 0.0
+            continue
+        eta = m / s
+        phi = _phi(eta)
+        Phi = _Phi(eta)
+        EY = s*phi + m*Phi
+        EY2 = (s*s + m*m)*Phi + m*s*phi
+        varY = max(0.0, EY2 - EY*EY)
+        Var_HDD_by_t[t] = float(varY)
+    globals()['Var_HDD_by_t'] = Var_HDD_by_t
 
     # --- Load PV profile and align to the DHN/optimization time_index ---
     # const_pv is expected to be a normalized factor (0..1) that will later be multiplied

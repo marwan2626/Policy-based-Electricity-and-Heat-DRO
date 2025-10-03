@@ -1,0 +1,43 @@
+{
+  "v2_results_csv": "C:\\Users\\ckw5258\\Desktop\\Github\\Policy-based-Electricity-and-Heat-DRO\\dso_model_v2_results_drcc_true_epsilon_0_10.csv",
+  "epsilon": 0.1,
+  "samples_dir": "C:\\Users\\ckw5258\\Desktop\\Github\\Policy-based-Electricity-and-Heat-DRO\\samples",
+  "dt_hours": 0.25,
+  "n_trajectories": 1000,
+  "metrics": [
+    "import_mwh",
+    "energy_cost_eur",
+    "peak_import_mw",
+    "pv_energy_mwh",
+    "hp_resid_energy_mwh_abs",
+    "avg_temp_c",
+    "v_min_pu",
+    "v_max_pu",
+    "max_line_loading_pct",
+    "max_trafo_loading_pct",
+    "steps_line_over_80pct",
+    "steps_trafo_over_80pct",
+    "loading_violation_threshold_pct",
+    "steps_voltage_violation",
+    "pv_curtail_mwh",
+    "bess_rt_energy_throughput_mwh",
+    "imbalance_mwh",
+    "bess_soc_clip_steps",
+    "residual_policy_std",
+    "residual_policy_frac_negative",
+    "da_energy_cost_eur",
+    "rt_pv_curtail_cost_eur",
+    "rt_imbalance_cost_eur",
+    "rt_bess_cycle_cost_eur",
+    "total_cost_eur",
+    "sample_id"
+  ],
+  "write_diagnostics": false,
+  "rt_cost_factors": {
+    "imb_up_factor": 1.3,
+    "imb_dn_factor": 1.3,
+    "pv_curt_price_factor": 1.0,
+    "bess_throughput_cost_eur_per_mwh": 0.5
+  },
+  "ignore_hp_residual": false
+}
