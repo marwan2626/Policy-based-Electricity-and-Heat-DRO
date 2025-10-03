@@ -36,7 +36,7 @@ import pandas as pd
 # ===========================
 # Epsilon used in the v2 filename suffix: dso_model_v2_results_drcc_true_epsilon_{EPSILON_TOKEN}.csv
 # The token uses two decimals with underscore as decimal separator, e.g., 0.05 -> "0_05"
-EPSILON: float = 0.20
+EPSILON: float = 0.15
 
 # If RESULTS_CSV is None, we'll try to find a file named with the epsilon token in the current folder.
 RESULTS_CSV: Optional[str] = None
@@ -692,7 +692,7 @@ def main() -> None:
     IMB_UP_FACTOR = 1.3  # premium multiplier for upward imbalance energy (deficit)
     IMB_DN_FACTOR = 1.3  # premium multiplier for downward imbalance energy (surplus absorption)
     PV_CURT_PRICE_FACTOR = 1.0  # opportunity cost factor for curtailed scheduled PV (if any)
-    BESS_THROUGHPUT_COST_EUR_PER_MWH = 0.0  # optional degradation proxy
+    BESS_THROUGHPUT_COST_EUR_PER_MWH = 0.5  # optional degradation proxy
 
     # Day-ahead energy cost (constant across trajectories): only pay for DA scheduled imports
     da_import_mw = np.maximum(base_net_import, 0.0)
@@ -767,71 +767,77 @@ def main() -> None:
         da_hp_total = np.sum([base_hp_by_bus.get(b, np.zeros(len(index))) for b in base_hp_by_bus.keys()], axis=0) if base_hp_by_bus else np.zeros(len(index))
         hp_temp_dev_total = hp_pred_total - da_hp_total
 
-        # Components of deviation per trajectory:
+        # Components of deviation per trajectory (arrays length = horizon)
         hp_dev = hp_temp_dev_total + hp_resid_total
-        pv_shortfall = np.maximum(0.0, base_pv_da_total - pv_total_rt)
-        base_residual = hp_dev + pv_shortfall
+        pv_dev = base_pv_da_total - pv_total_rt  # signed PV deviation
+        base_residual = hp_dev + pv_dev
 
         # Accumulators for metrics and voltages
         net_import_rt = np.zeros(len(index))
         v_min = 10.0; v_max = 0.0
         max_line_loading = 0.0; max_trafo_loading = 0.0
-        # Violation counters (lines/trafo > threshold, voltage handled separately)
         steps_line_over_thresh = 0; steps_trafo_over_thresh = 0; steps_voltage_violation = 0
         pv_curtail_energy = 0.0; bess_rt_energy_throughput = 0.0
-        # RT cost accumulators (DA energy cost handled separately / constant per trajectory)
-        pv_rt_curt_cost_eur = 0.0
-        imbalance_cost_eur = 0.0
-        bess_cycle_cost_eur = 0.0
+        pv_rt_curt_cost_eur = 0.0; imbalance_cost_eur = 0.0; bess_cycle_cost_eur = 0.0
 
-        # Initialize BESS energy state (MWh)
+        # Initialize BESS state for this trajectory
         E_mwh = max(0.0, min(1.0, bess_initial_soc)) * max(0.0, total_bess_capacity_mwh)
-        bess_soc_clip_steps = 0
-        u_plus_energy = 0.0
-        u_minus_energy = 0.0
+        bess_soc_clip_steps = 0; u_plus_energy = 0.0; u_minus_energy = 0.0
 
         for t, ts in enumerate(index):
             row = df.iloc[t]
-            # Scheduled PV at DA (aggregate); availability for shortfall already in pv_shortfall
             pv_sched_t = float(base_pv_da_total[t])
-            # Initial residual (deficit) before actions
-            resid_t = float(base_residual[t])
+            resid_t = float(base_residual[t])  # initial signed residual
 
-            # Policy open-loop commands (based on current residual)
+            # Policy open-loop commands from affine recourse (based on initial residual)
             p_bess_cmd, extra_curt_cmd = apply_recourse_for_step(resid_t, row, pv_sched_t)
 
-            # If surplus (resid_t < 0) we can apply extra curtail to move residual toward 0
+            # --- Battery-first: project affine command onto feasible (power + energy) band ---
+            p_cmd = float(p_bess_cmd)
+            # Clip to nameplate power limits
+            if bess_pmax_total > 0:
+                p_cmd = max(-bess_pmax_total, min(bess_pmax_total, p_cmd))
+            else:
+                p_cmd = 0.0
+
+            if dt_hours > 0 and bess_eff > 0 and total_bess_capacity_mwh > 0:
+                # Energy-based instantaneous feasible range (positive discharge, negative charge)
+                p_max_energy = (E_mwh * bess_eff) / dt_hours  # max discharge allowed
+                charge_headroom = max(0.0, total_bess_capacity_mwh - E_mwh)
+                p_min_energy = - (charge_headroom / (bess_eff * dt_hours))  # max (negative) charging
+                # Combine with power bounds
+                p_min_total = max(-bess_pmax_total, p_min_energy)
+                p_max_total = min(bess_pmax_total, p_max_energy)
+                if p_min_total > p_max_total:
+                    # Degenerate band (numerical), collapse to 0
+                    p_min_total, p_max_total = 0.0, 0.0
+                p_real = min(max(p_cmd, p_min_total), p_max_total)
+            else:
+                # No meaningful capacity/efficiency info -> already power clipped
+                p_real = p_cmd if bess_pmax_total > 0 else 0.0
+
+            # SoC update (charge if p_real < 0, discharge if p_real > 0)
+            if dt_hours > 0 and bess_eff > 0 and total_bess_capacity_mwh > 0:
+                E_mwh = E_mwh + max(0.0, -p_real) * bess_eff * dt_hours - max(0.0, p_real) / bess_eff * dt_hours
+                E_mwh = max(0.0, min(total_bess_capacity_mwh, E_mwh))
+            else:
+                # Track clip if non-zero command requested but no capacity
+                if abs(p_real) > 1e-9:
+                    bess_soc_clip_steps += 1
+
+            bess_delta = p_real  # (+) discharge reduces deficit/import
+            resid_t -= bess_delta
+            if abs(p_real - p_bess_cmd) > 1e-9:
+                bess_soc_clip_steps += 1
+
+            # --- PV curtailment after battery action (only for remaining surplus) ---
             extra_curt_used = 0.0
             if resid_t < 0 and extra_curt_cmd > 0:
-                extra_curt_used = min(extra_curt_cmd, pv_sched_t)
-                resid_t += extra_curt_used  # curtail reduces injection -> increases residual toward zero
+                pv_avail_t = float(pv_total_rt[t])  # real-time available PV (aggregate)
+                extra_curt_used = min(extra_curt_cmd, pv_avail_t)
+                resid_t += extra_curt_used  # curtail reduces injection (moves residual toward zero)
 
-            # BESS helpful-only logic: discharge only for deficit, charge only for surplus
-            p_dis_req = max(0.0, p_bess_cmd) if resid_t > 0 else 0.0
-            p_ch_req = max(0.0, -p_bess_cmd) if resid_t < 0 else 0.0
-            # Power limits
-            p_dis = min(p_dis_req, bess_pmax_total)
-            p_ch = min(p_ch_req, bess_pmax_total)
-            # Energy feasibility
-            if dt_hours > 0 and bess_eff > 0:
-                p_dis_max_energy = (E_mwh * bess_eff) / dt_hours
-                p_ch_max_energy = (max(0.0, total_bess_capacity_mwh - E_mwh) / (bess_eff * dt_hours))
-                p_dis_clipped = min(p_dis, p_dis_max_energy)
-                p_ch_clipped = min(p_ch, p_ch_max_energy)
-            else:
-                p_dis_clipped = p_dis; p_ch_clipped = p_ch
-            if (abs(p_dis_clipped - p_dis_req) > 1e-9) or (abs(p_ch_clipped - p_ch_req) > 1e-9):
-                bess_soc_clip_steps += 1
-            # State update
-            if dt_hours > 0 and bess_eff > 0:
-                E_mwh = E_mwh + p_ch_clipped * bess_eff * dt_hours - (p_dis_clipped / bess_eff) * dt_hours
-                if total_bess_capacity_mwh > 0:
-                    E_mwh = max(0.0, min(total_bess_capacity_mwh, E_mwh))
-            bess_delta = p_dis_clipped - p_ch_clipped  # positive reduces import
-            # Update residual (apply BESS effect)
-            resid_t -= bess_delta  # discharge reduces deficit; charge (if any) increases residual toward zero
-
-            # Final PCC imbalance after local actions
+            # Final PCC imbalance after local actions (signed residual -> two-sided imbalance)
             u_plus = max(0.0, resid_t)
             u_minus = max(0.0, -resid_t)
 
