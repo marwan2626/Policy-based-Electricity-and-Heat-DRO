@@ -48,13 +48,16 @@ SAMPLES_DIR: str = "samples"
 MAX_TRAJ: Optional[int] = None
 
 # Toggle to ignore stochastic HP residuals in OOS (Option A). When True, only temperature-driven HP deviations remain.
-IGNORE_HP_RESIDUAL: bool = True
+IGNORE_HP_RESIDUAL: bool = False
 
 # Write per-trajectory time series diagnostics (large files). Disabled by default.
 WRITE_DIAGNOSTICS: bool = False
 
 # Output directory for v3 results
 OUTDIR: str = "v3_oos"
+
+# Threshold (in percent) above which a line or transformer loading counts as a violation step
+LOADING_VIOLATION_THRESHOLD_PCT: float = 80.0
 
 
 # ===========================
@@ -773,7 +776,8 @@ def main() -> None:
         net_import_rt = np.zeros(len(index))
         v_min = 10.0; v_max = 0.0
         max_line_loading = 0.0; max_trafo_loading = 0.0
-        steps_line_over = 0; steps_trafo_over = 0; steps_voltage_violation = 0
+        # Violation counters (lines/trafo > threshold, voltage handled separately)
+        steps_line_over_thresh = 0; steps_trafo_over_thresh = 0; steps_voltage_violation = 0
         pv_curtail_energy = 0.0; bess_rt_energy_throughput = 0.0
         # RT cost accumulators (DA energy cost handled separately / constant per trajectory)
         pv_rt_curt_cost_eur = 0.0
@@ -913,7 +917,7 @@ def main() -> None:
             Vcomplex = Vmag * np.exp(1j * theta)
 
             # Line loading
-            any_line_over = False
+            any_line_over_thresh = False
             for fb, tb, y, Imax_kA, Vbase_kV in line_data:
                 if Imax_kA <= 0:
                     continue
@@ -922,13 +926,13 @@ def main() -> None:
                 loading_pct = (I_kA / Imax_kA) * 100.0
                 if loading_pct > max_line_loading:
                     max_line_loading = float(loading_pct)
-                if loading_pct > 100.0:
-                    any_line_over = True
-            if any_line_over:
-                steps_line_over += 1
+                if loading_pct > LOADING_VIOLATION_THRESHOLD_PCT:
+                    any_line_over_thresh = True
+            if any_line_over_thresh:
+                steps_line_over_thresh += 1
 
             # Transformer loading (LV side apparent power vs nameplate)
-            any_trafo_over = False
+            any_trafo_over_thresh = False
             for hv, lv, y_tr, sn_tr in trafo_data:
                 I_lv_pu = (Vcomplex[lv] - Vcomplex[hv]) * y_tr
                 S_lv_pu = Vcomplex[lv] * np.conj(I_lv_pu)
@@ -937,10 +941,10 @@ def main() -> None:
                     loading_pct = (S_lv_MVA / sn_tr) * 100.0
                     if loading_pct > max_trafo_loading:
                         max_trafo_loading = float(loading_pct)
-                    if loading_pct > 100.0:
-                        any_trafo_over = True
-            if any_trafo_over:
-                steps_trafo_over += 1
+                    if loading_pct > LOADING_VIOLATION_THRESHOLD_PCT:
+                        any_trafo_over_thresh = True
+            if any_trafo_over_thresh:
+                steps_trafo_over_thresh += 1
 
         # Summarize metrics including voltage and thermal bounds
         summ = _summarize_trajectory(index, price, net_import_rt, dt_hours, pv_total_rt, hp_resid_total, temp_sid['temperature_c'].to_numpy(dtype=float))
@@ -948,8 +952,9 @@ def main() -> None:
         summ['v_max_pu'] = v_max
         summ['max_line_loading_pct'] = max_line_loading
         summ['max_trafo_loading_pct'] = max_trafo_loading
-        summ['steps_line_over_100pct'] = int(steps_line_over)
-        summ['steps_trafo_over_100pct'] = int(steps_trafo_over)
+        summ['steps_line_over_80pct'] = int(steps_line_over_thresh)
+        summ['steps_trafo_over_80pct'] = int(steps_trafo_over_thresh)
+        summ['loading_violation_threshold_pct'] = float(LOADING_VIOLATION_THRESHOLD_PCT)
         summ['steps_voltage_violation'] = int(steps_voltage_violation)
         summ['pv_curtail_mwh'] = pv_curtail_energy
         summ['bess_rt_energy_throughput_mwh'] = bess_rt_energy_throughput
