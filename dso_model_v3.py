@@ -36,7 +36,11 @@ import pandas as pd
 # ===========================
 # Epsilon used in the v2 filename suffix: dso_model_v2_results_drcc_true_epsilon_{EPSILON_TOKEN}.csv
 # The token uses two decimals with underscore as decimal separator, e.g., 0.05 -> "0_05"
-EPSILON: float = 0.30
+EPSILON: float = 0.05
+# When running the deterministic (no DRCC tightening) case, set RUN_DRCC_FALSE = True.
+# In that mode we ignore EPSILON for locating the v2 results CSV and instead look for
+# files named like: dso_model_v2_results_drcc_false*.csv
+RUN_DRCC_FALSE: bool = True
 
 # If RESULTS_CSV is None, we'll try to find a file named with the epsilon token in the current folder.
 RESULTS_CSV: Optional[str] = None
@@ -45,7 +49,8 @@ RESULTS_CSV: Optional[str] = None
 SAMPLES_DIR: str = "samples"
 
 # Limit number of trajectories (sample_id) for a quick run. None means evaluate all.
-MAX_TRAJ: Optional[int] = None
+# For quicker rerun / debugging, cap trajectories (set to None for full 1000). Adjusted automatically if env V3_MAX_TRAJ set.
+MAX_TRAJ: Optional[int] = 120
 
 # Toggle to ignore stochastic HP residuals in OOS (Option A). When True, only temperature-driven HP deviations remain.
 IGNORE_HP_RESIDUAL: bool = False
@@ -62,6 +67,25 @@ LOADING_VIOLATION_THRESHOLD_PCT: float = 80.0
 # Phase 1: Use mean-centered residual for policy activation (instead of schedule-referenced residual)
 USE_MEAN_CENTERED_POLICY: bool = True
 
+# Logging of transformer loading distributions (for CVaR / tail risk analysis)
+LOG_TRAFO_LOADING: bool = True  # set True to enable logging
+TRAFO_LOADING_BUFFER_SAMPLES: int = 50  # flush every N samples
+TRAFO_LOADING_DIR_NAME: str = "v3_loading"  # subdirectory inside OUTDIR
+TRAFO_LOADING_FILENAME_PREFIX: str = "trafo_loading_raw_epsilon_"  # suffix token + .parquet
+TRAFO_LOADING_FLOAT_DTYPE = "float32"
+TRAFO_LOADING_WRITE_PARQUET: bool = True  # requires pyarrow; auto-falls back to CSV if engine unavailable
+_PYARROW_AVAILABLE = False
+try:
+    import pyarrow  # type: ignore
+    _PYARROW_AVAILABLE = True
+except Exception:
+    try:
+        import fastparquet  # type: ignore
+        _PYARROW_AVAILABLE = True
+    except Exception:
+        _PYARROW_AVAILABLE = False
+        # We'll downgrade to CSV later if requested parquet not possible
+
 
 # ===========================
 # Helpers
@@ -74,19 +98,36 @@ def _epsilon_token(eps: float) -> str:
 
 
 def _infer_v2_csv(epsilon: float) -> Optional[str]:
+    """Locate a v2 results CSV.
+
+    Logic:
+    - If RUN_DRCC_FALSE is True: ignore epsilon and search for deterministic files
+      starting with 'dso_model_v2_results_drcc_false'. If multiple, pick most recent.
+    - Else (DRCC / tightened case): use epsilon token to find 'drcc_true' file first;
+      fallback to any file containing that token.
+    """
+    if RUN_DRCC_FALSE:
+        prefix = "dso_model_v2_results_drcc_false"
+        det_candidates = [
+            f for f in os.listdir(os.getcwd())
+            if f.startswith(prefix) and f.endswith('.csv')
+        ]
+        if not det_candidates:
+            return None
+        det_candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return det_candidates[0]
+
+    # DRCC (tightened) path uses epsilon token
     token = _epsilon_token(epsilon)
-    # Try the canonical name first
-    name = f"dso_model_v2_results_drcc_true_epsilon_{token}.csv"
-    if os.path.exists(name):
-        return name
-    # Fallback: search for any results file containing the token
+    canonical = f"dso_model_v2_results_drcc_true_epsilon_{token}.csv"
+    if os.path.exists(canonical):
+        return canonical
+    # Fallback: any file with the token (keeps backward compatibility if naming shifted)
     candidates = [
-        f
-        for f in os.listdir(os.getcwd())
-        if f.startswith("dso_model_v2_results_") and f.endswith(".csv") and token in f
+        f for f in os.listdir(os.getcwd())
+        if f.startswith("dso_model_v2_results_") and f.endswith('.csv') and token in f
     ]
     if candidates:
-        # pick most recent
         candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         return candidates[0]
     return None
@@ -544,6 +585,8 @@ def main() -> None:
     base_hp_by_bus_raw = _collect_da_series(df, hp_bus_ids_raw, 'hp_elec_bus_', '_mw')
     # DA PV setpoints (what was actually scheduled in v2)
     base_pv_da_total = np.sum(list(base_pv_da_by_bus.values()), axis=0) if base_pv_da_by_bus else np.zeros(len(index))
+    # Forecast (mean) PV availability total for mean-centering policy residuals
+    pv_mean_total = np.sum(list(base_pv_by_bus.values()), axis=0) if base_pv_by_bus else np.zeros(len(index))
 
     # Filter samples to our timestamps
     temp_df = temp_df[temp_df['timestamp'].isin(index)]
@@ -554,6 +597,16 @@ def main() -> None:
     sample_ids = sorted(set(pv_df['sample_id'].unique()) & set(hp_df['sample_id'].unique()) & set(temp_df['sample_id'].unique()))
     if MAX_TRAJ is not None:
         sample_ids = sample_ids[: int(MAX_TRAJ)]
+    # Optional environment override for quick testing (does not alter stored config)
+    env_max = os.getenv('V3_MAX_TRAJ')
+    if env_max:
+        try:
+            env_lim = int(env_max)
+            if env_lim > 0:
+                sample_ids = sample_ids[:env_lim]
+                print(f"[v3] ENV override: limiting trajectories to {env_lim} via V3_MAX_TRAJ")
+        except Exception:
+            pass
     if not sample_ids:
         raise RuntimeError("No overlapping sample_ids found across PV/HP/Temperature samples")
 
@@ -708,6 +761,25 @@ def main() -> None:
     qfactor_household_const = float(np.tan(np.arccos(0.98)))
     qfactor_hp_const = float(np.tan(np.arccos(0.99)))
 
+    # Prepare transformer loading logging
+    trafo_loading_buffer: List[tuple] = []  # (sample_id, t_idx, trafo_index, loading_pct_float32)
+    trafo_meta_written = False
+    trafo_meta_records: List[Dict[str, object]] = []
+    trafo_count = len(trafo_data)
+    if LOG_TRAFO_LOADING and trafo_count > 0:
+        os.makedirs(os.path.join(OUTDIR, TRAFO_LOADING_DIR_NAME), exist_ok=True)
+        # Build meta once from trafo_data order
+        for idx_tr, (hv, lv, y_tr, sn_tr) in enumerate(trafo_data):
+            trafo_meta_records.append({
+                'trafo_index': idx_tr,
+                'hv_bus': int(hv),
+                'lv_bus': int(lv),
+                'sn_mva': float(sn_tr)
+            })
+
+    # Collect SoC trajectories for envelope export
+    collect_soc_frac: List[np.ndarray] = []
+
     total = len(sample_ids)
     report_step = max(1, total // 20)  # ~5% steps
     for i, sid in enumerate(sample_ids, start=1):
@@ -774,13 +846,15 @@ def main() -> None:
         hp_dev = hp_temp_dev_total + hp_resid_total
         pv_dev = base_pv_da_total - pv_total_rt  # signed PV deviation vs DA schedule (for reporting)
         base_residual = hp_dev + pv_dev          # schedule-based residual
-
-        # Mean-centered policy residual (hp mean = hp_pred_total, hp residual adds zero mean; pv mean = base_pv_da_total)
-        # Realized pre-action net stochastic deviation relative to forecast mean:
-        #   hp_mean_dev = -hp_resid_total (since hp_pred_total is mean)
-        #   pv_mean_dev = (base_pv_da_total - pv_total_rt) = pv_dev
-        # Combine for a mean-centered residual: hp_mean_dev + pv_mean_dev
-        residual_policy_array = (-hp_resid_total) + pv_dev
+        # Mean-centered policy residual if enabled:
+        # hp mean deviation = -hp_resid_total (hp_pred_total used as mean predictor)
+        # pv mean deviation = pv_mean_total - pv_total_rt
+        # residual_policy_array = hp_mean_dev + pv_mean_dev
+        if USE_MEAN_CENTERED_POLICY:
+            pv_mean_dev = pv_mean_total - pv_total_rt
+            residual_policy_array = (-hp_resid_total) + pv_mean_dev
+        else:
+            residual_policy_array = base_residual  # legacy schedule-based activation
 
         # Accumulators for metrics and voltages
         net_import_rt = np.zeros(len(index))
@@ -793,6 +867,8 @@ def main() -> None:
         # Initialize BESS state for this trajectory
         E_mwh = max(0.0, min(1.0, bess_initial_soc)) * max(0.0, total_bess_capacity_mwh)
         bess_soc_clip_steps = 0; u_plus_energy = 0.0; u_minus_energy = 0.0
+        # Track SoC fraction series for this trajectory
+        soc_series = np.zeros(len(index), dtype=float)
 
         # Collect policy residual stats if enabled
         residual_policy_vals = [] if USE_MEAN_CENTERED_POLICY else None
@@ -844,6 +920,8 @@ def main() -> None:
                 # Track clip if non-zero command requested but no capacity
                 if abs(p_real) > 1e-9:
                     bess_soc_clip_steps += 1
+            # Record SoC fraction after update
+            soc_series[t] = (E_mwh / total_bess_capacity_mwh) if total_bess_capacity_mwh > 0 else 0.0
 
             bess_delta = p_real  # (+) discharge reduces deficit/import
             resid_t -= bess_delta
@@ -959,7 +1037,7 @@ def main() -> None:
 
             # Transformer loading (LV side apparent power vs nameplate)
             any_trafo_over_thresh = False
-            for hv, lv, y_tr, sn_tr in trafo_data:
+            for idx_tr, (hv, lv, y_tr, sn_tr) in enumerate(trafo_data):
                 I_lv_pu = (Vcomplex[lv] - Vcomplex[hv]) * y_tr
                 S_lv_pu = Vcomplex[lv] * np.conj(I_lv_pu)
                 S_lv_MVA = abs(S_lv_pu) * Sbase
@@ -969,8 +1047,36 @@ def main() -> None:
                         max_trafo_loading = float(loading_pct)
                     if loading_pct > LOADING_VIOLATION_THRESHOLD_PCT:
                         any_trafo_over_thresh = True
+                    if LOG_TRAFO_LOADING:
+                        trafo_loading_buffer.append((sid, t, idx_tr, np.float32(loading_pct)))
             if any_trafo_over_thresh:
                 steps_trafo_over_thresh += 1
+
+        # Flush buffer periodically
+        if LOG_TRAFO_LOADING and trafo_loading_buffer and (i % TRAFO_LOADING_BUFFER_SAMPLES == 0 or i == total):
+            try:
+                import pandas as _pd
+                buf_df = _pd.DataFrame(trafo_loading_buffer, columns=['sample_id', 't', 'trafo_index', 'loading_pct'])
+                # Write/append parquet
+                token = _epsilon_token(EPSILON)
+                out_dir = os.path.join(OUTDIR, TRAFO_LOADING_DIR_NAME)
+                out_path = os.path.join(out_dir, f"{TRAFO_LOADING_FILENAME_PREFIX}{token}.parquet")
+                if TRAFO_LOADING_WRITE_PARQUET and _PYARROW_AVAILABLE:
+                    # Append mode: if file exists, concat then overwrite (simpler than row-group append without pyarrow writer state)
+                    if os.path.exists(out_path):
+                        existing = _pd.read_parquet(out_path)
+                        buf_df = _pd.concat([existing, buf_df], ignore_index=True)
+                    buf_df['loading_pct'] = buf_df['loading_pct'].astype(TRAFO_LOADING_FLOAT_DTYPE)
+                    buf_df.to_parquet(out_path, index=False)
+                else:
+                    # Fallback CSV
+                    if os.path.exists(out_path.replace('.parquet', '.csv')):
+                        buf_df.to_csv(out_path.replace('.parquet', '.csv'), mode='a', header=False, index=False)
+                    else:
+                        buf_df.to_csv(out_path.replace('.parquet', '.csv'), index=False)
+                trafo_loading_buffer.clear()
+            except Exception as e:
+                print(f"[WARN] Failed to write transformer loading buffer: {e}")
 
         # Summarize metrics including voltage and thermal bounds
         summ = _summarize_trajectory(index, price, net_import_rt, dt_hours, pv_total_rt, hp_resid_total, temp_sid['temperature_c'].to_numpy(dtype=float))
@@ -1000,16 +1106,62 @@ def main() -> None:
         summ['rt_bess_cycle_cost_eur'] = float(bess_cycle_cost_eur)
         summ['total_cost_eur'] = float(da_energy_cost_eur_const + pv_rt_curt_cost_eur + imbalance_cost_eur + bess_cycle_cost_eur)
         summ['sample_id'] = sid
+        # Store trajectory length and append (inside loop; previously mis-indented causing only last trajectory retained)
+        summ['n_steps'] = int(len(index))
         per_traj_summary.append(summ)
+        collect_soc_frac.append(soc_series)
 
     token = _epsilon_token(EPSILON)
+    # Derive DRCC mode label from v2 filename if present
+    try:
+        base_v2_name = os.path.basename(v2_csv) if v2_csv else ''
+    except Exception:
+        base_v2_name = ''
+    if 'drcc_true' in base_v2_name:
+        drcc_mode = 'drcc_true'
+    elif 'drcc_false' in base_v2_name:
+        drcc_mode = 'drcc_false'
+    else:
+        # Fallback: infer from meta flags we wrote (network tightening logging flag not available here, so leave generic)
+        drcc_mode = 'drcc_unspecified'
+
     summary_df = pd.DataFrame(per_traj_summary)
-    summary_path = os.path.join(OUTDIR, f'v3_summary_epsilon_{token}.csv')
+    # Filename logic: omit epsilon token for deterministic (drcc_false) case
+    if drcc_mode == 'drcc_false':
+        summary_filename = 'v3_summary_drcc_false.csv'
+    else:
+        summary_filename = f'v3_summary_{drcc_mode}_epsilon_{token}.csv'
+    summary_path = os.path.join(OUTDIR, summary_filename)
     summary_df.to_csv(summary_path, index=False)
+
+    # Export SoC envelope (05/50/95) across trajectories with naming consistent to summary/meta
+    soc_env_path = None
+    if collect_soc_frac:
+        try:
+            soc_mat = np.vstack(collect_soc_frac)
+            soc_p05 = np.percentile(soc_mat, 5, axis=0)
+            soc_p50 = np.percentile(soc_mat, 50, axis=0)
+            soc_p95 = np.percentile(soc_mat, 95, axis=0)
+            soc_env_df = pd.DataFrame({
+                'timestamp': index,
+                'soc_p05': soc_p05,
+                'soc_p50': soc_p50,
+                'soc_p95': soc_p95,
+            })
+            if drcc_mode == 'drcc_false':
+                soc_env_filename = 'soc_envelope_drcc_false.csv'
+            else:
+                soc_env_filename = f"soc_envelope_{drcc_mode}_epsilon_{token}.csv"
+            soc_env_path = os.path.join(OUTDIR, soc_env_filename)
+            soc_env_df.to_csv(soc_env_path, index=False)
+            print(f"✓ SoC envelope written: {soc_env_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to write SoC envelope: {e}")
 
     meta = {
         'v2_results_csv': os.path.abspath(v2_csv),
         'epsilon': EPSILON,
+        'drcc_mode': drcc_mode,
         'samples_dir': os.path.abspath(SAMPLES_DIR),
         'dt_hours': float(dt_hours),
         'n_trajectories': int(len(summary_df)),
@@ -1021,12 +1173,56 @@ def main() -> None:
             'pv_curt_price_factor': PV_CURT_PRICE_FACTOR,
             'bess_throughput_cost_eur_per_mwh': BESS_THROUGHPUT_COST_EUR_PER_MWH
         },
-        'ignore_hp_residual': bool(IGNORE_HP_RESIDUAL)
+        'ignore_hp_residual': bool(IGNORE_HP_RESIDUAL),
+        'use_mean_centered_policy': bool(USE_MEAN_CENTERED_POLICY),
+        'trafo_loading_logging': bool(LOG_TRAFO_LOADING)
     }
-    with open(os.path.join(OUTDIR, f'v3_meta_epsilon_{token}.json'), 'w', encoding='utf-8') as f:
+    # Add residual basis descriptor
+    meta['rt_residual_basis'] = 'mean_centered' if USE_MEAN_CENTERED_POLICY else 'schedule'
+    if soc_env_path:
+        meta['soc_envelope_file'] = os.path.basename(soc_env_path)
+    # Policy coefficients export (raw)
+    policy_coeffs_path = None
+    policy_cols = [c for c in [
+        'lambda0_mw','lambda_plus','lambda_minus',
+        'chi0_mw','chi_minus',
+        'gamma0_mw','gamma_plus',
+        'rho_plus_0','rho_plus_1','rho_minus_0','rho_minus_1'
+    ] if c in df.columns]
+    if policy_cols:
+        try:
+            policy_df = df[policy_cols].copy()
+            policy_df.insert(0, 'timestamp', df.index)
+            if drcc_mode == 'drcc_false':
+                policy_coeffs_filename = 'policy_coeffs_drcc_false.csv'
+            else:
+                policy_coeffs_filename = f"policy_coeffs_{drcc_mode}_epsilon_{token}.csv"
+            policy_coeffs_path = os.path.join(OUTDIR, policy_coeffs_filename)
+            policy_df.to_csv(policy_coeffs_path, index=False)
+            print(f"✓ Policy coefficients written: {policy_coeffs_path}")
+            meta['policy_coeffs_file'] = os.path.basename(policy_coeffs_path)
+        except Exception as e:
+            print(f"[WARN] Failed to export policy coefficients: {e}")
+    if LOG_TRAFO_LOADING and trafo_meta_records:
+        meta['trafo_loading_file'] = os.path.join(TRAFO_LOADING_DIR_NAME, f"{TRAFO_LOADING_FILENAME_PREFIX}{_epsilon_token(EPSILON)}.parquet")
+        meta['n_trafos'] = len(trafo_meta_records)
+        # Write meta for transformers if not exists
+        try:
+            meta_path_tr = os.path.join(OUTDIR, TRAFO_LOADING_DIR_NAME, f"trafo_meta_{_epsilon_token(EPSILON)}.csv")
+            if not os.path.exists(meta_path_tr):
+                pd.DataFrame(trafo_meta_records).to_csv(meta_path_tr, index=False)
+        except Exception as e:
+            print(f"[WARN] Could not write trafo meta CSV: {e}")
+    # Meta filename mirrors summary logic
+    if drcc_mode == 'drcc_false':
+        meta_filename = 'v3_meta_drcc_false.json'
+    else:
+        meta_filename = f'v3_meta_{drcc_mode}_epsilon_{token}.json'
+    with open(os.path.join(OUTDIR, meta_filename), 'w', encoding='utf-8') as f:
         json.dump(meta, f, indent=2)
 
     print(f"✓ v3 summary written: {summary_path}")
+    print(f"✓ v3 meta written: {os.path.join(OUTDIR, meta_filename)}")
 
 
 if __name__ == "__main__":
