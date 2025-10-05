@@ -1984,8 +1984,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
 
     bess_eff = 0.95  # Round-trip efficiency
     bess_initial_soc = 0.5  # Initial state of charge as a percentage of capacity
-    bess_capacity_mwh = 0.1  # BESS capacity in MWh
-    bess_cost_per_mwh = 10 # Cost per MWh of BESS capacity
+    bess_capacity_mwh = 0.25  # BESS capacity in MWh
+    bess_cost_per_mwh = 5.1 # Cost per MWh of BESS capacity
 
     ### Define the variables ###
     epsilon = 100e-9  # Small positive value to ensure some external grid usage
@@ -3278,6 +3278,10 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     #model.setParam('OutputFlag', 0)
     #model.setParam('Presolve', 0)
     #model.setParam('NonConvex', 2)
+    #model.setParam("NumericFocus", 3)
+    model.setParam("BarHomogeneous", 1)
+    model.setParam("Crossover", 0)
+    model.setParam("BarQCPConvTol", 1e-8)
 
     model.update()
 

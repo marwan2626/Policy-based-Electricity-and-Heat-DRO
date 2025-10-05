@@ -1,10 +1,10 @@
 {
   "v2_results_csv": "C:\\Users\\ckw5258\\Desktop\\Github\\Policy-based-Electricity-and-Heat-DRO\\dso_model_v2_results_drcc_false.csv",
-  "epsilon": 0.05,
+  "epsilon": 0.3,
   "drcc_mode": "drcc_false",
   "samples_dir": "C:\\Users\\ckw5258\\Desktop\\Github\\Policy-based-Electricity-and-Heat-DRO\\samples",
   "dt_hours": 0.25,
-  "n_trajectories": 120,
+  "n_trajectories": 1000,
   "metrics": [
     "import_mwh",
     "energy_cost_eur",
@@ -31,8 +31,7 @@
     "rt_imbalance_cost_eur",
     "rt_bess_cycle_cost_eur",
     "total_cost_eur",
-    "sample_id",
-    "n_steps"
+    "sample_id"
   ],
   "write_diagnostics": false,
   "rt_cost_factors": {
@@ -44,9 +43,6 @@
   "ignore_hp_residual": false,
   "use_mean_centered_policy": true,
   "trafo_loading_logging": true,
-  "rt_residual_basis": "mean_centered",
-  "soc_envelope_file": "soc_envelope_drcc_false.csv",
-  "policy_coeffs_file": "policy_coeffs_drcc_false.csv",
-  "trafo_loading_file": "v3_loading\\trafo_loading_raw_epsilon_0_05.parquet",
+  "trafo_loading_file": "v3_loading\\trafo_loading_raw_epsilon_0_30.parquet",
   "n_trafos": 1
 }

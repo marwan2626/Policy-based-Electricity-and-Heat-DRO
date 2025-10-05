@@ -36,11 +36,11 @@ import pandas as pd
 # ===========================
 # Epsilon used in the v2 filename suffix: dso_model_v2_results_drcc_true_epsilon_{EPSILON_TOKEN}.csv
 # The token uses two decimals with underscore as decimal separator, e.g., 0.05 -> "0_05"
-EPSILON: float = 0.05
+EPSILON: float = 0.30
 # When running the deterministic (no DRCC tightening) case, set RUN_DRCC_FALSE = True.
 # In that mode we ignore EPSILON for locating the v2 results CSV and instead look for
 # files named like: dso_model_v2_results_drcc_false*.csv
-RUN_DRCC_FALSE: bool = True
+RUN_DRCC_FALSE: bool = False
 
 # If RESULTS_CSV is None, we'll try to find a file named with the epsilon token in the current folder.
 RESULTS_CSV: Optional[str] = None
@@ -49,8 +49,7 @@ RESULTS_CSV: Optional[str] = None
 SAMPLES_DIR: str = "samples"
 
 # Limit number of trajectories (sample_id) for a quick run. None means evaluate all.
-# For quicker rerun / debugging, cap trajectories (set to None for full 1000). Adjusted automatically if env V3_MAX_TRAJ set.
-MAX_TRAJ: Optional[int] = 120
+MAX_TRAJ: Optional[int] = None
 
 # Toggle to ignore stochastic HP residuals in OOS (Option A). When True, only temperature-driven HP deviations remain.
 IGNORE_HP_RESIDUAL: bool = False
@@ -73,18 +72,7 @@ TRAFO_LOADING_BUFFER_SAMPLES: int = 50  # flush every N samples
 TRAFO_LOADING_DIR_NAME: str = "v3_loading"  # subdirectory inside OUTDIR
 TRAFO_LOADING_FILENAME_PREFIX: str = "trafo_loading_raw_epsilon_"  # suffix token + .parquet
 TRAFO_LOADING_FLOAT_DTYPE = "float32"
-TRAFO_LOADING_WRITE_PARQUET: bool = True  # requires pyarrow; auto-falls back to CSV if engine unavailable
-_PYARROW_AVAILABLE = False
-try:
-    import pyarrow  # type: ignore
-    _PYARROW_AVAILABLE = True
-except Exception:
-    try:
-        import fastparquet  # type: ignore
-        _PYARROW_AVAILABLE = True
-    except Exception:
-        _PYARROW_AVAILABLE = False
-        # We'll downgrade to CSV later if requested parquet not possible
+TRAFO_LOADING_WRITE_PARQUET: bool = True  # requires pyarrow
 
 
 # ===========================
@@ -1061,7 +1049,7 @@ def main() -> None:
                 token = _epsilon_token(EPSILON)
                 out_dir = os.path.join(OUTDIR, TRAFO_LOADING_DIR_NAME)
                 out_path = os.path.join(out_dir, f"{TRAFO_LOADING_FILENAME_PREFIX}{token}.parquet")
-                if TRAFO_LOADING_WRITE_PARQUET and _PYARROW_AVAILABLE:
+                if TRAFO_LOADING_WRITE_PARQUET:
                     # Append mode: if file exists, concat then overwrite (simpler than row-group append without pyarrow writer state)
                     if os.path.exists(out_path):
                         existing = _pd.read_parquet(out_path)

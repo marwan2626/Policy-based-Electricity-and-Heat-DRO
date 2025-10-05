@@ -82,7 +82,7 @@ ENABLE_RT_POLICIES = True  # <--- EDIT ME
 # Set to False to lock the above value regardless of CLI/env.
 ALLOW_RT_FLAG_RUNTIME_OVERRIDE = True
 ENABLE_DRCC_RT_BUDGETS = True  # <--- EDIT ME (uses PV/temperature std to size D+ / D-)
-DRCC_EPSILON = 0.05            # chance violation level; k = sqrt((1-eps)/eps)
+DRCC_EPSILON = 0.30            # chance violation level; k = sqrt((1-eps)/eps)
 
 # DRCC-based network tightening (transformers, lines, voltages) — default OFF to be non-invasive
 ENABLE_DRCC_NETWORK_TIGHTENING = True  # <--- EDIT ME
@@ -90,6 +90,10 @@ ENABLE_DRCC_NETWORK_TIGHTENING = True  # <--- EDIT ME
 DRCC_TIGHTEN_TRAFO = True
 DRCC_TIGHTEN_LINES = True
 DRCC_TIGHTEN_VOLTAGES = True
+## Base deterministic constraint enforcement (always-on network physics caps)
+ENFORCE_BASE_VOLT_LIMITS = True   # if False, voltage magnitude limits are skipped entirely (debug only)
+ENFORCE_BASE_LINE_LIMITS = True   # if False, line thermal limits are skipped (debug only)
+ENFORCE_BASE_TRAFO_LIMITS = True  # if False, transformer thermal limits are skipped (debug only)
 PV_STD_FROM_CSV = True         # try to read pv std from pv_profiles_output.csv
 PV_RELATIVE_STD = 0.20         # fallback relative std of PV availability (fraction of avail)
 PV_STD_CORRELATION = 1.00      # used only if constructing from per-bus stds (not CSV aggregate)
@@ -115,7 +119,7 @@ HP_DRCC_BHDD = HP_COEFF_BHDD
 
 # Residual uncertainty for HP predictor (normalized units, multiply by HP_PRED_PMAX to get MW)
 HP_INCLUDE_RESIDUAL = True
-HP_RESIDUAL_SIGMA_NORM = 0.01617 # std of predictor residual in normalized y_dev units
+HP_RESIDUAL_SIGMA_NORM = 0.01616 # std of predictor residual in normalized y_dev units
 HP_RESIDUAL_CORRELATION = 0.0     # 0=independent across HP buses, 1=fully correlated (not used in current RSS)
 
 # Allow runtime override of START_DATE/DURATION_HOURS via CLI args or environment
@@ -1394,7 +1398,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     bess_eff = 0.95  # Round-trip efficiency
     bess_initial_soc = 0.5  # Initial state of charge as a percentage of capacity
     bess_capacity_mwh = 0.25  # BESS capacity in MWh
-    bess_cost_per_mwh = 5 # Cost per MWh of BESS capacity
+    bess_cost_per_mwh = 5.1 # Cost per MWh of BESS capacity
 
     ### Define the variables ###
     epsilon = 100e-9  # Small positive value to ensure some external grid usage
@@ -1659,9 +1663,11 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         # Track nominal HP aggregate for budgets for every timestep
         hp_pred_nominal[t] = float(P_t * len(hp_load_buses)) if len(hp_load_buses) > 0 else 0.0
 
-    # Precompute DRCC k and an aggregate sigma for network tightening (PV + HP) if enabled
+    # Precompute k_epsilon (quantile amplification) and aggregate sigma when DRCC tightening is enabled.
+    # Option 1 semantics: if tightening disabled, keep RT budgets but neutralize chance amplification with k=1.
     use_net_drcc = bool(ENABLE_DRCC_NETWORK_TIGHTENING)
-    k_epsilon = None
+    k_epsilon = 1.0  # default neutral scaling when DRCC inactive
+    k_source = "neutral"
     sigma_net = {t: 0.0 for t in time_steps}
     if use_net_drcc:
         try:
@@ -1669,8 +1675,10 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             if eps <= 0 or eps >= 1:
                 eps = 0.05
             k_epsilon = float(np.sqrt((1.0 - eps) / eps))
+            k_source = "drcc_quantile"
         except Exception:
             k_epsilon = float(np.sqrt((1.0 - 0.05) / 0.05))
+            k_source = "drcc_quantile_fallback"
 
         # Needed std inputs prepared in main()
         const_pv_std = globals().get('const_pv_std', np.zeros(len(time_steps)))
@@ -1689,6 +1697,10 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             sigma_pv = float(const_pv_std[t]) * pv_installed_mw
             sigma_hp = hp_temp_sens * float(T_amb_std[t])
             sigma_net[t] = float(np.sqrt(sigma_pv**2 + sigma_hp**2))
+    else:
+        # When not using DRCC tightening, we still may use std-based RT budgets elsewhere with k=1.
+        # No network sigma aggregation needed for tightening margins.
+        pass
 
     # Add variables for each time step
     for t in time_steps:
@@ -2067,7 +2079,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 base_v_min = 0.90**2
                 base_v_max = 1.10**2
 
-                # Optional DRCC tightening on voltages using linear LDF sensitivity proxy with correlation knobs
+                # Compute tightened voltage band if DRCC tightening enabled; else fall back to base
                 if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_VOLTAGES and (k_epsilon is not None) and (sigmaP_pu_vec is not None):
                     R_row = np.array([R[i, j] for j in range(len(non_slack_buses))], dtype=float)
                     X_row = np.array([X[i, j] for j in range(len(non_slack_buses))], dtype=float)
@@ -2132,9 +2144,12 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                     tight_v_min = base_v_min
                     tight_v_max = base_v_max
 
-                if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_VOLTAGES:
-                    model.addConstr(V_vars[t, bus] >= tight_v_min, name=f"voltage_min_{t}_{bus}")
-                    model.addConstr(V_vars[t, bus] <= tight_v_max, name=f"voltage_max_{t}_{bus}")
+                # Always enforce base band (unless explicitly disabled); apply tightening only to the limit values
+                if ENFORCE_BASE_VOLT_LIMITS:
+                    vmin_enf = tight_v_min if (ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_VOLTAGES) else base_v_min
+                    vmax_enf = tight_v_max if (ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_VOLTAGES) else base_v_max
+                    model.addConstr(V_vars[t, bus] >= vmin_enf, name=f"voltage_min_{t}_{bus}")
+                    model.addConstr(V_vars[t, bus] <= vmax_enf, name=f"voltage_max_{t}_{bus}")
         
 
         # External grid power balance at slack bus
@@ -2226,8 +2241,9 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             else:
                 S_branch_limit = 0.8 * S_rated_line
 
-            # Enforce thermal limit via convex quadratic constraint when tightening is enabled
-            if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_LINES:
+            # Always enforce base thermal limit unless debugging flag disables it
+            if ENFORCE_BASE_LINE_LIMITS:
+                # If tightening inactive, S_branch_limit already equals base; if active, it's tightened.
                 model.addQConstr(
                     P_branch_vars[t, line_idx]*P_branch_vars[t, line_idx] +
                     Q_branch_vars[t, line_idx]*Q_branch_vars[t, line_idx]
@@ -2299,8 +2315,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             else:
                 S_limit = 0.8*S_rated
 
-            # Enforce transformer thermal limit via convex quadratic constraint when tightening is enabled
-            if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_TRAFO:
+            # Always enforce base transformer limit unless debugging flag disables it
+            if ENFORCE_BASE_TRAFO_LIMITS:
                 model.addQConstr(
                     P_trafo_vars[t, trafo_idx]*P_trafo_vars[t, trafo_idx] +
                     Q_trafo_vars[t, trafo_idx]*Q_trafo_vars[t, trafo_idx]
@@ -2330,7 +2346,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     _hp_corr_mode = 'full' if HP_FULLY_CORRELATED else 'rss'
     print(
         f"Flags — RT:{ENABLE_RT_POLICIES} | DRCC budgets:{ENABLE_DRCC_RT_BUDGETS} | DRCC network tighten:{ENABLE_DRCC_NETWORK_TIGHTENING} "
-        f"[trafo={DRCC_TIGHTEN_TRAFO}, lines={DRCC_TIGHTEN_LINES}, volts={DRCC_TIGHTEN_VOLTAGES}] | "
+        f"[tighten trafo={DRCC_TIGHTEN_TRAFO}, lines={DRCC_TIGHTEN_LINES}, volts={DRCC_TIGHTEN_VOLTAGES}] "
+        f"[base enforce trafo={ENFORCE_BASE_TRAFO_LIMITS}, lines={ENFORCE_BASE_LINE_LIMITS}, volts={ENFORCE_BASE_VOLT_LIMITS}] | "
         f"rho_PV={_rho_pv_txt}, HP_corr={_hp_corr_mode}"
     )
     # Coupling constraint: Electrical power consumption of heat pump
@@ -2437,15 +2454,23 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         # Optional DRCC-derived budgets using moment info (per-time-step std)
         use_drcc = bool(ENABLE_DRCC_RT_BUDGETS)
         if use_drcc:
-            # Chance parameter to k factor: k = sqrt((1-eps)/eps)
-            try:
-                eps = float(DRCC_EPSILON)
-                k_e = np.sqrt((1.0 - eps) / max(eps, 1e-6))
-            except Exception:
-                k_e = np.sqrt((1.0 - 0.05) / 0.05)
+            # DRCC RT budgets active. If network tightening is OFF we still keep budgets but neutralize amplification (k_e=1.0)
+            if bool(ENABLE_DRCC_NETWORK_TIGHTENING):
+                # Chance parameter to k factor: k = sqrt((1-eps)/eps)
+                try:
+                    eps = float(DRCC_EPSILON)
+                    k_e = np.sqrt((1.0 - eps) / max(eps, 1e-6))
+                except Exception:
+                    k_e = np.sqrt((1.0 - 0.05) / 0.05)
+            else:
+                k_e = 1.0  # Neutral scaling in deterministic (no tightening) mode
             # Retrieve aligned std arrays prepared in the calling scope
             const_pv_std = globals().get('const_pv_std', np.zeros(len(time_steps)))
             T_amb_std = globals().get('T_amb_std', np.zeros(len(time_steps)))
+            try:
+                print(f"[INFO] RT budget mode={'quantile_drcc' if ENABLE_DRCC_NETWORK_TIGHTENING else 'std_only_k1'} | k_e={k_e:.4f}")
+            except Exception:
+                pass
 
         for t in time_steps:
             base_demand_t = float(sum_nonflex_by_t.get(t, 0.0) + sum_flex_by_t.get(t, 0.0) + hp_pred_nominal.get(t, 0.0))
@@ -2568,6 +2593,10 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     #model.setParam('OutputFlag', 0)
     #model.setParam('Presolve', 0)
     #model.setParam('NonConvex', 2)
+    model.setParam("NumericFocus", 3)
+    model.setParam("BarHomogeneous", 1)
+    model.setParam("Crossover", 0) 
+    #model.setParam("BarQCPConvTol", 1e-8)
 
     model.update()
 
@@ -2579,17 +2608,25 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         print(f"OPF Optimal Objective Value: {model.ObjVal}")
         #print("\n--- Debugging P_abs and P_branch Values ---\n")
         # Post-solve quick summary (as requested): epsilon, kappa, max transformer and line loading
-        try:
-            eps_val = float(DRCC_EPSILON) if 'DRCC_EPSILON' in globals() else None
-        except Exception:
-            eps_val = None
-        try:
-            if eps_val is not None and 0.0 < eps_val < 1.0:
-                kappa_val = float(np.sqrt((1.0 - eps_val) / eps_val))
-            else:
+        # Determine epsilon/kappa display according to tightening semantics
+        if ENABLE_DRCC_NETWORK_TIGHTENING:
+            try:
+                eps_val = float(DRCC_EPSILON) if 'DRCC_EPSILON' in globals() else None
+            except Exception:
+                eps_val = None
+            try:
+                if eps_val is not None and 0.0 < eps_val < 1.0:
+                    kappa_val = float(np.sqrt((1.0 - eps_val) / eps_val))
+                else:
+                    kappa_val = None
+            except Exception:
                 kappa_val = None
-        except Exception:
-            kappa_val = None
+            mode_tag = "quantile_drcc"
+        else:
+            # Neutral deterministic mode: suppress epsilon and force kappa=1
+            eps_val = None
+            kappa_val = 1.0
+            mode_tag = "std_only_k1"
 
         # Compute maximum transformer loading (%) across all periods/transformers
         max_trafo_loading_pct = None
@@ -2632,10 +2669,14 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
 
         # Print the summary line before the cost breakdown
         try:
-            eps_text = f"epsilon={eps_val:.4f}" if eps_val is not None else "epsilon=N/A"
-            kap_text = f"kappa={kappa_val:.4f}" if kappa_val is not None else "kappa=N/A"
+            if ENABLE_DRCC_NETWORK_TIGHTENING:
+                eps_text = f"epsilon={eps_val:.4f}" if eps_val is not None else "epsilon=N/A"
+                kap_text = f"kappa={kappa_val:.4f}" if kappa_val is not None else "kappa=N/A"
+            else:
+                eps_text = "epsilon=--"
+                kap_text = f"kappa={kappa_val:.4f}"  # will be 1.0
         except Exception:
-            eps_text = f"epsilon={eps_val}" if eps_val is not None else "epsilon=N/A"
+            eps_text = "epsilon=--" if not ENABLE_DRCC_NETWORK_TIGHTENING else (f"epsilon={eps_val}" if eps_val is not None else "epsilon=N/A")
             kap_text = f"kappa={kappa_val}" if kappa_val is not None else "kappa=N/A"
 
         try:
@@ -2645,8 +2686,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             trafo_text = f"max_trafo_loading={max_trafo_loading_pct}%" if max_trafo_loading_pct is not None else "max_trafo_loading=N/A"
             line_text = f"max_line_loading={max_line_loading_pct}%" if max_line_loading_pct is not None else "max_line_loading=N/A"
 
-        print(f"{eps_text} | {kap_text} | {trafo_text} | {line_text}")
-    
+        print(f"{eps_text} | {kap_text} | mode={mode_tag} | {trafo_text} | {line_text}")
+
         # Extract optimized values for PV generation, external grid power, loads, and theta
         for t in time_steps:
             pv_gen_results[t] = {bus: pv_gen_vars[t][bus].x for bus in pv_buses}
@@ -2957,17 +2998,38 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             results_df['meta_drcc_tighten_trafo'] = [bool(DRCC_TIGHTEN_TRAFO)] * len(results_df)
             results_df['meta_drcc_tighten_lines'] = [bool(DRCC_TIGHTEN_LINES)] * len(results_df)
             results_df['meta_drcc_tighten_voltages'] = [bool(DRCC_TIGHTEN_VOLTAGES)] * len(results_df)
+            try:
+                network_tightening_active_flag = bool(
+                    ENABLE_DRCC_NETWORK_TIGHTENING and (DRCC_TIGHTEN_TRAFO or DRCC_TIGHTEN_LINES or DRCC_TIGHTEN_VOLTAGES)
+                )
+            except Exception:
+                network_tightening_active_flag = False
+            results_df['meta_network_tightening_active'] = [network_tightening_active_flag] * len(results_df)
+            results_df['meta_rt_budgets_active'] = [bool(ENABLE_DRCC_RT_BUDGETS)] * len(results_df)
+            results_df['meta_enforce_base_trafo_limits'] = [bool(ENFORCE_BASE_TRAFO_LIMITS)] * len(results_df)
+            results_df['meta_enforce_base_line_limits'] = [bool(ENFORCE_BASE_LINE_LIMITS)] * len(results_df)
+            results_df['meta_enforce_base_volt_limits'] = [bool(ENFORCE_BASE_VOLT_LIMITS)] * len(results_df)
             # DRCC parameters
+            # Epsilon/k metadata: blank them when tightening disabled (we neutralize k to 1 internally)
+            if bool(ENABLE_DRCC_NETWORK_TIGHTENING):
+                try:
+                    eps_val = float(DRCC_EPSILON)
+                except Exception:
+                    eps_val = np.nan
+                results_df['meta_drcc_epsilon'] = [eps_val] * len(results_df)
+                try:
+                    k_eps = float(np.sqrt((1.0 - eps_val) / eps_val)) if (eps_val is not None and eps_val > 0.0 and eps_val < 1.0) else np.nan
+                except Exception:
+                    k_eps = np.nan
+                results_df['meta_drcc_k_epsilon'] = [k_eps] * len(results_df)
+            else:
+                results_df['meta_drcc_epsilon'] = ["" for _ in range(len(results_df))]
+                results_df['meta_drcc_k_epsilon'] = ["" for _ in range(len(results_df))]
+            # Record how RT budgets were sized (quantile or neutral)
             try:
-                eps_val = float(DRCC_EPSILON)
+                results_df['meta_rt_budget_mode'] = ["quantile_drcc" if ENABLE_DRCC_NETWORK_TIGHTENING else "std_only_k1"] * len(results_df)
             except Exception:
-                eps_val = np.nan
-            results_df['meta_drcc_epsilon'] = [eps_val] * len(results_df)
-            try:
-                k_eps = float(np.sqrt((1.0 - eps_val) / eps_val)) if (eps_val is not None and eps_val > 0.0 and eps_val < 1.0) else np.nan
-            except Exception:
-                k_eps = np.nan
-            results_df['meta_drcc_k_epsilon'] = [k_eps] * len(results_df)
+                pass
             # PV uncertainty handling
             results_df['meta_pv_std_from_csv'] = [bool(PV_STD_FROM_CSV)] * len(results_df)
             try:
@@ -3055,12 +3117,22 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             eps_val = float(DRCC_EPSILON)
         except Exception:
             eps_val = None
+        # Simplified suffix logic per user request:
+        # Only reflect network tightening (transformers/lines/voltages) in the filename.
+        # If master tightening enabled AND at least one subcomponent flag is True => drcc_true_epsilon_<token>
+        # Otherwise => drcc_false (independent of RT budgets usage).
         try:
-            drcc_active = bool(ENABLE_DRCC_NETWORK_TIGHTENING or ENABLE_DRCC_RT_BUDGETS)
+            network_tightening_active = bool(
+                ENABLE_DRCC_NETWORK_TIGHTENING and (DRCC_TIGHTEN_TRAFO or DRCC_TIGHTEN_LINES or DRCC_TIGHTEN_VOLTAGES)
+            )
         except Exception:
-            drcc_active = False
-        if drcc_active:
-            if eps_val is not None and 0.0 < eps_val < 1.0:
+            network_tightening_active = False
+
+        if eps_val is not None and not (0.0 < eps_val < 1.0):
+            eps_val = None  # sanitize invalid epsilon
+
+        if network_tightening_active:
+            if eps_val is not None:
                 eps_token = f"{eps_val:.2f}".replace('.', '_')
                 suffix = f"drcc_true_epsilon_{eps_token}"
             else:

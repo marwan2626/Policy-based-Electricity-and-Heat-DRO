@@ -39,5 +39,9 @@
     "pv_curt_price_factor": 1.0,
     "bess_throughput_cost_eur_per_mwh": 0.5
   },
-  "ignore_hp_residual": false
+  "ignore_hp_residual": false,
+  "use_mean_centered_policy": true,
+  "trafo_loading_logging": true,
+  "trafo_loading_file": "v3_loading\\trafo_loading_raw_epsilon_0_20.parquet",
+  "n_trafos": 1
 }
