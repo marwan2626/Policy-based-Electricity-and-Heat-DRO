@@ -37,6 +37,11 @@ PLOT_POLICY_HEATMAPS: bool = True
 POLICY_HEATMAP_FIG = "policy_heatmaps.png"
 PLOT_FRONTIER_TRAJECTORY_SCATTER: bool = True
 FRONTIER_TRAJECTORY_SCATTER_FIG = "frontier_trajectory_scatter.png"
+FRONTIER_HYBRID_SCATTER_FIG = "frontier_hybrid_scatter.png"  # new hybrid figure (cloud + mean)
+
+# New: per-timestep transformer violation probability plot
+PLOT_TRAFO_VIOLATION_TIME_PROFILE: bool = True
+TRAFO_VIOLATION_TIME_PROFILE_FIG = "trafo_violation_time_profile.png"
 FRONTIER_HYBRID_SCATTER_FIG = "frontier_hybrid_scatter.png"
 
 # Cost model parameters for OOS components
@@ -750,6 +755,86 @@ def main() -> None:
             print(f"✓ Frontier hybrid scatter: {hybrid_path}")
         else:
             print('[INFO] Hybrid frontier scatter skipped (insufficient data).')
+
+    # --- Transformer violation probability per timestep ---
+    if PLOT_TRAFO_VIOLATION_TIME_PROFILE:
+        # Correct per-timestep probability: for each (sample_id, t) take max loading across trafos; violation if > threshold.
+        threshold_pct = 80.0
+        profiles: List[Tuple[str, np.ndarray]] = []
+        t_axis: np.ndarray | None = None
+        # Helper to compute profile from a parquet path
+        def compute_profile(parquet_path: str):
+            try:
+                pdf = pd.read_parquet(parquet_path)
+            except Exception:
+                return None
+            must = {'sample_id','t','trafo_index','loading_pct'}
+            if not must <= set(pdf.columns):
+                return None
+            # Max across trafos per (sample_id, t)
+            grp = pdf.groupby(['sample_id','t'])['loading_pct'].max().reset_index()
+            counts = grp.groupby('t')['sample_id'].nunique()
+            viol = grp[grp['loading_pct'] > threshold_pct].groupby('t')['sample_id'].nunique()
+            rate_series = (viol / counts).reindex(counts.index).fillna(0.0)
+            return counts.index.to_numpy(), rate_series.to_numpy()
+        # Baseline (drcc_false)
+        base_meta = os.path.join(RESULTS_DIR, 'v3_meta_drcc_false.json')
+        if os.path.exists(base_meta):
+            try:
+                with open(base_meta,'r',encoding='utf-8') as f:
+                    m = json.load(f)
+                rel = m.get('trafo_loading_file')
+                if rel:
+                    base_pq = os.path.join(RESULTS_DIR, rel)
+                    if os.path.exists(base_pq):
+                        res = compute_profile(base_pq)
+                        if res:
+                            t_axis, rate = res
+                            profiles.append(('stochastic', rate))
+            except Exception as e:
+                print(f"[WARN] Baseline trafo profile failed: {e}")
+        # DRCC epsilons
+        for eps in EPSILONS:
+            tok = epsilon_token(eps)
+            pq_path = os.path.join(RESULTS_DIR, 'v3_loading', f'trafo_loading_raw_epsilon_{tok}.parquet')
+            if not os.path.exists(pq_path):
+                continue
+            res = compute_profile(pq_path)
+            if not res:
+                continue
+            t_local, rate = res
+            if t_axis is None:
+                t_axis = t_local
+            else:
+                if len(t_local) != len(t_axis):  # simple alignment by truncation
+                    min_len = min(len(t_local), len(t_axis))
+                    t_axis = t_axis[:min_len]
+                    rate = rate[:min_len]
+            profiles.append((f"{eps:.2f}", rate))
+        if profiles and t_axis is not None:
+            # Normalize all lengths
+            min_len = min(len(r) for _, r in profiles)
+            profiles = [(lab, r[:min_len]) for lab, r in profiles]
+            t_axis = t_axis[:min_len]
+            fig_tp, ax_tp = plt.subplots(figsize=(10,4.8))
+            # baseline first
+            for lab, arr in sorted(profiles, key=lambda x: (0 if x[0]=='stochastic' else 1, x[0])):
+                if lab == 'stochastic':
+                    ax_tp.plot(t_axis, arr, color='black', linestyle='--', linewidth=1.8, label=lab)
+                else:
+                    ax_tp.plot(t_axis, arr, linewidth=1.2, alpha=0.9, label=f"ε={lab}")
+            ax_tp.set_xlabel('Timestep index')
+            ax_tp.set_ylabel(f"P(any trafo > {int(threshold_pct)}%)")
+            ax_tp.set_title('Per-Timestep Transformer Violation Probability')
+            ax_tp.grid(alpha=0.3, linewidth=0.5)
+            ax_tp.set_ylim(0, 1.0)
+            ax_tp.legend(fontsize=8, ncol=3, frameon=False)
+            out_tp = os.path.join(RESULTS_DIR, TRAFO_VIOLATION_TIME_PROFILE_FIG)
+            fig_tp.tight_layout()
+            fig_tp.savefig(out_tp, dpi=160)
+            print(f"✓ Transformer violation time profile: {out_tp}")
+        else:
+            print('[INFO] Skipped transformer violation time profile (no loading parquet data).')
 
     # --- Policy heatmaps ---
     if PLOT_POLICY_HEATMAPS:
