@@ -645,60 +645,76 @@ def create_comprehensive_plots(results_df, hp_power_values, ambient_temps_c=None
         plt.grid(True, alpha=0.3)
         #plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
     
-    # 9. Electrical Bus Voltages
+    # 9. Original (Deterministic / Baseline) Flexible Load per Bus (unconstrained reference)
+    # This replaces the previous voltage plot per user request.
     plt.subplot(7, 2, 9)
-    voltage_cols = [col for col in results_df.columns if 'voltage_pu' in col.lower()]
-    if voltage_cols:
-        # Plot voltage profiles for all buses
-        for i, col in enumerate(voltage_cols):
-            bus_number = col.split('_')[1]  # Extract bus number from column name
-            plt.plot(hours, results_df[col], alpha=0.7, linewidth=1.5, label=f'Bus {bus_number}')
-        
-        # Add voltage limits
-        #plt.axhline(y=0.95, color='red', linestyle='--', alpha=0.8, label='Min Limit (0.95 p.u.)')
-        #plt.axhline(y=1.05, color='red', linestyle='--', alpha=0.8, label='Max Limit (1.05 p.u.)')
-        plt.axhline(y=1.0, color='black', linestyle='-', alpha=0.5, label='Nominal (1.0 p.u.)')
-        
-        plt.title('Electrical Bus Voltages Over Time', fontsize=14, fontweight='bold')
-        plt.xlabel('Hour')
-        plt.ylabel('Voltage (p.u.)')
-        plt.grid(True, alpha=0.3)
-        #plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-        plt.ylim(0.85, 1.15)  # Set reasonable voltage range
+    try:
+        # We reconstruct baseline per-bus flexible load time series from flexible_time_synchronized_loads_P (MW)
+        # which is structured as {t: {bus: mw}}.
+        baseline_flex_dict = globals().get('flexible_time_synchronized_loads_P', {})
+        if baseline_flex_dict:
+            # Collect all buses present in any timestep for deterministic baseline
+            baseline_buses = set()
+            for tmap in baseline_flex_dict.values():
+                baseline_buses.update(tmap.keys())
+            baseline_buses = sorted(list(baseline_buses))
+            color_map = plt.cm.tab20(np.linspace(0, 1, max(1, len(baseline_buses))))
+            T = len(hours)
+            for i, bus in enumerate(baseline_buses):
+                series_kw = []
+                for t in range(T):
+                    val_mw = 0.0
+                    if t in baseline_flex_dict and bus in baseline_flex_dict[t]:
+                        val_mw = float(baseline_flex_dict[t][bus])
+                    series_kw.append(val_mw * 1000.0)  # MW -> kW
+                alpha = 0.85 if len(baseline_buses) <= 25 else 0.5
+                lw = 1.2 if len(baseline_buses) <= 25 else 0.8
+                label = f"Bus {bus}" if len(baseline_buses) <= 15 else None
+                plt.plot(hours, series_kw, linewidth=lw, alpha=alpha, color=color_map[i % len(color_map)], label=label)
+            plt.title('Baseline Flexible Load per Bus (kW)', fontsize=14, fontweight='bold')
+            plt.xlabel('Hour')
+            plt.ylabel('Power (kW)')
+            plt.grid(True, alpha=0.3)
+            if len(baseline_buses) <= 15:
+                plt.legend(fontsize=7, loc='upper right')
+        else:
+            plt.text(0.5, 0.5, 'No baseline flexible load data', transform=plt.gca().transAxes, ha='center', va='center', fontsize=12)
+            plt.title('Baseline Flexible Load per Bus (kW)', fontsize=14, fontweight='bold')
+            plt.xlabel('Hour')
+            plt.ylabel('Power (kW)')
+            plt.grid(True, alpha=0.3)
+    except Exception as _baseline_flex_err:
+        plt.text(0.5, 0.5, f'Baseline flex plot error: {_baseline_flex_err}', transform=plt.gca().transAxes, ha='center', va='center', fontsize=10)
+        plt.title('Baseline Flexible Load per Bus (error)', fontsize=14, fontweight='bold')
     
-    # 10. Thermal Storage State of Charge Analysis
+    # 10. Flexible Load Active Power per Bus (REPLACES Thermal Storage SOC plot)
     plt.subplot(7, 2, 10)
-    if storage_soc_values is not None:
-        storage_soc_percent = [soc * 100 for soc in storage_soc_values]  # Convert to percentage
-        
-        plt.plot(hours, storage_soc_percent, 'g-', linewidth=2, label='Storage SOC')
-        plt.title('Thermal Storage State of Charge', fontsize=14, fontweight='bold')
-        plt.xlabel('Hour')
-        plt.ylabel('State of Charge (%)')
-        plt.grid(True, alpha=0.3)
-        plt.ylim(0, 100)  # SOC ranges from 0% to 100%
-        
-        # Add horizontal lines for reference
-        plt.axhline(y=50, color='orange', linestyle='--', alpha=0.7, label='50% SOC')
-        plt.axhline(y=20, color='red', linestyle='--', alpha=0.7, label='20% SOC (Low)')
-        plt.axhline(y=80, color='blue', linestyle='--', alpha=0.7, label='80% SOC (High)')
-        
-        # Add statistics text
-        min_soc = min(storage_soc_percent)
-        max_soc = max(storage_soc_percent)
-        avg_soc = np.mean(storage_soc_percent)
-        plt.text(0.05, 0.95, f'Min: {min_soc:.1f}%\nMax: {max_soc:.1f}%\nAvg: {avg_soc:.1f}%', 
-                 transform=plt.gca().transAxes, fontsize=10,
-                 bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-        
-        plt.legend(loc='upper right', fontsize=8)
-    else:
-        plt.text(0.5, 0.5, 'No Storage SOC Data Available', 
-                 transform=plt.gca().transAxes, fontsize=12, ha='center', va='center')
-        plt.title('Thermal Storage State of Charge', fontsize=14, fontweight='bold')
-        plt.xlabel('Hour')
-        plt.ylabel('State of Charge (%)')
-        plt.grid(True, alpha=0.3)
+    try:
+        flex_bus_cols = [c for c in results_df.columns if c.startswith('flex_load_bus_') and c.endswith('_mw')]
+        if flex_bus_cols:
+            cols_sorted = sorted(flex_bus_cols, key=lambda x: int(x.split('_')[3]))
+            color_map = plt.cm.tab20(np.linspace(0, 1, max(1, len(cols_sorted))))
+            for i, col in enumerate(cols_sorted):
+                series_kw = results_df[col].values * 1000.0
+                alpha = 0.85 if len(cols_sorted) <= 25 else 0.5
+                lw = 1.2 if len(cols_sorted) <= 25 else 0.8
+                label = f"Bus {col.split('_')[3]}" if len(cols_sorted) <= 20 else None
+                plt.plot(hours, series_kw, linewidth=lw, alpha=alpha, color=color_map[i % len(color_map)], label=label)
+            plt.title('Flexible Load per Bus (kW)', fontsize=14, fontweight='bold')
+            plt.xlabel('Hour')
+            plt.ylabel('Power (kW)')
+            plt.grid(True, alpha=0.3)
+            if len(cols_sorted) <= 20:
+                plt.legend(fontsize=7, loc='upper right')
+        else:
+            plt.text(0.5, 0.5, 'No Flexible Load Data', transform=plt.gca().transAxes, ha='center', va='center', fontsize=12)
+            plt.title('Flexible Load per Bus (kW)', fontsize=14, fontweight='bold')
+            plt.xlabel('Hour')
+            plt.ylabel('Power (kW)')
+            plt.grid(True, alpha=0.3)
+    except Exception as _flex_plot_err:
+        plt.text(0.5, 0.5, f'Flex plot error: {_flex_plot_err}', transform=plt.gca().transAxes, ha='center', va='center', fontsize=10)
+        plt.title('Flexible Load per Bus (error)', fontsize=14, fontweight='bold')
     
     # 11. Non-Flexible Load Active Power (per-bus traces)
     plt.subplot(7, 2, 11)
@@ -2697,14 +2713,14 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
 
     # After adding all constraints and variables
     #model.setParam('OutputFlag', 0)
-    #model.setParam('Presolve', 1)
+    model.setParam('Presolve', 0)
     #model.setParam('scaleFlag', 3)
     #model.setParam('NonConvex', 2)
     #model.setParam("NumericFocus", 1)
-    model.setParam("BarHomogeneous", 1)
+    #model.setParam("BarHomogeneous", 0)
     #model.setParam("Crossover", 0) 
     #model.setParam("BarQCPConvTol", 1e-8)
-    model.setParam("Method", 3)
+    #model.setParam("Method", 3)
 
     model.update()
 
@@ -3280,6 +3296,13 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 results_df['D_minus_max_mw'] = [D_minus_max[t] for t in time_steps]
                 # Also expose DA aggregated flexible curtailment to verify the tie to y_cap
                 results_df['ycap_mw'] = [ycap_var.x if ("ycap_var" in locals() and ycap_var is not None) else 0.0 for _ in time_steps]
+                # Per-bus flexible load realized power (MW) — flat columns for plotting (unaggregated)
+                try:
+                    for bus in flexible_load_buses:
+                        col_name = f'flex_load_bus_{bus}_mw'
+                        results_df[col_name] = [flexible_load_P_vars[t][bus].x if (t in flexible_load_P_vars and bus in flexible_load_P_vars[t]) else 0.0 for t in time_steps]
+                except Exception:
+                    pass
         except Exception:
             pass
         
