@@ -1611,6 +1611,12 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     non_flexible_time_synchronized_loads_P = {t: {} for t in time_steps}
     non_flexible_time_synchronized_loads_Q = {t: {} for t in time_steps}
 
+    # Attach early (empty) to globals so later code that queries it never gets None
+    globals()['flexible_time_synchronized_loads_P'] = flexible_time_synchronized_loads_P
+    globals()['flexible_time_synchronized_loads_Q'] = flexible_time_synchronized_loads_Q
+    globals()['non_flexible_time_synchronized_loads_P'] = non_flexible_time_synchronized_loads_P
+    globals()['non_flexible_time_synchronized_loads_Q'] = non_flexible_time_synchronized_loads_Q
+
 
 
     # Add BEV loads from CSV into net.load (if present) so they behave like electrical_loads.csv entries
@@ -1933,6 +1939,30 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 non_flexible_time_synchronized_loads_P[t][bus] = 0.0
             if bus not in non_flexible_time_synchronized_loads_Q[t]:
                 non_flexible_time_synchronized_loads_Q[t][bus] = 0.0
+
+        # After finishing this timestep, optionally store cumulative stats for debugging
+        try:
+            sum_flex = sum(flexible_time_synchronized_loads_P[t].values())
+            sum_nonflex = sum(non_flexible_time_synchronized_loads_P[t].values())
+            if t == 0:
+                print(f"[DEBUG FLEX BUILD] t={t} total baseline flexible MW = {sum_flex:.6f} | non-flexible MW = {sum_nonflex:.6f}")
+            elif t in (int(len(time_steps)/2), len(time_steps)-1):
+                print(f"[DEBUG FLEX BUILD] t={t} total baseline flexible MW = {sum_flex:.6f} | non-flexible MW = {sum_nonflex:.6f}")
+        except Exception:
+            pass
+
+    # Final debug summary for baseline flexible loads
+    try:
+        flex_totals = [sum(flexible_time_synchronized_loads_P[t].values()) for t in time_steps]
+        if len(flex_totals) > 0:
+            print(f"[DEBUG FLEX BUILD] Baseline flexible load totals across horizon: min={min(flex_totals):.6f} MW max={max(flex_totals):.6f} MW")
+        else:
+            print("[DEBUG FLEX BUILD] No entries in baseline flexible loads (flexible_time_synchronized_loads_P is empty).")
+    except Exception as _e_dbg:
+        print(f"[DEBUG FLEX BUILD] Failed computing flex totals summary: {_e_dbg}")
+
+    # Reassign to globals in case references changed
+    globals()['flexible_time_synchronized_loads_P'] = flexible_time_synchronized_loads_P
 
         # Scale installed peak by the normalized PV profile for this timestep
         # const_pv is expected to be in 0..1; pv_bus_limits_t gives available potential (MW)
