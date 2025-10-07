@@ -109,6 +109,8 @@ HP_FULLY_CORRELATED = True     # temperature is common across HPs
 RHO_TEMP_AVG = 0             # 0=independent, 1=fully correlated within day
 # Capacity buy-back pricing (EUR per MW-hour of purchased connection reduction)
 C_CAP_EUR_PER_MW_H = 5.0  # <--- EDIT ME (capacity price); set 0 to disable economic impact
+C_SHED_EUR_PER_MW_H = 0.0
+
 # =====================================================================
 ## Debug flags for aggregated flexibility mechanism
 DEBUG_EXTRACT_IIS = True              # If model infeasible, extract IIS
@@ -1507,7 +1509,6 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     bess_cost_per_mwh = 5.1 # Cost per MWh of BESS capacity
     # Baseline (intercept) BESS throughput cost (EUR/MWh) for p0 channel
     c_base_bess = 1.5
-
     # Extract transformer capacity in MW (assuming sn_mva is in MVA)
     transformer_capacity_mw = net.trafo['sn_mva'].values[0]
     #print(f"Transformer Capacity: {transformer_capacity_mw}")
@@ -1535,7 +1536,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     Q_trafo_vars = {}  # Store transformer loading decision variables
     S_trafo_vars = {}  # Store transformer loading decision variables
     transformer_loading_vars = {}  # Store transformer loading percentage decision variables 
-    transformer_loading_perc_vars = {}  # Store transformer loading percentage decision variables  
+    transformer_loading_perc_vars = {}  # Store transformer loading percentage decision variables 
+    shed_vars = {} 
 
     slack_bus_index = net.ext_grid.bus.iloc[0]
 
@@ -1603,6 +1605,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     # Robust SoC extreme envelope trajectories (down/up under full deviations)
     E_down_vars = {}
     E_up_vars = {}
+    ycap_var = None  # single y_cap for this model
 
 
     # Temporary dictionary to store updated load values per time step
@@ -1946,7 +1949,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             sum_nonflex = sum(non_flexible_time_synchronized_loads_P[t].values())
             if t == 0:
                 print(f"[DEBUG FLEX BUILD] t={t} total baseline flexible MW = {sum_flex:.6f} | non-flexible MW = {sum_nonflex:.6f}")
-            elif t in (int(len(time_steps)/2), len(time_steps)-1):
+            elif t in (int(len(time_steps)/2), len(time_steps)-25):
                 print(f"[DEBUG FLEX BUILD] t={t} total baseline flexible MW = {sum_flex:.6f} | non-flexible MW = {sum_nonflex:.6f}")
         except Exception:
             pass
@@ -1964,101 +1967,66 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     # Reassign to globals in case references changed
     globals()['flexible_time_synchronized_loads_P'] = flexible_time_synchronized_loads_P
 
-    # Scale installed peak by the normalized PV profile for this timestep
-    # const_pv is expected to be in 0..1; pv_bus_limits_t gives available potential (MW)
-    pv_bus_limits_t = {bus: float(base_pv_bus_limits.get(bus, 0.0)) * float(const_pv[t]) for bus in pv_buses}
-
-    # PV availability scaled per timestep (no verbose debug printing)
-
-    # Create PV generation variables for this time step using the scaled availability
-    if len(pv_buses) > 0:
-        pv_gen_vars[t] = model.addVars(pv_buses, lb=0, ub=pv_bus_limits_t, name=f'pv_gen_{t}')
-        curtailment_vars[t] = model.addVars(pv_buses, lb=0, ub=pv_bus_limits_t, name=f'curtailment_{t}')
-
-        for bus in pv_buses:
-            # available potential this timestep
-            available_mw = float(base_pv_bus_limits.get(bus, 0.0)) * float(const_pv[t])
-            model.addConstr(
-                curtailment_vars[t][bus] == available_mw - pv_gen_vars[t][bus], 
-                name=f'curtailment_constraint_{t}_{bus}'
-            )
-        # Track aggregate PV availability for budgets
+    # ------------------------------------------------------------------
+    # CORRECT PER-TIMESTEP VARIABLE CREATION (replaces earlier broken single-t block)
+    # ------------------------------------------------------------------
+    for t in time_steps:
+        # PV availability (MW) this timestep per bus
+        pv_bus_limits_t = {bus: float(base_pv_bus_limits.get(bus, 0.0)) * float(const_pv[t]) for bus in pv_buses}
+        if len(pv_buses) > 0:
+            pv_gen_vars[t] = model.addVars(pv_buses, lb=0, ub=pv_bus_limits_t, name=f'pv_gen_{t}')
+            curtailment_vars[t] = model.addVars(pv_buses, lb=0, ub=pv_bus_limits_t, name=f'curtailment_{t}')
+            for bus in pv_buses:
+                avail = pv_bus_limits_t[bus]
+                model.addConstr(curtailment_vars[t][bus] == avail - pv_gen_vars[t][bus], name=f'curtailment_constraint_{t}_{bus}')
             pv_avail_sum_by_t[t] = float(sum(pv_bus_limits_t.values()))
 
+        if t == 0:
+            print(f"[INIT VARS] Created PV/BESS/ext-grid/flex/HP vars for first timestep (pv_buses={pv_buses}, bess_buses={bess_buses})")
+
+        # BESS variables (charge/discharge/energy trajectory)
         if len(bess_buses) > 0:
-            # Create per-bus negative lower bounds by negating the base limits dict
             bess_charge_vars[t] = model.addVars(bess_buses, lb=0, ub=base_bess_bus_limits, name=f'bess_charge_{t}')
             bess_discharge_vars[t] = model.addVars(bess_buses, lb=0, ub=base_bess_bus_limits, name=f'bess_discharge_{t}')
             bess_energy_vars[t] = model.addVars(bess_buses, lb=0, ub=bess_capacity_mwh, name=f'bess_energy_{t}')
             if t == time_steps[0]:
-                # Set initial state-of-charge for each BESS (do not overwrite the vars dict)
                 for bus in bess_buses:
-                    model.addConstr(
-                        bess_energy_vars[t][bus] == bess_initial_soc * bess_capacity_mwh,
-                        name=f'bess_energy_initial_{t}_{bus}'
-                    )
+                    model.addConstr(bess_energy_vars[t][bus] == bess_initial_soc * bess_capacity_mwh, name=f'bess_energy_initial_{t}_{bus}')
             else:
-                # bess energy time t = bess energy t-1 + charge*efficiency (guard if previous missing)
                 for bus in bess_buses:
-                    if (t-1) in bess_energy_vars and bus in bess_energy_vars[t-1]:
+                    prev_t = t - 1
+                    if prev_t in bess_energy_vars and bus in bess_energy_vars[prev_t]:
                         model.addConstr(
-                            bess_energy_vars[t][bus] == bess_energy_vars[t-1][bus]
-                            + bess_charge_vars[t][bus] * bess_eff - bess_discharge_vars[t][bus] / bess_eff,
+                            bess_energy_vars[t][bus] == bess_energy_vars[prev_t][bus] + bess_charge_vars[t][bus] * bess_eff - bess_discharge_vars[t][bus] / bess_eff,
                             name=f'bess_energy_update_{t}_{bus}'
                         )
                     else:
-                        # Fallback: tie to initial SOC to avoid missing-key errors
+                        # Fallback to initial SOC if previous missing (should not occur once fixed)
                         model.addConstr(
                             bess_energy_vars[t][bus] == bess_initial_soc * bess_capacity_mwh,
                             name=f'bess_energy_update_fallback_{t}_{bus}'
                         )
-                # Optional: enforce cyclical SOC (end SOC = start SOC)
                 if t == time_steps[-1]:
                     for bus in bess_buses:
-                        if time_steps and time_steps[0] in bess_energy_vars and bus in bess_energy_vars[time_steps[0]]:
-                            model.addConstr(
-                                bess_energy_vars[t][bus] == bess_energy_vars[time_steps[0]][bus],
-                                name=f'bess_energy_cyclical_{t}_{bus}'
-                            )
-                        else:
-                            # Fallback: end equals initial SOC constant
-                            model.addConstr(
-                                bess_energy_vars[t][bus] == bess_initial_soc * bess_capacity_mwh,
-                                name=f'bess_energy_cyclical_fallback_{t}_{bus}'
-                            )
-            
-        # External grid power variables for import and export at the slack bus (bus 0)
-        ext_grid_import_P_vars[t] = model.addVar(lb=0, name=f'ext_grid_import_P_{t}')  # Import is non-negative
-        ext_grid_import_Q_vars[t] = model.addVar(lb=0, name=f'ext_grid_import_Q_{t}')  # Import is non-negative
-        ext_grid_export_P_vars[t] = model.addVar(lb=0, name=f'ext_grid_export_P_{t}')  # Export is non-negative
-        ext_grid_export_Q_vars[t] = model.addVar(lb=0, name=f'ext_grid_export_Q_{t}')  # Export is non-negative
+                        # Enforce cyclical SOC
+                        model.addConstr(bess_energy_vars[t][bus] == bess_energy_vars[time_steps[0]][bus], name=f'bess_energy_cyclical_{t}_{bus}')
 
-        # model.addConstr(ext_grid_import_P_vars[t] + ext_grid_export_P_vars[t] >= epsilon, name=f'nonzero_ext_grid_P_usage_{t}')
-        # model.addConstr(ext_grid_import_Q_vars[t] + ext_grid_export_Q_vars[t] >= epsilon, name=f'nonzero_ext_grid_Q_usage_{t}')
+        # External grid (import/export) per timestep
+        ext_grid_import_P_vars[t] = model.addVar(lb=0, name=f'ext_grid_import_P_{t}')
+        ext_grid_import_Q_vars[t] = model.addVar(lb=0, name=f'ext_grid_import_Q_{t}')
+        ext_grid_export_P_vars[t] = model.addVar(lb=0, name=f'ext_grid_export_P_{t}')
+        ext_grid_export_Q_vars[t] = model.addVar(lb=0, name=f'ext_grid_export_Q_{t}')
 
+        # Flexible load decision vars
+        flexible_load_P_vars[t] = model.addVars(flexible_load_buses, lb=0, name=f'flexible_load_P_{t}') if len(flexible_load_buses) > 0 else {}
+        flexible_load_Q_vars[t] = model.addVars(flexible_load_buses, name=f'flexible_load_Q_{t}') if len(flexible_load_buses) > 0 else {}
+        shed_vars[t] = model.addVars(flexible_load_buses, lb=0, name=f'shed_{t}') if len(flexible_load_buses) > 0 else {}
 
-        flexible_load_P_vars[t] = model.addVars(
-            flexible_load_buses,
-            lb=0,
-            name=f'flexible_load_P_{t}'
-        )
-
-        flexible_load_Q_vars[t] = model.addVars(
-            flexible_load_buses,
-            name=f'flexible_load_Q_{t}'
-        )
-
-        # Define heat pump load variables for buses with HP loads
+        # Heat pump decision vars
         if len(hp_load_buses) > 0:
-            p_hp_vars[t] = model.addVars(
-                hp_load_buses,
-                lb=0,
-                ub=HP_PMAX_MW,
-                name=f'p_hp_{t}'
-            )
-            # Debug: Print heat pump variable creation for first time step
-            if t == 0:
-                print(f"  Created p_hp_vars[{t}] for buses: {hp_load_buses}")
+            p_hp_vars[t] = model.addVars(hp_load_buses, lb=0, ub=HP_PMAX_MW, name=f'p_hp_{t}')
+            if t == time_steps[0]:
+                print(f"  Created p_hp_vars for buses: {hp_load_buses}")
 
     # ------------------------------------------------------------------
     # Aggregated flexible connection capacity buy-back variable (ycap)
@@ -2116,17 +2084,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     P_accumulated_vars = model.addVars(time_steps, net.bus.index, lb=-GRB.INFINITY, name="P_accumulated")
     Q_accumulated_vars = model.addVars(time_steps, net.bus.index, lb=-GRB.INFINITY, name="Q_accumulated")
 
-    # SAFEGUARD: Ensure flexible load vars exist for every timestep (defensive in case earlier loop was disrupted)
-    if len(flexible_load_buses) > 0:
-        missing_t = [t for t in time_steps if t not in flexible_load_P_vars]
-        if missing_t:
-            print(f"[WARN] Late-creating flexible load vars for missing timesteps: {missing_t[:10]}{'...' if len(missing_t)>10 else ''}")
-            for t in missing_t:
-                try:
-                    flexible_load_P_vars[t] = model.addVars(flexible_load_buses, lb=0, name=f'flexible_load_P_{t}_late')
-                    flexible_load_Q_vars[t] = model.addVars(flexible_load_buses, name=f'flexible_load_Q_{t}_late')
-                except Exception as _late_err:
-                    print(f"[ERROR] Failed late creation of flexible load vars for t={t}: {_late_err}")
+    # (Removed obsolete safeguard for late creation of flexible load vars after loop repair)
 
     # Add power balance and load flow constraints for each time step
     for t in time_steps:
@@ -2136,37 +2094,38 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         # These implement the single scalar buy-back design; keeps feasibility at night.
         # ------------------------------------------------------------------
         if len(flexible_load_buses) > 0:
-            missing_var_buses = []
-            for b in flexible_load_buses:
-                baseline_tb = float(flexible_time_synchronized_loads_P[t].get(b, 0.0))
-                if b not in flexible_load_P_vars[t]:
-                    missing_var_buses.append(b)
-                    continue
-                # Non-negativity is inherent from variable lb, but add explicit constraint for clarity
-                model.addConstr(flexible_load_P_vars[t][b] >= 0.0, name=f"flex_lb_t{t}_b{b}")
-                model.addConstr(flexible_load_P_vars[t][b] <= baseline_tb, name=f"flex_ub_t{t}_b{b}")
-            if missing_var_buses:
-                print(f"[WARN] Flexible load vars missing for t={t} buses={missing_var_buses}. Creating fallback vars with UB=0.")
-                # Create fallback variables for missing buses to keep indexing consistent
-                for b in missing_var_buses:
-                    try:
-                        v_fb = model.addVar(lb=0.0, ub=0.0, name=f'flexible_load_P_fallback_{t}_{b}')
-                        flexible_load_P_vars[t][b] = v_fb
-                        # Add explicit constraints (redundant but consistent)
-                        model.addConstr(flexible_load_P_vars[t][b] >= 0.0, name=f"flex_fb_lb_t{t}_b{b}")
-                        model.addConstr(flexible_load_P_vars[t][b] <= 0.0, name=f"flex_fb_ub_t{t}_b{b}")
-                    except Exception as _fb_err:
-                        print(f"[ERROR] Failed to create fallback flex var for t={t} bus={b}: {_fb_err}")
+            shed_t = model.addVars(flexible_load_buses, lb=0.0, name=f"shed_{t}")
+            shed_vars[t] = shed_t
+
+            sum_baseline_t = gp.quicksum(float(flexible_time_synchronized_loads_P[t].get(b,0.0))
+                                        for b in flexible_load_buses)
+            sum_flex_t = gp.quicksum(flexible_load_P_vars[t][b] for b in flexible_load_buses)
+
+            for bus in flexible_load_buses:
+                baseline_tb = float(flexible_time_synchronized_loads_P[t].get(bus, 0.0))
+                model.addConstr(flexible_load_P_vars[t][bus] >= 0.0, name=f"flex_lb_t{t}_b{bus}")
+                model.addConstr(flexible_load_P_vars[t][bus] <= baseline_tb, name=f"flex_ub_t{t}_b{bus}")
+
+                # reactive power constraint
+                model.addConstr(flexible_load_Q_vars[t][bus] == 0.0, name=f"flex_Q_pf_t{t}_b{bus}")
+
+                model.addConstr(flexible_load_P_vars[t][bus] + shed_t[bus] == baseline_tb,
+                    name=f"flex_track_t{t}_b{bus}")
+
             # Aggregated connection capacity (only if ycap_var exists)
             if 'ycap_var' in locals() and ycap_var is not None:
                 total_conn_cap_MW = 11.0/1000.0 * len(flexible_load_buses)
-                model.addConstr(
-                    gp.quicksum(flexible_load_P_vars[t][b] for b in flexible_load_buses) <= total_conn_cap_MW - ycap_var,
-                    name=f"agg_conn_cap_t{t}"
-                )
+                # baseline tracking (aggregate)
+                model.addConstr(sum_flex_t <= total_conn_cap_MW - ycap_var,
+                    name=f"agg_conn_cap_t{t}")
+                # connection capacity after buy-back (activated by default)
+                model.addConstr(sum_flex_t <= total_conn_cap_MW - ycap_var, name=f"agg_conn_cap_t{t}")
+
                 if bool(DEBUG_PRINT_FLEX_DIAGNOSTICS):
                     globals().setdefault('diag_sum_flex', {})[t] = gp.quicksum(flexible_load_P_vars[t][b] for b in flexible_load_buses)
                     globals().setdefault('diag_cap_rhs', {})[t] = total_conn_cap_MW - ycap_var
+                    
+
 
         # Power injection vector P
         P_injected = {bus: gp.LinExpr() for bus in net.bus.index}
@@ -2786,14 +2745,19 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         baseline_bess_cost = gp.quicksum(c_base_bess * (p0_dis_vars[t] + p0_ch_vars[t]) * dt_hours for t in time_steps if t in p0_dis_vars)
     else:
         baseline_bess_cost = 0
-    # Aggregate flexible curtailment cost (if any flexible curtail vars were created)
-    # Day-ahead flexible curtailment penalty (separate from RT capacity); renamed for clarity
-    # Capacity buy-back cost: pay per MW-hour of reduced connection (ycap applies every timestep)
-    if 'ycap_var' in locals() and ycap_var is not None:
-        flex_capacity_cost = C_CAP_EUR_PER_MW_H * ycap_var * dt_hours * len(time_steps)
-    else:
-        flex_capacity_cost = 0
     pv_curtail_cost = gp.quicksum(electricity_price[t] * curtailment_vars[t][bus] * dt_hours for bus in pv_buses for t in time_steps) if len(pv_buses) > 0 else 0
+    flex_capacity_cost = C_CAP_EUR_PER_MW_H * ycap_var * dt_hours * len(time_steps)
+    # Shedding cost: shed_vars[t] is a tupledict (per-bus shedding vars) — must sum its values.
+    # Previous code attempted: float * tupledict -> TypeError. We expand explicitly.
+    if C_SHED_EUR_PER_MW_H != 0 and len(shed_vars) > 0:
+        shed_cost = gp.quicksum(
+            C_SHED_EUR_PER_MW_H * v * dt_hours
+            for t in time_steps
+            for v in (shed_vars[t].values() if isinstance(shed_vars[t], gp.tupledict) else (
+                shed_vars[t].values() if hasattr(shed_vars[t], 'values') else []))
+        )
+    else:
+        shed_cost = 0
 
     # New: first-stage capacity and RT proxy costs for robust policies (only if enabled)
     if ENABLE_RT_POLICIES:
@@ -2813,7 +2777,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         bess_rt_proxy_cost = 0
 
     # Objective: Minimize total cost (import, export, and curtailment costs)
-    total_cost = electricity_cost + bess_cost + baseline_bess_cost + flex_capacity_cost + pv_curtail_cost
+    total_cost = electricity_cost + bess_cost + baseline_bess_cost + flex_capacity_cost + pv_curtail_cost + shed_cost
     total_cost += cap_cost + imb_proxy_cost + pv_curt_proxy_cost + bess_rt_proxy_cost
     model.setObjective(total_cost, GRB.MINIMIZE)
 
@@ -2823,7 +2787,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     #model.setParam('scaleFlag', 3)
     #model.setParam('NonConvex', 2)
     #model.setParam("NumericFocus", 1)
-    #model.setParam("BarHomogeneous", 0)
+    #model.setParam("BarHomogeneous", 1)
     #model.setParam("Crossover", 0) 
     #model.setParam("BarQCPConvTol", 1e-8)
     #model.setParam("Method", 3)
@@ -3090,12 +3054,19 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         print("\nCOST BREAKDOWN:")
         print(f"  electricity_cost = {electricity_cost_value}")
         print(f"  bess_cost = {bess_cost_value}")
-        print(f"  flex_capacity_cost_DA = {float(flex_capacity_cost.getValue()) if hasattr(flex_capacity_cost, 'getValue') else 'N/A'}")
+        print(f"  flex_curtailment_cost = {float(flex_capacity_cost.getValue()) if hasattr(flex_capacity_cost, 'getValue') else 'N/A'}")
         try:
-            ycap_print = ycap_var.x if ('ycap_var' in locals() and ycap_var is not None) else (ycap_var.X if 'ycap_var' in locals() else None)
+            if 'ycurt_vars' in locals() and ycurt_vars:
+                total_curt = sum(v.X for v in ycurt_vars.values())
+                avg_curt = total_curt / len(ycurt_vars)
+            else:
+                total_curt = 0.0
+                avg_curt = 0.0
         except Exception:
-            ycap_print = None
-        print(f"  ycap_mw = {ycap_print}")
+            total_curt = None
+            avg_curt = None
+        print(f"  total_curtailment_mw = {total_curt}")
+        print(f"  avg_curtailment_mw = {avg_curt}")
         print(f"  pv_curtail_cost = {pv_curtail_cost_value}")
         if ENABLE_RT_POLICIES:
             try:
