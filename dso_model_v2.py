@@ -3451,6 +3451,67 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 flexible_load_p=results.get('flexible_load_p', None)
             )
         print(f"="*80)
+
+        # ------------------------------------------------------------------
+        # DEBUG: Baseline vs Realized Flexible Load for a Selected Timestep
+        # ------------------------------------------------------------------
+        try:
+            baseline_flex_dict = globals().get('flexible_time_synchronized_loads_P', {})
+            realized_flex_dict = results.get('flexible_load_p', {})
+            if baseline_flex_dict:
+                # Choose first timestep with non-zero baseline total, else 0
+                candidate_ts = sorted(baseline_flex_dict.keys())
+                t_debug = None
+                for tt in candidate_ts:
+                    try:
+                        if sum(float(v) for v in baseline_flex_dict[tt].values()) > 1e-9:
+                            t_debug = tt
+                            break
+                    except Exception:
+                        pass
+                if t_debug is None:
+                    t_debug = candidate_ts[0]
+                base_map = baseline_flex_dict.get(t_debug, {})
+                real_map = realized_flex_dict.get(t_debug, {})
+                all_buses = sorted(set(base_map.keys()) | set(real_map.keys()))
+                print(f"\n[DEBUG FLEX] Timestep t={t_debug}: baseline_vs_realized (MW) for first 25 buses:")
+                print(f"{'Bus':>6} {'Baseline_MW':>14} {'Realized_MW':>14} {'Delta_MW':>12}")
+                for bus in all_buses[:25]:
+                    b = float(base_map.get(bus, 0.0))
+                    r = float(real_map.get(bus, 0.0))
+                    print(f"{bus:>6} {b:14.6f} {r:14.6f} {r-b:12.6f}")
+                # Bar plot (kW) saved to file
+                import matplotlib.pyplot as _plt
+                fig_dbg, ax_dbg = _plt.subplots(figsize=(10,4))
+                bw = 0.4
+                x_idx = np.arange(len(all_buses))
+                base_kw = [float(base_map.get(b, 0.0))*1000.0 for b in all_buses]
+                real_kw = [float(real_map.get(b, 0.0))*1000.0 for b in all_buses]
+                ax_dbg.bar(x_idx - bw/2, base_kw, width=bw, label='Baseline kW')
+                ax_dbg.bar(x_idx + bw/2, real_kw, width=bw, label='Realized kW')
+                ax_dbg.set_title(f'Baseline vs Realized Flexible Load (t={t_debug})')
+                ax_dbg.set_xlabel('Bus')
+                ax_dbg.set_ylabel('Power (kW)')
+                if len(all_buses) <= 40:
+                    ax_dbg.set_xticks(x_idx)
+                    ax_dbg.set_xticklabels(all_buses, rotation=90, fontsize=8)
+                else:
+                    # sparse ticks
+                    step = max(1, len(all_buses)//40)
+                    sel = list(range(0, len(all_buses), step))
+                    ax_dbg.set_xticks([x_idx[i] for i in sel])
+                    ax_dbg.set_xticklabels([all_buses[i] for i in sel], rotation=90, fontsize=8)
+                ax_dbg.grid(alpha=0.3)
+                ax_dbg.legend()
+                debug_fig_name = f'baseline_vs_realized_flex_t{t_debug}.png'
+                fig_dbg.tight_layout()
+                fig_dbg.savefig(debug_fig_name, dpi=150)
+                _plt.close(fig_dbg)
+                print(f"[DEBUG FLEX] Saved comparison figure: {debug_fig_name}")
+            else:
+                print("[DEBUG FLEX] No baseline flexible load dictionary present (flexible_time_synchronized_loads_P empty or undefined).")
+        except Exception as _flex_dbg_err:
+            print(f"[DEBUG FLEX] Failed generating baseline vs realized debug: {_flex_dbg_err}")
         
         return results, results_data
     
