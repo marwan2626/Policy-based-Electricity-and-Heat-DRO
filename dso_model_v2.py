@@ -646,28 +646,43 @@ def create_comprehensive_plots(results_df, hp_power_values, ambient_temps_c=None
         plt.grid(True, alpha=0.3)
         #plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
     
-    # 9. Electrical Bus Voltages (restored)
+    # 9. Baseline (time-synchronized) Flexible Load per Bus (kW) replacing voltage subplot
     plt.subplot(7, 2, 9)
-    voltage_cols = [col for col in results_df.columns if 'voltage_pu' in col.lower()]
-    if voltage_cols:
-        for i, col in enumerate(voltage_cols):
-            bus_number = col.split('_')[1] if '_' in col else str(i)
-            plt.plot(hours, results_df[col], alpha=0.7, linewidth=1.2, label=f'Bus {bus_number}')
-        plt.axhline(y=1.0, color='black', linestyle='-', alpha=0.5, label='Nominal (1.0 p.u.)')
-        plt.title('Electrical Bus Voltages Over Time', fontsize=14, fontweight='bold')
-        plt.xlabel('Hour')
-        plt.ylabel('Voltage (p.u.)')
-        plt.grid(True, alpha=0.3)
-        plt.ylim(0.85, 1.15)
-        # Legend omitted for readability unless few buses
-        if len(voltage_cols) <= 15:
-            plt.legend(fontsize=7, loc='upper right')
-    else:
-        plt.text(0.5, 0.5, 'No Voltage Data', transform=plt.gca().transAxes, ha='center', va='center', fontsize=12)
-        plt.title('Electrical Bus Voltages Over Time', fontsize=14, fontweight='bold')
-        plt.xlabel('Hour')
-        plt.ylabel('Voltage (p.u.)')
-        plt.grid(True, alpha=0.3)
+    try:
+        baseline_flex_dict = globals().get('flexible_time_synchronized_loads_P', {})
+        if baseline_flex_dict:
+            all_buses = set()
+            for tmap in baseline_flex_dict.values():
+                all_buses.update(tmap.keys())
+            buses_sorted = sorted(list(all_buses))
+            color_map = plt.cm.tab20(np.linspace(0, 1, max(1, len(buses_sorted))))
+            T = len(hours)
+            for i, bus in enumerate(buses_sorted):
+                series_kw = []
+                for t in range(T):
+                    val_mw = 0.0
+                    if t in baseline_flex_dict and bus in baseline_flex_dict[t]:
+                        val_mw = float(baseline_flex_dict[t][bus])
+                    series_kw.append(val_mw * 1000.0)
+                alpha = 0.85 if len(buses_sorted) <= 25 else 0.5
+                lw = 1.2 if len(buses_sorted) <= 25 else 0.8
+                label = f"Bus {bus}" if len(buses_sorted) <= 15 else None
+                plt.plot(hours, series_kw, linewidth=lw, alpha=alpha, color=color_map[i % len(color_map)], label=label)
+            plt.title('Baseline Flexible Load per Bus (kW)', fontsize=14, fontweight='bold')
+            plt.xlabel('Hour')
+            plt.ylabel('Power (kW)')
+            plt.grid(True, alpha=0.3)
+            if len(buses_sorted) <= 15:
+                plt.legend(fontsize=7, loc='upper right')
+        else:
+            plt.text(0.5, 0.5, 'No baseline flexible load data', transform=plt.gca().transAxes, ha='center', va='center', fontsize=12)
+            plt.title('Baseline Flexible Load per Bus (kW)', fontsize=14, fontweight='bold')
+            plt.xlabel('Hour')
+            plt.ylabel('Power (kW)')
+            plt.grid(True, alpha=0.3)
+    except Exception as _baseline_subplot_err:
+        plt.text(0.5, 0.5, f'Baseline flex plot error: {_baseline_subplot_err}', transform=plt.gca().transAxes, ha='center', va='center', fontsize=10)
+        plt.title('Baseline Flexible Load per Bus (error)', fontsize=14, fontweight='bold')
     
     # 10. Flexible Load Active Power per Bus (REPLACES Thermal Storage SOC plot)
     plt.subplot(7, 2, 10)
@@ -3315,6 +3330,25 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 results_df['D_minus_max_mw'] = [D_minus_max[t] for t in time_steps]
                 # Also expose DA aggregated flexible curtailment to verify the tie to y_cap
                 results_df['ycap_mw'] = [ycap_var.x if ("ycap_var" in locals() and ycap_var is not None) else 0.0 for _ in time_steps]
+                # Baseline flexible (time-synchronized) loads per bus (MW & kW)
+                try:
+                    baseline_flex_dict = globals().get('flexible_time_synchronized_loads_P', {})
+                    if baseline_flex_dict:
+                        all_buses = set()
+                        for tmap in baseline_flex_dict.values():
+                            all_buses.update(tmap.keys())
+                        buses_sorted = sorted(list(all_buses))
+                        for bus in buses_sorted:
+                            series_mw = []
+                            for t in time_steps:
+                                v = 0.0
+                                if t in baseline_flex_dict and bus in baseline_flex_dict[t]:
+                                    v = float(baseline_flex_dict[t][bus])
+                                series_mw.append(v)
+                            results_df[f'baseline_flex_bus_{bus}_mw'] = series_mw
+                            results_df[f'baseline_flex_bus_{bus}_kw'] = [val * 1000.0 for val in series_mw]
+                except Exception as _baseline_export_err:
+                    print(f"WARNING: baseline flex export failed: {_baseline_export_err}")
                 # Per-bus flexible load realized power (MW) — flat columns for plotting (unaggregated)
                 try:
                     for bus in flexible_load_buses:
