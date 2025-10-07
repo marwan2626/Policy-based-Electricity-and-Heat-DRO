@@ -633,21 +633,8 @@ def create_comprehensive_plots(results_df, hp_power_values, ambient_temps_c=None
         plt.grid(True, alpha=0.3)
         #plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
     
-    # 8. Junction Temperatures Overview - Return Temperatures  
+    # 8. Baseline (time-synchronized) Flexible Load per Bus (kW) (replaces Return Junction Temperatures)
     plt.subplot(7, 2, 8)
-    return_cols = [col for col in results_df.columns if 'return' in col.lower() and 'temp' in col.lower()]
-    if return_cols:
-        return_temps = results_df[return_cols].values
-        for i, col in enumerate(return_cols[:10]):  # Show first 10 for clarity
-            plt.plot(hours, results_df[col], alpha=0.7, label=f'Junction {i+1}')
-        plt.title('Return Junction Temperatures (First 10)', fontsize=14, fontweight='bold')
-        plt.xlabel('Hour')
-        plt.ylabel('Temperature (°C)')
-        plt.grid(True, alpha=0.3)
-        #plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-    
-    # 9. Baseline (time-synchronized) Flexible Load per Bus (kW) replacing voltage subplot
-    plt.subplot(7, 2, 9)
     try:
         baseline_flex_dict = globals().get('flexible_time_synchronized_loads_P', {})
         if baseline_flex_dict:
@@ -683,6 +670,38 @@ def create_comprehensive_plots(results_df, hp_power_values, ambient_temps_c=None
     except Exception as _baseline_subplot_err:
         plt.text(0.5, 0.5, f'Baseline flex plot error: {_baseline_subplot_err}', transform=plt.gca().transAxes, ha='center', va='center', fontsize=10)
         plt.title('Baseline Flexible Load per Bus (error)', fontsize=14, fontweight='bold')
+
+    # 9. Electrical Bus Voltages Over Time (restored)
+    plt.subplot(7, 2, 9)
+    voltage_cols = [col for col in results_df.columns if 'voltage_pu' in col.lower()]
+    if voltage_cols:
+        for i, col in enumerate(voltage_cols):
+            try:
+                # Attempt to extract bus number between first and second underscore if pattern matches 'bus_<id>_voltage_pu'
+                parts = col.split('_')
+                if len(parts) >= 3 and parts[0] == 'bus' and parts[-2] == 'voltage' and parts[-1] == 'pu':
+                    bus_number = parts[1]
+                elif len(parts) >= 2 and parts[0] == 'bus':
+                    bus_number = parts[1]
+                else:
+                    bus_number = str(i)
+            except Exception:
+                bus_number = str(i)
+            plt.plot(hours, results_df[col], alpha=0.7, linewidth=1.0, label=f'Bus {bus_number}')
+        plt.axhline(y=1.0, color='black', linestyle='-', alpha=0.5, label='Nominal (1.0 p.u.)')
+        plt.title('Electrical Bus Voltages Over Time', fontsize=14, fontweight='bold')
+        plt.xlabel('Hour')
+        plt.ylabel('Voltage (p.u.)')
+        plt.grid(True, alpha=0.3)
+        plt.ylim(0.85, 1.15)
+        if len(voltage_cols) <= 15:
+            plt.legend(fontsize=7, loc='upper right')
+    else:
+        plt.text(0.5, 0.5, 'No Voltage Data', transform=plt.gca().transAxes, ha='center', va='center', fontsize=12)
+        plt.title('Electrical Bus Voltages Over Time', fontsize=14, fontweight='bold')
+        plt.xlabel('Hour')
+        plt.ylabel('Voltage (p.u.)')
+        plt.grid(True, alpha=0.3)
     
     # 10. Flexible Load Active Power per Bus (REPLACES Thermal Storage SOC plot)
     plt.subplot(7, 2, 10)
