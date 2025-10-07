@@ -115,6 +115,7 @@ DEBUG_EXTRACT_IIS = True              # If model infeasible, extract IIS
 DEBUG_PRINT_FLEX_DIAGNOSTICS = True   # Print per-period cap diagnostics (first few + min/max)
 RELAX_AGG_CONN_CAP = False            # (Removed) kept for backward compatibility; no slack will be created
 MAX_FLEX_DIAG_PERIODS = 8             # How many early periods to print diagnostics
+SHOW_BASELINE_FLEX_FIG = True         # If True, create a standalone figure with baseline (deterministic) flexible loads per bus
 ## End debug flags
 
 # --- Heat Pump predictor and DRCC constants (single source of truth) ---
@@ -645,47 +646,28 @@ def create_comprehensive_plots(results_df, hp_power_values, ambient_temps_c=None
         plt.grid(True, alpha=0.3)
         #plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
     
-    # 9. Original (Deterministic / Baseline) Flexible Load per Bus (unconstrained reference)
-    # This replaces the previous voltage plot per user request.
+    # 9. Electrical Bus Voltages (restored)
     plt.subplot(7, 2, 9)
-    try:
-        # We reconstruct baseline per-bus flexible load time series from flexible_time_synchronized_loads_P (MW)
-        # which is structured as {t: {bus: mw}}.
-        baseline_flex_dict = globals().get('flexible_time_synchronized_loads_P', {})
-        if baseline_flex_dict:
-            # Collect all buses present in any timestep for deterministic baseline
-            baseline_buses = set()
-            for tmap in baseline_flex_dict.values():
-                baseline_buses.update(tmap.keys())
-            baseline_buses = sorted(list(baseline_buses))
-            color_map = plt.cm.tab20(np.linspace(0, 1, max(1, len(baseline_buses))))
-            T = len(hours)
-            for i, bus in enumerate(baseline_buses):
-                series_kw = []
-                for t in range(T):
-                    val_mw = 0.0
-                    if t in baseline_flex_dict and bus in baseline_flex_dict[t]:
-                        val_mw = float(baseline_flex_dict[t][bus])
-                    series_kw.append(val_mw * 1000.0)  # MW -> kW
-                alpha = 0.85 if len(baseline_buses) <= 25 else 0.5
-                lw = 1.2 if len(baseline_buses) <= 25 else 0.8
-                label = f"Bus {bus}" if len(baseline_buses) <= 15 else None
-                plt.plot(hours, series_kw, linewidth=lw, alpha=alpha, color=color_map[i % len(color_map)], label=label)
-            plt.title('Baseline Flexible Load per Bus (kW)', fontsize=14, fontweight='bold')
-            plt.xlabel('Hour')
-            plt.ylabel('Power (kW)')
-            plt.grid(True, alpha=0.3)
-            if len(baseline_buses) <= 15:
-                plt.legend(fontsize=7, loc='upper right')
-        else:
-            plt.text(0.5, 0.5, 'No baseline flexible load data', transform=plt.gca().transAxes, ha='center', va='center', fontsize=12)
-            plt.title('Baseline Flexible Load per Bus (kW)', fontsize=14, fontweight='bold')
-            plt.xlabel('Hour')
-            plt.ylabel('Power (kW)')
-            plt.grid(True, alpha=0.3)
-    except Exception as _baseline_flex_err:
-        plt.text(0.5, 0.5, f'Baseline flex plot error: {_baseline_flex_err}', transform=plt.gca().transAxes, ha='center', va='center', fontsize=10)
-        plt.title('Baseline Flexible Load per Bus (error)', fontsize=14, fontweight='bold')
+    voltage_cols = [col for col in results_df.columns if 'voltage_pu' in col.lower()]
+    if voltage_cols:
+        for i, col in enumerate(voltage_cols):
+            bus_number = col.split('_')[1] if '_' in col else str(i)
+            plt.plot(hours, results_df[col], alpha=0.7, linewidth=1.2, label=f'Bus {bus_number}')
+        plt.axhline(y=1.0, color='black', linestyle='-', alpha=0.5, label='Nominal (1.0 p.u.)')
+        plt.title('Electrical Bus Voltages Over Time', fontsize=14, fontweight='bold')
+        plt.xlabel('Hour')
+        plt.ylabel('Voltage (p.u.)')
+        plt.grid(True, alpha=0.3)
+        plt.ylim(0.85, 1.15)
+        # Legend omitted for readability unless few buses
+        if len(voltage_cols) <= 15:
+            plt.legend(fontsize=7, loc='upper right')
+    else:
+        plt.text(0.5, 0.5, 'No Voltage Data', transform=plt.gca().transAxes, ha='center', va='center', fontsize=12)
+        plt.title('Electrical Bus Voltages Over Time', fontsize=14, fontweight='bold')
+        plt.xlabel('Hour')
+        plt.ylabel('Voltage (p.u.)')
+        plt.grid(True, alpha=0.3)
     
     # 10. Flexible Load Active Power per Bus (REPLACES Thermal Storage SOC plot)
     plt.subplot(7, 2, 10)
@@ -928,6 +910,38 @@ def create_comprehensive_plots(results_df, hp_power_values, ambient_temps_c=None
     plt.tight_layout()
     plt.savefig('dso_model_v2_results.png', dpi=300, bbox_inches='tight')
     plt.show()
+
+    # Optional standalone baseline flexible load figure
+    if bool(globals().get('SHOW_BASELINE_FLEX_FIG', False)):
+        try:
+            baseline_flex_dict = globals().get('flexible_time_synchronized_loads_P', {})
+            if baseline_flex_dict:
+                fig_bl, ax_bl = plt.subplots(figsize=(14,6))
+                all_buses = set()
+                for tmap in baseline_flex_dict.values():
+                    all_buses.update(tmap.keys())
+                buses_sorted = sorted(list(all_buses))
+                color_map = plt.cm.tab20(np.linspace(0,1,max(1,len(buses_sorted))))
+                T = len(hours)
+                for i, bus in enumerate(buses_sorted):
+                    series_kw = []
+                    for t in range(T):
+                        val_mw = 0.0
+                        if t in baseline_flex_dict and bus in baseline_flex_dict[t]:
+                            val_mw = float(baseline_flex_dict[t][bus])
+                        series_kw.append(val_mw * 1000.0)
+                    ax_bl.plot(hours, series_kw, linewidth=1.0, alpha=0.8, color=color_map[i%len(color_map)], label=f'Bus {bus}' if len(buses_sorted) <= 20 else None)
+                ax_bl.set_title('Baseline Flexible Load per Bus (kW)', fontsize=14, fontweight='bold')
+                ax_bl.set_xlabel('Hour')
+                ax_bl.set_ylabel('Power (kW)')
+                ax_bl.grid(True, alpha=0.3)
+                if len(buses_sorted) <= 20:
+                    ax_bl.legend(fontsize=8, ncol=2)
+                fig_bl.tight_layout()
+                fig_bl.savefig('baseline_flexible_loads.png', dpi=300, bbox_inches='tight')
+                plt.show()
+        except Exception as _baseline_fig_err:
+            print(f"[WARN] Could not produce baseline flexible load figure: {_baseline_fig_err}")
     
     # Create additional detailed plots
     create_detailed_junction_plots(results_df)
