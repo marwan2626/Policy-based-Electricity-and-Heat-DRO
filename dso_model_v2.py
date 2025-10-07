@@ -2999,6 +2999,11 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         print(f"  electricity_cost = {electricity_cost_value}")
         print(f"  bess_cost = {bess_cost_value}")
         print(f"  flex_capacity_cost_DA = {float(flex_capacity_cost.getValue()) if hasattr(flex_capacity_cost, 'getValue') else 'N/A'}")
+        try:
+            ycap_print = ycap_var.x if ('ycap_var' in locals() and ycap_var is not None) else (ycap_var.X if 'ycap_var' in locals() else None)
+        except Exception:
+            ycap_print = None
+        print(f"  ycap_mw = {ycap_print}")
         print(f"  pv_curtail_cost = {pv_curtail_cost_value}")
         if ENABLE_RT_POLICIES:
             try:
