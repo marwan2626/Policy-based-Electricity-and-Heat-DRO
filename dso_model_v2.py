@@ -1964,25 +1964,25 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     # Reassign to globals in case references changed
     globals()['flexible_time_synchronized_loads_P'] = flexible_time_synchronized_loads_P
 
-        # Scale installed peak by the normalized PV profile for this timestep
-        # const_pv is expected to be in 0..1; pv_bus_limits_t gives available potential (MW)
-        pv_bus_limits_t = {bus: float(base_pv_bus_limits.get(bus, 0.0)) * float(const_pv[t]) for bus in pv_buses}
+    # Scale installed peak by the normalized PV profile for this timestep
+    # const_pv is expected to be in 0..1; pv_bus_limits_t gives available potential (MW)
+    pv_bus_limits_t = {bus: float(base_pv_bus_limits.get(bus, 0.0)) * float(const_pv[t]) for bus in pv_buses}
 
-        # PV availability scaled per timestep (no verbose debug printing)
+    # PV availability scaled per timestep (no verbose debug printing)
 
-        # Create PV generation variables for this time step using the scaled availability
-        if len(pv_buses) > 0:
-            pv_gen_vars[t] = model.addVars(pv_buses, lb=0, ub=pv_bus_limits_t, name=f'pv_gen_{t}')
-            curtailment_vars[t] = model.addVars(pv_buses, lb=0, ub=pv_bus_limits_t, name=f'curtailment_{t}')
+    # Create PV generation variables for this time step using the scaled availability
+    if len(pv_buses) > 0:
+        pv_gen_vars[t] = model.addVars(pv_buses, lb=0, ub=pv_bus_limits_t, name=f'pv_gen_{t}')
+        curtailment_vars[t] = model.addVars(pv_buses, lb=0, ub=pv_bus_limits_t, name=f'curtailment_{t}')
 
-            for bus in pv_buses:
-                # available potential this timestep
-                available_mw = float(base_pv_bus_limits.get(bus, 0.0)) * float(const_pv[t])
-                model.addConstr(
-                    curtailment_vars[t][bus] == available_mw - pv_gen_vars[t][bus], 
-                    name=f'curtailment_constraint_{t}_{bus}'
-                )
-            # Track aggregate PV availability for budgets
+        for bus in pv_buses:
+            # available potential this timestep
+            available_mw = float(base_pv_bus_limits.get(bus, 0.0)) * float(const_pv[t])
+            model.addConstr(
+                curtailment_vars[t][bus] == available_mw - pv_gen_vars[t][bus], 
+                name=f'curtailment_constraint_{t}_{bus}'
+            )
+        # Track aggregate PV availability for budgets
             pv_avail_sum_by_t[t] = float(sum(pv_bus_limits_t.values()))
 
         if len(bess_buses) > 0:
