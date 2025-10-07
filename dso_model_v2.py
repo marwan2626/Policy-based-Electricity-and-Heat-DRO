@@ -100,8 +100,14 @@ PV_STD_CORRELATION = 1.00      # used only if constructing from per-bus stds (no
 HP_FULLY_CORRELATED = True     # temperature is common across HPs
 RHO_TEMP_AVG = 0             # 0=independent, 1=fully correlated within day
 # Capacity buy-back pricing (EUR per MW-hour of purchased connection reduction)
-C_CAP_EUR_PER_MW_H = 50.0  # <--- EDIT ME (capacity price); set 0 to disable economic impact
+C_CAP_EUR_PER_MW_H = 5.0  # <--- EDIT ME (capacity price); set 0 to disable economic impact
 # =====================================================================
+## Debug flags for aggregated flexibility mechanism
+DEBUG_EXTRACT_IIS = True              # If model infeasible, extract IIS
+DEBUG_PRINT_FLEX_DIAGNOSTICS = True   # Print per-period cap diagnostics (first few + min/max)
+RELAX_AGG_CONN_CAP = False            # (Removed) kept for backward compatibility; no slack will be created
+MAX_FLEX_DIAG_PERIODS = 8             # How many early periods to print diagnostics
+## End debug flags
 
 # --- Heat Pump predictor and DRCC constants (single source of truth) ---
 # Affine predictor (Baseline + Deviation normalized by Pmax, with daily T_avg)
@@ -2008,6 +2014,9 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                     gp.quicksum(flexible_load_P_vars[t][b] for b in flexible_load_buses) <= total_conn_cap_MW - ycap_var,
                     name=f"agg_conn_cap_t{t}"
                 )
+                if bool(DEBUG_PRINT_FLEX_DIAGNOSTICS):
+                    globals().setdefault('diag_sum_flex', {})[t] = gp.quicksum(flexible_load_P_vars[t][b] for b in flexible_load_buses)
+                    globals().setdefault('diag_cap_rhs', {})[t] = total_conn_cap_MW - ycap_var
 
         # Power injection vector P
         P_injected = {bus: gp.LinExpr() for bus in net.bus.index}
@@ -2128,8 +2137,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 model.addConstr(V_vars[t, bus] == V_reduced_vars[t, bus], name=f"voltage_assignment_{t}_{bus}")
 
                 # Base voltage band (squared magnitude) used before
-                base_v_min = 0.90**2
-                base_v_max = 1.10**2
+                base_v_min = 0.70**2
+                base_v_max = 1.50**2
 
                 # Compute tightened voltage band if DRCC tightening enabled; else fall back to base
                 if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_VOLTAGES and (k_epsilon is not None) and (sigmaP_pu_vec is not None):
@@ -2654,23 +2663,66 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         bess_rt_proxy_cost = 0
 
     # Objective: Minimize total cost (import, export, and curtailment costs)
-    total_cost = electricity_cost + bess_cost + baseline_bess_cost + flex_capacity_cost + pv_curtail_cost 
+    total_cost = electricity_cost + bess_cost + baseline_bess_cost + flex_capacity_cost + pv_curtail_cost
     total_cost += cap_cost + imb_proxy_cost + pv_curt_proxy_cost + bess_rt_proxy_cost
     model.setObjective(total_cost, GRB.MINIMIZE)
 
     # After adding all constraints and variables
     #model.setParam('OutputFlag', 0)
-    #model.setParam('Presolve', 0)
+    model.setParam('Presolve', 1)
+    model.setParam('scaleFlag', 3)
     #model.setParam('NonConvex', 2)
-    model.setParam("NumericFocus", 3)
+    model.setParam("NumericFocus", 1)
     model.setParam("BarHomogeneous", 1)
-    model.setParam("Crossover", 0) 
+    #model.setParam("Crossover", 0) 
     #model.setParam("BarQCPConvTol", 1e-8)
 
     model.update()
 
     # Optimize the model
     model.optimize()
+
+    # If infeasible and IIS debugging enabled, extract IIS details early
+    if model.status == GRB.INFEASIBLE and bool(DEBUG_EXTRACT_IIS):
+        print("\n[DIAG] Model infeasible — extracting IIS ...")
+        try:
+            model.computeIIS()
+            viol_cons = []
+            for c in model.getConstrs():
+                if c.IISConstr:
+                    viol_cons.append(c.ConstrName)
+            viol_quads = []
+            for qc in model.getQConstrs():
+                if qc.IISQConstr:
+                    viol_quads.append(qc.QCName)
+            viol_bounds = []
+            for v in model.getVars():
+                if v.IISLB or v.IISUB:
+                    viol_bounds.append(v.VarName)
+            print(f"[DIAG] IIS constraints count={len(viol_cons)} quads={len(viol_quads)} bounds={len(viol_bounds)}")
+            if len(viol_cons) > 0:
+                print("[DIAG] Constraints in IIS (first 50):")
+                for name in viol_cons[:50]:
+                    print("   -", name)
+            if len(viol_bounds) > 0:
+                print("[DIAG] Vars with IIS bounds (first 50):")
+                    
+                for name in viol_bounds[:50]:
+                    print("   -", name)
+            # Save IIS list to a text file for deeper inspection
+            try:
+                with open('iis_diagnostics.txt','w') as f:
+                    f.write('IIS Constraints:\n')
+                    for n in viol_cons: f.write(n+'\n')
+                    f.write('\nIIS Quad Constraints:\n')
+                    for n in viol_quads: f.write(n+'\n')
+                    f.write('\nIIS Variable Bounds:\n')
+                    for n in viol_bounds: f.write(n+'\n')
+                print('[DIAG] IIS written to iis_diagnostics.txt')
+            except Exception as _e:
+                print(f"[DIAG] Failed writing IIS file: {_e}")
+        except Exception as _e:
+            print(f"[DIAG] IIS extraction failed: {_e}")
 
     # Check if optimization was successful
     if model.status == GRB.OPTIMAL:
@@ -2925,6 +2977,18 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             print(f"  model.ObjVal = {model.ObjVal}")
         except Exception:
             pass
+        # Diagnostics for flexible capacity cap (print first few periods)
+        if bool(DEBUG_PRINT_FLEX_DIAGNOSTICS) and 'diag_sum_flex' in globals() and 'diag_cap_rhs' in globals():
+            try:
+                print("\n[DIAG] Aggregated flexible capacity usage (first periods):")
+                for t in sorted(diag_sum_flex.keys())[:MAX_FLEX_DIAG_PERIODS]:
+                    rhs_val = (11.0/1000.0 * len(flexible_load_buses)) - (ycap_var.X if ("ycap_var" in locals() and ycap_var is not None) else 0.0)
+                    print(f"   t={t} sum_flex≈{diag_sum_flex[t].getValue():.5f} MW  cap_rhs≈{rhs_val:.5f} MW")
+                # Provide min/max across horizon
+                sum_vals = [diag_sum_flex[t].getValue() for t in diag_sum_flex]
+                print(f"[DIAG] sum_flex_min={min(sum_vals):.5f} max={max(sum_vals):.5f}")
+            except Exception as _e:
+                print(f"[DIAG] Flex diagnostics failed: {_e}")
         print(f"✓ MULTI-PERIOD OPTIMIZATION SUCCESSFUL!")
         print(f"="*80)
         
