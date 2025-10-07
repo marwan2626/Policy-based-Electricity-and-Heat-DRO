@@ -2116,6 +2116,18 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     P_accumulated_vars = model.addVars(time_steps, net.bus.index, lb=-GRB.INFINITY, name="P_accumulated")
     Q_accumulated_vars = model.addVars(time_steps, net.bus.index, lb=-GRB.INFINITY, name="Q_accumulated")
 
+    # SAFEGUARD: Ensure flexible load vars exist for every timestep (defensive in case earlier loop was disrupted)
+    if len(flexible_load_buses) > 0:
+        missing_t = [t for t in time_steps if t not in flexible_load_P_vars]
+        if missing_t:
+            print(f"[WARN] Late-creating flexible load vars for missing timesteps: {missing_t[:10]}{'...' if len(missing_t)>10 else ''}")
+            for t in missing_t:
+                try:
+                    flexible_load_P_vars[t] = model.addVars(flexible_load_buses, lb=0, name=f'flexible_load_P_{t}_late')
+                    flexible_load_Q_vars[t] = model.addVars(flexible_load_buses, name=f'flexible_load_Q_{t}_late')
+                except Exception as _late_err:
+                    print(f"[ERROR] Failed late creation of flexible load vars for t={t}: {_late_err}")
+
     # Add power balance and load flow constraints for each time step
     for t in time_steps:
         # ------------------------------------------------------------------
