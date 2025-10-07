@@ -571,6 +571,70 @@ def main() -> None:
     base_pv_by_bus = _collect_da_series(df, pv_bus_ids, 'pv_avail_bus_', '_mw')
     base_pv_da_by_bus = _collect_da_series(df, pv_gen_bus_ids, 'pv_gen_bus_', '_mw')
     base_hp_by_bus_raw = _collect_da_series(df, hp_bus_ids_raw, 'hp_elec_bus_', '_mw')
+    # Flexible load exports (baseline, realized, curtailment) added in v2 refactor
+    flex_baseline_bus_ids = _get_bus_ids_from_columns(df, 'baseline_flex_bus_', '_mw')
+    flex_realized_bus_ids = _get_bus_ids_from_columns(df, 'flex_load_bus_', '_mw')
+    flex_curt_bus_ids = _get_bus_ids_from_columns(df, 'curt_bus_', '_mw')
+    flex_baseline_by_bus = _collect_da_series(df, flex_baseline_bus_ids, 'baseline_flex_bus_', '_mw') if flex_baseline_bus_ids else {}
+    flex_realized_by_bus = _collect_da_series(df, flex_realized_bus_ids, 'flex_load_bus_', '_mw') if flex_realized_bus_ids else {}
+    flex_curt_by_bus = _collect_da_series(df, flex_curt_bus_ids, 'curt_bus_', '_mw') if flex_curt_bus_ids else {}
+    # Aggregate flexible load series (they are deterministic across OOS trajectories)
+    if flex_baseline_by_bus:
+        flex_baseline_total = np.sum(list(flex_baseline_by_bus.values()), axis=0)
+    else:
+        flex_baseline_total = np.zeros(len(index))
+    if flex_realized_by_bus:
+        flex_realized_total = np.sum(list(flex_realized_by_bus.values()), axis=0)
+    else:
+        flex_realized_total = np.zeros(len(index))
+    if flex_curt_by_bus:
+        flex_curt_total = np.sum(list(flex_curt_by_bus.values()), axis=0)
+    else:
+        # Fallback: difference baseline - realized if curtail columns absent
+        flex_curt_total = np.maximum(0.0, flex_baseline_total - flex_realized_total)
+    # ycap_mw (aggregate curtailment) consistency check
+    if 'ycap_mw' in df.columns:
+        try:
+            ycap_series = df['ycap_mw'].to_numpy(dtype=float)
+            # Only warn if discrepancy is material
+            diff_norm = np.max(np.abs(ycap_series - flex_curt_total)) if len(ycap_series) else 0.0
+            if diff_norm > 1e-6:
+                print(f"[flex-load] Warning: ycap_mw mismatch vs summed curt_bus_ series (max abs diff {diff_norm:.3e})")
+        except Exception:
+            ycap_series = None
+    else:
+        ycap_series = None
+    # Pre-compute flexible load energy / power metrics (constant across trajectories)
+    if dt_hours > 0 and len(flex_baseline_total):
+        flex_metrics_static = {
+            'flex_baseline_energy_mwh': float(np.sum(flex_baseline_total * dt_hours)),
+            'flex_realized_energy_mwh': float(np.sum(flex_realized_total * dt_hours)),
+            'flex_curtail_energy_mwh': float(np.sum(flex_curt_total * dt_hours)),
+            'flex_avg_curtailment_mw': float(np.mean(flex_curt_total)),
+            'flex_peak_curtailment_mw': float(np.max(flex_curt_total)) if len(flex_curt_total) else 0.0,
+        }
+        baseline_energy = flex_metrics_static['flex_baseline_energy_mwh']
+        if baseline_energy > 0:
+            flex_metrics_static['flex_energy_curtailed_pct'] = 100.0 * flex_metrics_static['flex_curtail_energy_mwh'] / baseline_energy
+        else:
+            flex_metrics_static['flex_energy_curtailed_pct'] = np.nan
+        if ycap_series is not None and len(ycap_series) == len(flex_curt_total):
+            flex_metrics_static['flex_ycap_energy_mwh'] = float(np.sum(ycap_series * dt_hours))
+    else:
+        flex_metrics_static = {
+            'flex_baseline_energy_mwh': np.nan,
+            'flex_realized_energy_mwh': np.nan,
+            'flex_curtail_energy_mwh': np.nan,
+            'flex_avg_curtailment_mw': np.nan,
+            'flex_peak_curtailment_mw': np.nan,
+            'flex_energy_curtailed_pct': np.nan,
+        }
+    # Log detection summary
+    if flex_baseline_by_bus:
+        print(f"[flex-load] Detected {len(flex_baseline_by_bus)} flexible load buses (baseline). Total baseline energy = {flex_metrics_static['flex_baseline_energy_mwh']:.6f} MWh")
+        print(f"[flex-load] Realized energy = {flex_metrics_static['flex_realized_energy_mwh']:.6f} MWh | Curtailment energy = {flex_metrics_static['flex_curtail_energy_mwh']:.6f} MWh ({flex_metrics_static['flex_energy_curtailed_pct']:.3f}%)")
+    else:
+        print("[flex-load] No flexible load columns detected in v2 results CSV.")
     # DA PV setpoints (what was actually scheduled in v2)
     base_pv_da_total = np.sum(list(base_pv_da_by_bus.values()), axis=0) if base_pv_da_by_bus else np.zeros(len(index))
     # Forecast (mean) PV availability total for mean-centering policy residuals
@@ -1096,6 +1160,8 @@ def main() -> None:
         summ['sample_id'] = sid
         # Store trajectory length and append (inside loop; previously mis-indented causing only last trajectory retained)
         summ['n_steps'] = int(len(index))
+        # Attach static flexible load metrics (same for all trajectories)
+        summ.update(flex_metrics_static)
         per_traj_summary.append(summ)
         collect_soc_frac.append(soc_series)
 
