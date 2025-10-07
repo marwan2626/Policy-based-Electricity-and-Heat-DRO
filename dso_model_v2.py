@@ -74,9 +74,17 @@ START_DATE = "2023-01-10 00:00:00"  # Can be modified when running the optimizat
 DURATION_HOURS = 24  # Can be modified when running the optimization
 
 # ======================= USER CONFIG (edit here) =======================
-# Real-time (second-stage) policy coefficients in day-ahead model
-# Set to True to enable RT policies without any CLI/environment flags.
-ENABLE_RT_POLICIES = True  # <--- EDIT ME
+"""Top-level feature flags (default values before any CLI/env overrides).
+
+We keep these defaults expressive, but immediately below we implement a clean
+override block so that users can reliably switch features off without editing
+the file. Previously the runtime override for ENABLE_RT_POLICIES was nested
+inside an unrelated conditional which made it hard to disable (indentation
+bug). That prevented isolation debugging of numeric issues. This patch fixes
+that and also introduces an environment/CLI hook for DRCC tightening.
+"""
+# Real-time (second-stage) policy coefficients in day-ahead model (robust affine policy proxies)
+ENABLE_RT_POLICIES = True  # <--- EDIT ME (base default)
 
 # Allow command-line or environment to override ENABLE_RT_POLICIES.
 # Set to False to lock the above value regardless of CLI/env.
@@ -84,8 +92,8 @@ ALLOW_RT_FLAG_RUNTIME_OVERRIDE = True
 ENABLE_DRCC_RT_BUDGETS = True  # <--- EDIT ME (uses PV/temperature std to size D+ / D-)
 DRCC_EPSILON = 0.05            # chance violation level; k = sqrt((1-eps)/eps)
 
-# DRCC-based network tightening (transformers, lines, voltages) — default OFF to be non-invasive
-ENABLE_DRCC_NETWORK_TIGHTENING = True  # <--- EDIT ME
+# DRCC-based network tightening (transformers, lines, voltages)
+ENABLE_DRCC_NETWORK_TIGHTENING = True  # <--- EDIT ME (base default)
 # You can selectively toggle sub-components when master is ON
 DRCC_TIGHTEN_TRAFO = True
 DRCC_TIGHTEN_LINES = True
@@ -132,16 +140,17 @@ HP_RESIDUAL_CORRELATION = 0.0     # 0=independent across HP buses, 1=fully corre
 
 # Allow runtime override of START_DATE/DURATION_HOURS via CLI args or environment
 try:
-    import argparse
-    import os
-    import sys
+    import argparse, os, sys
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--start-date', dest='start_date', help='Override START_DATE (YYYY-MM-DD HH:MM:SS)')
     parser.add_argument('--duration-hours', dest='duration_hours', type=int, help='Override DURATION_HOURS (int)')
     parser.add_argument('--enable-rt-policies', dest='enable_rt_policies', action='store_true', help='Enable robust real-time policy coefficients in the day-ahead model')
-    # parse_known_args so other scripts importing this module won't fail
+    parser.add_argument('--disable-rt-policies', dest='disable_rt_policies', action='store_true', help='Force-disable RT policies regardless of defaults')
+    parser.add_argument('--enable-drcc-tightening', dest='enable_drcc_tight', action='store_true', help='Enable DRCC network tightening')
+    parser.add_argument('--disable-drcc-tightening', dest='disable_drcc_tight', action='store_true', help='Disable DRCC network tightening')
     args, _ = parser.parse_known_args()
-    # Priority: CLI arg > environment variable > file default
+
+    # Window overrides
     if args.start_date:
         START_DATE = args.start_date
     elif os.environ.get('CMES_START_DATE'):
@@ -154,11 +163,30 @@ try:
             DURATION_HOURS = int(os.environ.get('CMES_DURATION_HOURS'))
         except Exception:
             pass
-        if ALLOW_RT_FLAG_RUNTIME_OVERRIDE:
-            ENABLE_RT_POLICIES = bool(args.enable_rt_policies) or str(os.environ.get('CMES_ENABLE_RT_POLICIES', '0')).strip().lower() in ('1','true','yes','on')
-except Exception:
-    # If argparse/import fails for any reason, fall back to file defaults
-        ENABLE_RT_POLICIES = False
+
+    # Feature overrides (priority: explicit CLI flag > env var > file default)
+    if ALLOW_RT_FLAG_RUNTIME_OVERRIDE:
+        if args.disable_rt_policies:
+            ENABLE_RT_POLICIES = False
+        elif args.enable_rt_policies:
+            ENABLE_RT_POLICIES = True
+        else:
+            # Environment variable (set to 1/true/on to enable, 0/false/off to disable)
+            env_rt = os.environ.get('CMES_ENABLE_RT_POLICIES')
+            if env_rt is not None:
+                ENABLE_RT_POLICIES = str(env_rt).strip().lower() in ('1','true','yes','on')
+
+    # DRCC tightening overrides via CLI / env (independent of ALLOW_RT_FLAG_RUNTIME_OVERRIDE)
+    if args.disable_drcc_tight:
+        ENABLE_DRCC_NETWORK_TIGHTENING = False
+    elif args.enable_drcc_tight:
+        ENABLE_DRCC_NETWORK_TIGHTENING = True
+    else:
+        env_drcc = os.environ.get('CMES_ENABLE_DRCC_TIGHTENING')
+        if env_drcc is not None:
+            ENABLE_DRCC_NETWORK_TIGHTENING = str(env_drcc).strip().lower() in ('1','true','yes','on')
+except Exception as _e:
+    print(f"[WARN] Runtime override parsing failed: {_e}. Using file defaults.")
 
 # Load the VDI profiles with heating and hot water loads
 print("Loading VDI profiles from 'vdi_profiles/all_house_profiles.csv'...")
@@ -2669,13 +2697,14 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
 
     # After adding all constraints and variables
     #model.setParam('OutputFlag', 0)
-    model.setParam('Presolve', 1)
-    model.setParam('scaleFlag', 3)
+    #model.setParam('Presolve', 1)
+    #model.setParam('scaleFlag', 3)
     #model.setParam('NonConvex', 2)
-    model.setParam("NumericFocus", 1)
+    #model.setParam("NumericFocus", 1)
     model.setParam("BarHomogeneous", 1)
     #model.setParam("Crossover", 0) 
     #model.setParam("BarQCPConvTol", 1e-8)
+    model.setParam("Method", 3)
 
     model.update()
 
