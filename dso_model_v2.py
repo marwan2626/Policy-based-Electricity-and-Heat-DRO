@@ -2781,21 +2781,82 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     total_cost += cap_cost + imb_proxy_cost + pv_curt_proxy_cost + bess_rt_proxy_cost
     model.setObjective(total_cost, GRB.MINIMIZE)
 
-    # After adding all constraints and variables
-    #model.setParam('OutputFlag', 0)
-    model.setParam('Presolve', 0)
-    #model.setParam('scaleFlag', 3)
-    #model.setParam('NonConvex', 2)
-    #model.setParam("NumericFocus", 1)
-    #model.setParam("BarHomogeneous", 1)
-    #model.setParam("Crossover", 0) 
-    #model.setParam("BarQCPConvTol", 1e-8)
-    #model.setParam("Method", 3)
+    # -------------------- SOLVER PARAM STRATEGY (pass 1) --------------------
+    # Previous code disabled presolve; that often hurts numerics. We allow an env override to keep it off.
+    if os.environ.get('CMES_PRESOLVE_OFF', '0') == '1':
+        model.setParam('Presolve', 0)
+    else:
+        model.setParam('Presolve', 2)  # full presolve
+    # Light initial numeric stabilization (heavier tweaks only if needed in fallback)
+    model.setParam('NumericFocus', int(os.environ.get('CMES_NUMERIC_FOCUS', '0')))  # user can raise to 1..3
+    # Allow barrier (default) to try first; no forced Method unless user supplies one
+    if os.environ.get('CMES_FORCE_BARRIER', '0') == '1':
+        model.setParam('Method', 2)  # 2 = barrier
+    # Optional: quiet output
+    if os.environ.get('CMES_GUROBI_SILENT', '0') == '1':
+        model.setParam('OutputFlag', 0)
 
     model.update()
 
     # Optimize the model
     model.optimize()
+
+    # -------------------- NUMERICAL RECOVERY / SECOND PASS --------------------
+    # If numerical trouble or ambiguous infeasible/unbounded, attempt a recovery pass with
+    # stronger scaling and homogeneous self-dual barrier, producing diagnostic artifacts.
+    recovery_attempted = False
+    def _write_diagnostics(tag: str):
+        try:
+            model.write(f'debug_model_{tag}.lp')
+        except Exception:
+            pass
+        try:
+            model.write(f'debug_model_{tag}.mps')
+        except Exception:
+            pass
+
+    troubled_statuses = {getattr(GRB, 'NUMERIC', 12), getattr(GRB, 'INF_OR_UNBD', 4), getattr(GRB, 'UNBOUNDED', 5)}
+    if model.status in troubled_statuses and bool(int(os.environ.get('CMES_ENABLE_RECOVERY', '1'))):
+        print(f"[RECOVERY] Detected problematic status ({model.status}); launching numerical recovery pass...")
+        _write_diagnostics('pass1')
+        recovery_attempted = True
+        # Strengthen numeric settings
+        model.setParam('InfUnbdInfo', 1)
+        model.setParam('DualReductions', 0)
+        model.setParam('BarHomogeneous', 1)   # homogeneous self-dual barrier
+        model.setParam('NumericFocus', 3)
+        model.setParam('ScaleFlag', 2)        # more aggressive scaling
+        model.setParam('Presolve', 2)
+        model.setParam('Method', 2)           # barrier
+        model.setParam('Crossover', 0)        # stay in barrier space (reduce instability)
+        try:
+            model.reset()  # clear previous solve state while keeping model
+        except Exception:
+            pass
+        model.optimize()
+
+    # A third pass if still numeric trouble: escalate BarHomogeneous
+    if recovery_attempted and model.status in troubled_statuses:
+        print(f"[RECOVERY-2] Still problematic (status {model.status}); escalating homogeneous barrier level 2...")
+        _write_diagnostics('pass2')
+        try:
+            model.setParam('BarHomogeneous', 2)
+            model.reset()
+        except Exception:
+            pass
+        model.optimize()
+
+    # If still ambiguous infeasible/unbounded, force dual reductions off & try simplex as last resort
+    if recovery_attempted and model.status in troubled_statuses:
+        print(f"[RECOVERY-3] Status {model.status} persists; trying primal simplex fallback...")
+        _write_diagnostics('pass3')
+        try:
+            model.setParam('Method', 0)  # primal simplex
+            model.setParam('BarHomogeneous', 0)
+            model.reset()
+            model.optimize()
+        except Exception as _e_final:
+            print(f"[RECOVERY-3] Fallback attempt raised {_e_final}")
 
     # If infeasible and IIS debugging enabled, extract IIS details early
     if model.status == GRB.INFEASIBLE and bool(DEBUG_EXTRACT_IIS):
