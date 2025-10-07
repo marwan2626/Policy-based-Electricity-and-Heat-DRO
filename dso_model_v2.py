@@ -2124,11 +2124,27 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         # These implement the single scalar buy-back design; keeps feasibility at night.
         # ------------------------------------------------------------------
         if len(flexible_load_buses) > 0:
+            missing_var_buses = []
             for b in flexible_load_buses:
                 baseline_tb = float(flexible_time_synchronized_loads_P[t].get(b, 0.0))
+                if b not in flexible_load_P_vars[t]:
+                    missing_var_buses.append(b)
+                    continue
                 # Non-negativity is inherent from variable lb, but add explicit constraint for clarity
                 model.addConstr(flexible_load_P_vars[t][b] >= 0.0, name=f"flex_lb_t{t}_b{b}")
                 model.addConstr(flexible_load_P_vars[t][b] <= baseline_tb, name=f"flex_ub_t{t}_b{b}")
+            if missing_var_buses:
+                print(f"[WARN] Flexible load vars missing for t={t} buses={missing_var_buses}. Creating fallback vars with UB=0.")
+                # Create fallback variables for missing buses to keep indexing consistent
+                for b in missing_var_buses:
+                    try:
+                        v_fb = model.addVar(lb=0.0, ub=0.0, name=f'flexible_load_P_fallback_{t}_{b}')
+                        flexible_load_P_vars[t][b] = v_fb
+                        # Add explicit constraints (redundant but consistent)
+                        model.addConstr(flexible_load_P_vars[t][b] >= 0.0, name=f"flex_fb_lb_t{t}_b{b}")
+                        model.addConstr(flexible_load_P_vars[t][b] <= 0.0, name=f"flex_fb_ub_t{t}_b{b}")
+                    except Exception as _fb_err:
+                        print(f"[ERROR] Failed to create fallback flex var for t={t} bus={b}: {_fb_err}")
             # Aggregated connection capacity (only if ycap_var exists)
             if 'ycap_var' in locals() and ycap_var is not None:
                 total_conn_cap_MW = 11.0/1000.0 * len(flexible_load_buses)
