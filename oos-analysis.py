@@ -43,6 +43,9 @@ FRONTIER_HYBRID_SCATTER_FIG = "frontier_hybrid_scatter.png"  # new hybrid figure
 PLOT_TRAFO_VIOLATION_TIME_PROFILE: bool = True
 TRAFO_VIOLATION_TIME_PROFILE_FIG = "trafo_violation_time_profile.png"
 FRONTIER_HYBRID_SCATTER_FIG = "frontier_hybrid_scatter.png"
+# New: time series of lambda_plus and lambda0 across epsilon cases
+PLOT_POLICY_LAMBDA_TIME_SERIES: bool = True
+POLICY_LAMBDA_TIME_SERIES_FIG = "policy_lambda_time_series.png"
 
 # Cost model parameters for OOS components
 PV_CURT_PRICE_FACTOR = 1.0  # EUR per MWh of curtailed PV is factor * price
@@ -899,6 +902,71 @@ def main() -> None:
                 print(f"✓ Policy heatmaps: {heat_path}")
         else:
             print('[INFO] No policy coefficient files found for heatmap plotting.')
+
+    # --- Policy lambda time series (lambda0_mw & lambda_plus) ---
+    if PLOT_POLICY_LAMBDA_TIME_SERIES:
+        lambda_cases: List[Tuple[str, str, float | None]] = []  # (label, path, epsilon)
+        base_pol = os.path.join(RESULTS_DIR, 'policy_coeffs_drcc_false.csv')
+        if os.path.exists(base_pol):
+            lambda_cases.append((DETERMINISTIC_LABEL, base_pol, None))
+        for eps in EPSILONS:
+            tok = epsilon_token(eps)
+            pol_path = os.path.join(RESULTS_DIR, f'policy_coeffs_drcc_true_epsilon_{tok}.csv')
+            if os.path.exists(pol_path):
+                lambda_cases.append((f"{eps:.2f}", pol_path, eps))
+        # Need both lambda0_mw and lambda_plus to proceed
+        if lambda_cases:
+            try:
+                import matplotlib.dates as mdates
+                # Load all and align timestamps (assume same horizon)
+                series_lambda0 = []  # (label, values)
+                series_lambdap = []
+                timestamps = None
+                for lab, path_pol, eps_val in lambda_cases:
+                    try:
+                        pdf = pd.read_csv(path_pol)
+                    except Exception:
+                        continue
+                    if 'lambda0_mw' not in pdf.columns or 'lambda_plus' not in pdf.columns:
+                        continue
+                    if timestamps is None and 'timestamp' in pdf.columns:
+                        timestamps = pd.to_datetime(pdf['timestamp'])
+                    series_lambda0.append((lab, pdf['lambda0_mw'].to_numpy(dtype=float)))
+                    series_lambdap.append((lab, pdf['lambda_plus'].to_numpy(dtype=float)))
+                if series_lambda0 and series_lambdap:
+                    fig_l, axes_l = plt.subplots(2, 1, figsize=(10,5.8), sharex=True)
+                    # Color mapping for epsilons; baseline black
+                    # Collect eps labels (exclude baseline) for consistent color scale ordering
+                    eps_labels = sorted([lab for lab, _, e in lambda_cases if e is not None], key=lambda x: float(x))
+                    cmap = plt.cm.plasma
+                    def color_for_label(lab: str):
+                        if lab == DETERMINISTIC_LABEL:
+                            return 'black'
+                        # map label string (like '0.05') to index
+                        if lab in eps_labels:
+                            idx = eps_labels.index(lab)
+                            return cmap((idx+1)/(len(eps_labels)+1))
+                        return 'gray'
+                    for lab, vals in series_lambda0:
+                        axes_l[0].plot(vals, label=lab, color=color_for_label(lab), linewidth=1.2,
+                                       linestyle='--' if lab==DETERMINISTIC_LABEL else '-')
+                    axes_l[0].set_ylabel('lambda0_mw')
+                    axes_l[0].grid(alpha=0.25)
+                    for lab, vals in series_lambdap:
+                        axes_l[1].plot(vals, label=lab, color=color_for_label(lab), linewidth=1.2,
+                                       linestyle='--' if lab==DETERMINISTIC_LABEL else '-')
+                    axes_l[1].set_ylabel('lambda_plus')
+                    axes_l[1].grid(alpha=0.25)
+                    axes_l[1].set_xlabel('Timestep index')
+                    # Legend outside to avoid clutter
+                    handles, labels = axes_l[0].get_legend_handles_labels()
+                    fig_l.legend(handles, labels, loc='upper center', ncol=min(6, len(labels)), frameon=False, fontsize=8, bbox_to_anchor=(0.5, 1.02))
+                    fig_l.tight_layout(rect=[0,0,1,0.97])
+                    out_lam = os.path.join(RESULTS_DIR, POLICY_LAMBDA_TIME_SERIES_FIG)
+                    fig_l.savefig(out_lam, dpi=150)
+                    print(f"✓ Policy lambda time series: {out_lam}")
+            except Exception as e:
+                print(f"[WARN] Failed to build lambda time series plot: {e}")
 
     # --- SoC envelope plotting (optional) ---
     if PLOT_SOC_ENVELOPES:

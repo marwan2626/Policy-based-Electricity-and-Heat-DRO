@@ -3,12 +3,23 @@
 Minimize
  
 Subject To
- Q_accumulated_48_35: Q_accumulated[48,35] = -0.00831735367970103
- Q_send_calc_33: Q_branch[48,33] - Q_accumulated[48,35] = 0
- S_branch_limit_48_33: [ P_branch[48,33] ^2 + Q_branch[48,33] ^2 ]
-   <= 7.31578e-08
+ P_accumulated_73_35: - pv_gen_73[35] - pv_gen_73[36] - pv_gen_73[37]
+   - pv_gen_73[39] - pv_gen_73[40] - pv_gen_73[41] - pv_gen_73[42]
+   - pv_gen_73[43] + flexible_load_P_73[42] + P_accumulated[73,35]
+   = -0.1760256385421194
+ P_send_calc_33: P_branch[73,33] - P_accumulated[73,35] = 0
+ S_branch_limit_73_33: [ P_branch[73,33] ^2 + Q_branch[73,33] ^2 ]
+   <= 0.02239488
 Bounds
- P_branch[48,33] free
- Q_branch[48,33] free
- Q_accumulated[48,35] free
+ -infinity <= pv_gen_73[35] <= 0
+ -infinity <= pv_gen_73[36] <= 0
+ -infinity <= pv_gen_73[37] <= 0
+ -infinity <= pv_gen_73[39] <= 0
+ -infinity <= pv_gen_73[40] <= 0
+ -infinity <= pv_gen_73[41] <= 0
+ -infinity <= pv_gen_73[42] <= 0
+ -infinity <= pv_gen_73[43] <= 0
+ P_branch[73,33] free
+ Q_branch[73,33] free
+ P_accumulated[73,35] free
 End

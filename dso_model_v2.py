@@ -82,7 +82,7 @@ ENABLE_RT_POLICIES = True  # <--- EDIT ME
 # Set to False to lock the above value regardless of CLI/env.
 ALLOW_RT_FLAG_RUNTIME_OVERRIDE = True
 ENABLE_DRCC_RT_BUDGETS = True  # <--- EDIT ME (uses PV/temperature std to size D+ / D-)
-DRCC_EPSILON = 0.30            # chance violation level; k = sqrt((1-eps)/eps)
+DRCC_EPSILON = 0.05            # chance violation level; k = sqrt((1-eps)/eps)
 
 # DRCC-based network tightening (transformers, lines, voltages) — default OFF to be non-invasive
 ENABLE_DRCC_NETWORK_TIGHTENING = True  # <--- EDIT ME
@@ -99,6 +99,8 @@ PV_RELATIVE_STD = 0.20         # fallback relative std of PV availability (fract
 PV_STD_CORRELATION = 1.00      # used only if constructing from per-bus stds (not CSV aggregate)
 HP_FULLY_CORRELATED = True     # temperature is common across HPs
 RHO_TEMP_AVG = 0             # 0=independent, 1=fully correlated within day
+# Capacity buy-back pricing (EUR per MW-hour of purchased connection reduction)
+C_CAP_EUR_PER_MW_H = 50.0  # <--- EDIT ME (capacity price); set 0 to disable economic impact
 # =====================================================================
 
 # --- Heat Pump predictor and DRCC constants (single source of truth) ---
@@ -763,46 +765,52 @@ def create_comprehensive_plots(results_df, hp_power_values, ambient_temps_c=None
         plt.ylabel('Loading (%)')
         plt.grid(True, alpha=0.3)
     
-    # 13. PV Generation Over Time (replaces temperature summary)
+    # 13. PV Generation per Bus (kW) ONLY (no totals, no availability)
     plt.subplot(7, 2, 13)
-    # pv_gen results are expected in the saved results dict and results_df does not contain per-pv columns by default
-    # Try to extract PV columns from results_df (if present) else use the passed-in results dict via globals()
-    pv_cols = [col for col in results_df.columns if 'pv' in col.lower() or 'p_pv' in col.lower()]
-    if pv_cols:
-        # plot any explicit pv columns in results_df (assumed MW -> convert to kW)
-        for col in pv_cols:
-            plt.plot(hours, results_df[col].values * 1000.0, label=col)
-        plt.title('PV Generation per Column (kW)', fontsize=14, fontweight='bold')
-        plt.xlabel('Hour')
-        plt.ylabel('Power (kW)')
-        plt.grid(True, alpha=0.3)
-        #plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-    else:
-        # Use pv_gen_results from the optimization results structure if available
-        pv_ts = globals().get('pv_gen_results', {})
-        if pv_ts and len(pv_ts) > 0:
-            # build per-bus series (kW)
-            per_pv = {}
-            T = len(hours)
-            for t in range(T):
-                if t in pv_ts:
-                    for bus, mw in pv_ts[t].items():
-                        per_pv.setdefault(bus, [0.0]*T)
-                        per_pv[bus][t] = mw * 1000.0
-
-            colors = plt.cm.tab20(np.linspace(0, 1, max(1, len(per_pv))))
-            for i, (bus, series_kw) in enumerate(sorted(per_pv.items(), key=lambda x: x[0])):
-                plt.plot(hours, series_kw, linewidth=1.2, alpha=0.9, color=colors[i % len(colors)], label=f'PV bus {bus}')
-
+    try:
+        pv_gen_bus_cols = [c for c in results_df.columns if c.startswith('pv_gen_bus_') and c.endswith('_mw')]
+        if pv_gen_bus_cols:
+            cols_sorted = sorted(pv_gen_bus_cols, key=lambda x: int(x.split('_')[3]))
+            color_map = plt.cm.tab20(np.linspace(0, 1, min(len(cols_sorted), 20)))
+            for i, col in enumerate(cols_sorted):
+                series_kw = results_df[col].values * 1000.0
+                color = color_map[i % len(color_map)]
+                alpha = 0.85 if len(cols_sorted) <= 20 else 0.5
+                lw = 1.1 if len(cols_sorted) <= 20 else 0.8
+                label = col if len(cols_sorted) <= 20 else None
+                plt.plot(hours, series_kw, linewidth=lw, alpha=alpha, color=color, label=label)
             plt.title('PV Generation per Bus (kW)', fontsize=14, fontweight='bold')
             plt.xlabel('Hour')
             plt.ylabel('Power (kW)')
             plt.grid(True, alpha=0.3)
-            if len(per_pv) <= 20:
-                plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+            if len(cols_sorted) <= 20:
+                plt.legend(fontsize=7, ncol=1, loc='upper right')
         else:
-            plt.text(0.5, 0.5, 'No PV generation data available', transform=plt.gca().transAxes, ha='center', va='center', fontsize=12)
-            plt.title('PV Generation Over Time', fontsize=14, fontweight='bold')
+            # Fallback to global pv_gen_results if DataFrame columns absent
+            pv_ts = globals().get('pv_gen_results', {})
+            if pv_ts:
+                T = len(hours)
+                per_bus = {}
+                for t in range(T):
+                    if t in pv_ts:
+                        for bus, mw in pv_ts[t].items():
+                            per_bus.setdefault(bus, [0.0]*T)
+                            per_bus[bus][t] = mw * 1000.0
+                colors = plt.cm.tab20(np.linspace(0,1,len(per_bus)))
+                for i, (bus, series) in enumerate(sorted(per_bus.items(), key=lambda x: x[0])):
+                    plt.plot(hours, series, linewidth=1.0, alpha=0.8, color=colors[i%len(colors)], label=f'Bus {bus}' if len(per_bus) <= 20 else None)
+                plt.title('PV Generation per Bus (kW)', fontsize=14, fontweight='bold')
+                plt.xlabel('Hour')
+                plt.ylabel('Power (kW)')
+                plt.grid(True, alpha=0.3)
+                if len(per_bus) <= 20:
+                    plt.legend(fontsize=7, loc='upper right')
+            else:
+                plt.text(0.5, 0.5, 'No PV data available', transform=plt.gca().transAxes, ha='center', va='center', fontsize=12)
+                plt.title('PV Generation per Bus', fontsize=14, fontweight='bold')
+    except Exception as _pv_plot_err:
+        plt.text(0.5, 0.5, f'PV plot error: {_pv_plot_err}', transform=plt.gca().transAxes, ha='center', va='center', fontsize=10)
+        plt.title('PV Generation per Bus (error)', fontsize=14, fontweight='bold')
     
     # 14. Heat Demand Coverage Stacked Area Plot
     plt.subplot(7, 2, 14)
@@ -1397,11 +1405,10 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
 
     bess_eff = 0.95  # Round-trip efficiency
     bess_initial_soc = 0.5  # Initial state of charge as a percentage of capacity
-    bess_capacity_mwh = 0.25  # BESS capacity in MWh
+    bess_capacity_mwh = 0.1  # BESS capacity in MWh
     bess_cost_per_mwh = 5.1 # Cost per MWh of BESS capacity
-
-    ### Define the variables ###
-    epsilon = 100e-9  # Small positive value to ensure some external grid usage
+    # Baseline (intercept) BESS throughput cost (EUR/MWh) for p0 channel
+    c_base_bess = 1.5
 
     # Extract transformer capacity in MW (assuming sn_mva is in MVA)
     transformer_capacity_mw = net.trafo['sn_mva'].values[0]
@@ -1492,6 +1499,12 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     rho_minus1_vars = {}
     z_dis_vars = {}
     z_ch_vars = {}
+    # Baseline intercept channel (added to make lambda0 physically meaningful)
+    p0_dis_vars = {}
+    p0_ch_vars = {}
+    # Robust SoC extreme envelope trajectories (down/up under full deviations)
+    E_down_vars = {}
+    E_up_vars = {}
 
 
     # Temporary dictionary to store updated load values per time step
@@ -1918,6 +1931,20 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             # Debug: Print heat pump variable creation for first time step
             if t == 0:
                 print(f"  Created p_hp_vars[{t}] for buses: {hp_load_buses}")
+
+    # ------------------------------------------------------------------
+    # Aggregated flexible connection capacity buy-back variable (ycap)
+    # ------------------------------------------------------------------
+    if len(flexible_load_buses) > 0:
+        total_conn_cap_MW = 11.0/1000.0 * len(flexible_load_buses)  # 11 kW per connection -> MW
+        try:
+            ycap_var = model.addVar(lb=0.0, ub=total_conn_cap_MW, name="ycap")
+            print(f"Added aggregated connection capacity variable ycap with upper bound {total_conn_cap_MW:.4f} MW")
+        except Exception as _e:
+            print(f"Warning: failed to add ycap variable: {_e}")
+            ycap_var = None
+    else:
+        ycap_var = None
                             
        
     
@@ -1963,6 +1990,25 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
 
     # Add power balance and load flow constraints for each time step
     for t in time_steps:
+        # ------------------------------------------------------------------
+        # Per-bus flexible load bounds (0 <= P_tb <= baseline_tb) and
+        # aggregated connection capacity constraint: sum_flex_t <= total_conn_cap_MW - ycap
+        # These implement the single scalar buy-back design; keeps feasibility at night.
+        # ------------------------------------------------------------------
+        if len(flexible_load_buses) > 0:
+            for b in flexible_load_buses:
+                baseline_tb = float(flexible_time_synchronized_loads_P[t].get(b, 0.0))
+                # Non-negativity is inherent from variable lb, but add explicit constraint for clarity
+                model.addConstr(flexible_load_P_vars[t][b] >= 0.0, name=f"flex_lb_t{t}_b{b}")
+                model.addConstr(flexible_load_P_vars[t][b] <= baseline_tb, name=f"flex_ub_t{t}_b{b}")
+            # Aggregated connection capacity (only if ycap_var exists)
+            if 'ycap_var' in locals() and ycap_var is not None:
+                total_conn_cap_MW = 11.0/1000.0 * len(flexible_load_buses)
+                model.addConstr(
+                    gp.quicksum(flexible_load_P_vars[t][b] for b in flexible_load_buses) <= total_conn_cap_MW - ycap_var,
+                    name=f"agg_conn_cap_t{t}"
+                )
+
         # Power injection vector P
         P_injected = {bus: gp.LinExpr() for bus in net.bus.index}
         Q_injected = {bus: gp.LinExpr() for bus in net.bus.index}
@@ -1998,6 +2044,12 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 if t in bess_discharge_vars and bus in bess_discharge_vars[t]:
                     P_injected[bus] += bess_discharge_vars[t][bus]
                 # Assume BESS operates at unity power factor (no reactive power)
+
+        # Add aggregated baseline intercept injection at a representative BESS bus (assumption: first bus)
+        if ENABLE_RT_POLICIES and len(bess_buses) > 0 and t in p0_dis_vars and t in p0_ch_vars:
+            rep_bus = bess_buses[0]
+            if rep_bus in P_injected:
+                P_injected[rep_bus] += (p0_dis_vars[t] - p0_ch_vars[t])
 
         model.update()
 
@@ -2399,33 +2451,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             print(f"  t={t}: P_base={P_base:.4f} MW, y_dev={y_dev:.4f} -> HP={P_t:.4f} MW")
 
     
-    # Treat flexible electrical loads as an aggregated curtailable resource (capacity buyback) per timestep
-    for t in time_steps:
-        if len(flexible_load_buses) > 0:
-            flex_curtail_P_vars[t] = model.addVar(
-                lb=0,
-                ub=sum(float(flexible_time_synchronized_loads_P[t][bus]) for bus in flexible_load_buses),
-                name=f'flex_curtail_P_{t}'
-            )
-
-            # Per-bus upper bounds (allow each bus to be curtailed individually but only constrained by aggregate)
-            for bus in flexible_load_buses:
-                model.addConstr(
-                    flexible_load_P_vars[t][bus] <= flexible_time_synchronized_loads_P[t][bus],
-                    name=f"flexible_load_upper_P_t{t}_bus{bus}"
-                )
-                # Reactive load similarly bounded by its baseline (no individual reactive curtailment control)
-                model.addConstr(
-                    flexible_load_Q_vars[t][bus] <= flexible_time_synchronized_loads_Q[t][bus],
-                    name=f"flexible_load_upper_Q_t{t}_bus{bus}"
-                )
-
-            # Enforce aggregated curtailment relationship: total flexible consumption = baseline_total - aggregated_curtail
-            model.addConstr(
-                gp.quicksum(flexible_load_P_vars[t][bus] for bus in flexible_load_buses)
-                == gp.quicksum(float(flexible_time_synchronized_loads_P[t][bus]) for bus in flexible_load_buses) - flex_curtail_P_vars[t],
-                name=f"flexible_agg_curtail_P_t{t}"
-            )
+    # NOTE: legacy per-period flexible curtailment variables removed; capacity mechanism now governs flexibility via ycap.
 
     if ENABLE_RT_POLICIES:
         # --- Robust no-scenario affine recourse: budgets, variables, constraints, and proxy costs ---
@@ -2436,7 +2462,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         imb_up_factor = 1.3
         imb_dn_factor = 1.3
         pv_curt_price_factor = 1.0
-        bess_rt_price_per_mw = 2.0
+        bess_rt_price_per_mw = 5.0
 
         try:
             if len(time_index) >= 2:
@@ -2509,7 +2535,11 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             # Buy-back activation disabled: remove y_cap and gamma variables
             chi0_vars[t] = model.addVar(lb=0.0, name=f'chi0_{t}')
             chi_minus_vars[t] = model.addVar(lb=0.0, name=f'chi_minus_{t}')
-            lambda0_vars[t] = model.addVar(lb=0.0, name=f'lambda0_{t}')
+            # Baseline intercept BESS power decomposition (discharge / charge) non-negative
+            p0_dis_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'p0_dis_{t}')
+            p0_ch_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'p0_ch_{t}')
+            # Keep lambda0 for continuity in downstream usage but link to p0_dis - p0_ch
+            lambda0_vars[t] = model.addVar(lb=- (total_bess_pmax if 'total_bess_pmax' in locals() else 0.0), ub=(total_bess_pmax if 'total_bess_pmax' in locals() else 0.0), name=f'lambda0_{t}')
             lambda_plus_vars[t] = model.addVar(lb=0.0, name=f'lambda_plus_{t}')
             lambda_minus_vars[t] = model.addVar(lb=0.0, name=f'lambda_minus_{t}')
             rho_plus0_vars[t] = model.addVar(lb=0.0, name=f'rho_plus0_{t}')
@@ -2518,6 +2548,36 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             rho_minus1_vars[t] = model.addVar(lb=0.0, name=f'rho_minus1_{t}')
             z_dis_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'z_dis_{t}')
             z_ch_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'z_ch_{t}')
+
+            # Link intercept variable to decomposition
+            model.addConstr(p0_dis_vars[t] - p0_ch_vars[t] == lambda0_vars[t], name=f'lambda0_link_t{t}')
+            # Instantaneous power caps (baseline + deviation cannot exceed physical rating)
+            if 'total_bess_pmax' in locals() and total_bess_pmax > 0.0:
+                model.addConstr(p0_dis_vars[t] + z_dis_vars[t] <= total_bess_pmax, name=f'bess_cap_dis_t{t}')
+                model.addConstr(p0_ch_vars[t] + z_ch_vars[t] <= total_bess_pmax, name=f'bess_cap_ch_t{t}')
+
+            # Robust SoC extreme trajectories (simple affine envelope) only if energy known
+            if 'bess_capacity_mwh' in locals() and 'bess_initial_soc' in locals():
+                total_bess_energy = float(bess_capacity_mwh) * (len(bess_buses) if 'bess_buses' in locals() else 1)
+                if total_bess_energy > 0.0:
+                    E_down_vars[t] = model.addVar(lb=0.0, ub=total_bess_energy, name=f'E_down_{t}')
+                    E_up_vars[t] = model.addVar(lb=0.0, ub=total_bess_energy, name=f'E_up_{t}')
+                    if t == time_steps[0]:
+                        model.addConstr(E_down_vars[t] == bess_initial_soc * total_bess_energy, name=f'Edown_init')
+                        model.addConstr(E_up_vars[t] == bess_initial_soc * total_bess_energy, name=f'Eup_init')
+                    else:
+                        # Down path: assume worst-case discharge deviation realized
+                        model.addConstr(
+                            E_down_vars[t] == E_down_vars[t-1] + (p0_ch_vars[t]*bess_eff - p0_dis_vars[t]/bess_eff - z_dis_vars[t]/bess_eff)*dt_hours,
+                            name=f'Edown_dyn_t{t}'
+                        )
+                        # Up path: assume worst-case charge deviation realized
+                        model.addConstr(
+                            E_up_vars[t] == E_up_vars[t-1] + (p0_ch_vars[t]*bess_eff - p0_dis_vars[t]/bess_eff + z_ch_vars[t]*bess_eff)*dt_hours,
+                            name=f'Eup_dyn_t{t}'
+                        )
+                    # Feasibility relationship
+                    model.addConstr(E_down_vars[t] <= E_up_vars[t], name=f'Eenv_order_t{t}')
 
             model.addConstr(
                 # No buy-back activation: cover deficit with BESS proxies and imbalance proxies only
@@ -2562,9 +2622,18 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     # Convert MW to MWh using dt_hours when multiplying by prices in EUR/MWh
     electricity_cost =  gp.quicksum(electricity_price[t] * (ext_grid_import_P_vars[t] + ext_grid_export_P_vars[t]) * dt_hours for t in time_steps)
     bess_cost = gp.quicksum(bess_cost_per_mwh * (bess_charge_vars[t][bus] + bess_discharge_vars[t][bus]) * dt_hours for bus in bess_buses for t in time_steps) if len(bess_buses) > 0 else 0
+    # Baseline intercept throughput cost (only if RT policies active and baseline vars exist)
+    if ENABLE_RT_POLICIES:
+        baseline_bess_cost = gp.quicksum(c_base_bess * (p0_dis_vars[t] + p0_ch_vars[t]) * dt_hours for t in time_steps if t in p0_dis_vars)
+    else:
+        baseline_bess_cost = 0
     # Aggregate flexible curtailment cost (if any flexible curtail vars were created)
     # Day-ahead flexible curtailment penalty (separate from RT capacity); renamed for clarity
-    flex_curtail_cost = gp.quicksum(2 * electricity_price[t] * flex_curtail_P_vars[t] * dt_hours for t in flex_curtail_P_vars.keys()) if len(flex_curtail_P_vars) > 0 else 0
+    # Capacity buy-back cost: pay per MW-hour of reduced connection (ycap applies every timestep)
+    if 'ycap_var' in locals() and ycap_var is not None:
+        flex_capacity_cost = C_CAP_EUR_PER_MW_H * ycap_var * dt_hours * len(time_steps)
+    else:
+        flex_capacity_cost = 0
     pv_curtail_cost = gp.quicksum(electricity_price[t] * curtailment_vars[t][bus] * dt_hours for bus in pv_buses for t in time_steps) if len(pv_buses) > 0 else 0
 
     # New: first-stage capacity and RT proxy costs for robust policies (only if enabled)
@@ -2585,7 +2654,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         bess_rt_proxy_cost = 0
 
     # Objective: Minimize total cost (import, export, and curtailment costs)
-    total_cost = electricity_cost + bess_cost + flex_curtail_cost + pv_curtail_cost 
+    total_cost = electricity_cost + bess_cost + baseline_bess_cost + flex_capacity_cost + pv_curtail_cost 
     total_cost += cap_cost + imb_proxy_cost + pv_curt_proxy_cost + bess_rt_proxy_cost
     model.setObjective(total_cost, GRB.MINIMIZE)
 
@@ -2698,10 +2767,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             ext_grid_import_Q_results[t] = ext_grid_import_Q_vars[t].x
             ext_grid_export_P_results[t] = ext_grid_export_P_vars[t].x
             ext_grid_export_Q_results[t] = ext_grid_export_Q_vars[t].x
-            if t in flex_curtail_P_vars:
-                flex_curtail_P_results[t] = flex_curtail_P_vars[t].x
-            else:
-                flex_curtail_P_results[t] = 0.0
+            # Legacy per-period curtailment removed; set to 0 for backward compatibility
+            flex_curtail_P_results[t] = 0.0
             V_results[t] = {bus: V_vars[t, bus].x for bus in net.bus.index}
 
             # Extract load results as **flat dictionaries**
@@ -2794,7 +2861,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             bess_cost_value = None
 
         try:
-            flex_curtail_cost_value = sum(electricity_price[t] * flex_curtail_P_results.get(t, 0.0) * dt_hours for t in time_steps)
+            flex_curtail_cost_value = 0.0  # legacy metric (now handled by capacity cost)
         except Exception:
             flex_curtail_cost_value = None
 
@@ -2820,7 +2887,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         print("\nCOST BREAKDOWN:")
         print(f"  electricity_cost = {electricity_cost_value}")
         print(f"  bess_cost = {bess_cost_value}")
-        print(f"  flex_curtail_cost_DA = {flex_curtail_cost_value}")
+        print(f"  flex_capacity_cost_DA = {float(flex_capacity_cost.getValue()) if hasattr(flex_capacity_cost, 'getValue') else 'N/A'}")
         print(f"  pv_curtail_cost = {pv_curtail_cost_value}")
         if ENABLE_RT_POLICIES:
             try:
@@ -3105,10 +3172,21 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 results_df['rho_plus1'] = [rho_plus1_vars[t].x for t in time_steps]
                 results_df['rho_minus0_mw'] = [rho_minus0_vars[t].x for t in time_steps]
                 results_df['rho_minus1'] = [rho_minus1_vars[t].x for t in time_steps]
+                # Baseline intercept decomposition & SoC envelope (conditional: may not exist if no BESS)
+                try:
+                    results_df['p0_dis_mw'] = [p0_dis_vars[t].x if t in p0_dis_vars else 0.0 for t in time_steps]
+                    results_df['p0_ch_mw'] = [p0_ch_vars[t].x if t in p0_ch_vars else 0.0 for t in time_steps]
+                except Exception:
+                    pass
+                try:
+                    results_df['E_down_mwh'] = [E_down_vars[t].x if t in E_down_vars else np.nan for t in time_steps]
+                    results_df['E_up_mwh'] = [E_up_vars[t].x if t in E_up_vars else np.nan for t in time_steps]
+                except Exception:
+                    pass
                 results_df['D_plus_max_mw'] = [D_plus_max[t] for t in time_steps]
                 results_df['D_minus_max_mw'] = [D_minus_max[t] for t in time_steps]
                 # Also expose DA aggregated flexible curtailment to verify the tie to y_cap
-                results_df['flex_curtail_da_mw'] = [flex_curtail_P_results.get(t, 0.0) for t in time_steps]
+                results_df['ycap_mw'] = [ycap_var.x if ("ycap_var" in locals() and ycap_var is not None) else 0.0 for _ in time_steps]
         except Exception:
             pass
         

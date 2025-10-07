@@ -36,7 +36,7 @@ import pandas as pd
 # ===========================
 # Epsilon used in the v2 filename suffix: dso_model_v2_results_drcc_true_epsilon_{EPSILON_TOKEN}.csv
 # The token uses two decimals with underscore as decimal separator, e.g., 0.05 -> "0_05"
-EPSILON: float = 0.30
+EPSILON: float = 0.05
 # When running the deterministic (no DRCC tightening) case, set RUN_DRCC_FALSE = True.
 # In that mode we ignore EPSILON for locating the v2 results CSV and instead look for
 # files named like: dso_model_v2_results_drcc_false*.csv
