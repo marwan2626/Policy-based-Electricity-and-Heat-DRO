@@ -109,7 +109,7 @@ HP_FULLY_CORRELATED = True     # temperature is common across HPs
 RHO_TEMP_AVG = 0             # 0=independent, 1=fully correlated within day
 # Capacity buy-back pricing (EUR per MW-hour of purchased connection reduction)
 C_CAP_EUR_PER_MW_H = 5.0  # <--- EDIT ME (capacity price); set 0 to disable economic impact
-C_SHED_EUR_PER_MW_H = 0.0
+C_SHED_EUR_PER_MW_H = 10000.0
 
 # =====================================================================
 ## Debug flags for aggregated flexibility mechanism
@@ -3112,10 +3112,30 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         except Exception:
             base_total_value = None
 
+        # Derive flexible connection capacity (y_cap) cost and shedding cost
+        try:
+            capacity_cost_value = C_CAP_EUR_PER_MW_H * (ycap_var.X if ('ycap_var' in locals() and ycap_var is not None) else 0.0) * dt_hours * len(time_steps)
+        except Exception:
+            capacity_cost_value = None
+        # Aggregate shedding over all buses/time (power MW per period -> energy MWh via dt_hours in cost)
+        try:
+            total_shed_power_sum = 0.0  # sum of MW over periods (will multiply by dt_hours for energy-based cost)
+            for t in time_steps:
+                if t in shed_vars and hasattr(shed_vars[t], 'values'):
+                    for v in shed_vars[t].values():
+                        total_shed_power_sum += getattr(v, 'X', 0.0)
+            shed_cost_value = C_SHED_EUR_PER_MW_H * total_shed_power_sum * dt_hours
+            avg_shed_mw = total_shed_power_sum / len(time_steps) if len(time_steps) else 0.0
+        except Exception:
+            shed_cost_value = None
+            total_shed_power_sum = None
+            avg_shed_mw = None
+
         print("\nCOST BREAKDOWN:")
         print(f"  electricity_cost = {electricity_cost_value}")
         print(f"  bess_cost = {bess_cost_value}")
-        print(f"  flex_curtailment_cost = {float(flex_capacity_cost.getValue()) if hasattr(flex_capacity_cost, 'getValue') else 'N/A'}")
+        print(f"  flex_capacity_cost (y_cap) = {capacity_cost_value}")
+        print(f"  shed_cost = {shed_cost_value}")
         try:
             if 'ycurt_vars' in locals() and ycurt_vars:
                 total_curt = sum(v.X for v in ycurt_vars.values())
@@ -3128,6 +3148,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             avg_curt = None
         print(f"  total_curtailment_mw = {total_curt}")
         print(f"  avg_curtailment_mw = {avg_curt}")
+        print(f"  total_shed_power_sum_mw_periods = {total_shed_power_sum}")
+        print(f"  avg_shed_mw = {avg_shed_mw}")
         print(f"  pv_curtail_cost = {pv_curtail_cost_value}")
         if ENABLE_RT_POLICIES:
             try:
@@ -3156,11 +3178,23 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             except Exception:
                 grand_total_value = None
 
+        # Recompute base total including new capacity and shedding cost components if available
+        try:
+            components = [electricity_cost_value, bess_cost_value, pv_curtail_cost_value]
+            # Only add if not None
+            if capacity_cost_value is not None:
+                components.append(capacity_cost_value)
+            if shed_cost_value is not None:
+                components.append(shed_cost_value)
+            # (legacy flex_curtail_cost_value intentionally omitted)
+            base_total_recomputed = sum(c for c in components if c is not None)
+        except Exception:
+            base_total_recomputed = base_total_value  # fallback
         if ENABLE_RT_POLICIES:
-            print(f"  total_cost_base (no RT proxies) = {base_total_value}")
+            print(f"  total_cost_base (no RT proxies) = {base_total_recomputed}")
             print(f"  total_cost_with_rt_proxies = {grand_total_value if grand_total_value is not None else 'N/A'}")
         else:
-            print(f"  total_cost (components sum or model.ObjVal) = {base_total_value if base_total_value is not None else model.ObjVal}")
+            print(f"  total_cost (components sum or model.ObjVal) = {base_total_recomputed if base_total_recomputed is not None else model.ObjVal}")
         try:
             print(f"  model.ObjVal = {model.ObjVal}")
         except Exception:
