@@ -1019,6 +1019,16 @@ def main() -> None:
                 # approximate Q using household pf (match v2)
                 Q_inj[b] -= p_mw * qfactor_household_const
 
+            # Flexible loads (day-ahead realized schedule after curtailment is fixed across OOS)
+            # We subtract flex_realized (already MW). Treat pf same as household (could customize later).
+            if flex_realized_by_bus:
+                for b, series in flex_realized_by_bus.items():
+                    if t < len(series):
+                        p_flex = float(series[t])
+                        if abs(p_flex) > 0.0:
+                            P_inj[b] -= p_flex
+                            Q_inj[b] -= p_flex * qfactor_household_const
+
             # Heat pumps: use DA hp_elec_bus_*_mw plus residual split proportionally across HP buses
             if base_hp_by_bus:
                 # Distribute total HP deviation equally across detected HP devices (Option A)
