@@ -138,7 +138,8 @@ def generate_samples(
 	results_csv: str,
 	n_samples: int = 1000,
 	seed: int = 42,
-	outdir: str = "samples",
+    outdir: str = "samples",
+    distribution: str = "gaussian",
 ) -> None:
 	os.makedirs(outdir, exist_ok=True)
 
@@ -205,8 +206,19 @@ def generate_samples(
 		sigmas = T_std_k[pos]
 		sigma_Tavg_by_day[day] = _var_of_daily_mean_with_equicorr(sigmas, meta['rho_temp_avg'])
 
-	# Prep RNG
+	# Prep RNG & validate distribution
 	rng = np.random.default_rng(seed)
+	distribution = distribution.lower().strip()
+	if distribution not in {"gaussian", "uniform"}:
+		raise ValueError(f"Unsupported distribution '{distribution}'. Use 'gaussian' or 'uniform'.")
+
+	def _draw_standard(size):
+		"""Draw standard (mean 0, var 1) variates according to selected distribution."""
+		if distribution == "gaussian":
+			return rng.standard_normal(size=size)
+		# Uniform with same variance as standard normal: U(-sqrt(3), +sqrt(3)) has Var=1
+		bound = np.sqrt(3.0)
+		return rng.uniform(-bound, bound, size=size)
 
 	# Contract for outputs
 	nT = len(index)
@@ -216,7 +228,14 @@ def generate_samples(
 	temp_samples = np.zeros((nT, n_samples), dtype=float)
 	# Build map from row idx to day
 	idx_to_day = [ts.date() for ts in index]
-	day_to_shift = {day: rng.normal(loc=0.0, scale=sigma_Tavg_by_day.get(day, 0.0), size=n_samples) for day in set(idx_to_day)}
+	day_to_shift = {}
+	for day in set(idx_to_day):
+		std_day = float(sigma_Tavg_by_day.get(day, 0.0))
+		if std_day <= 0:
+			day_to_shift[day] = np.zeros(n_samples)
+		else:
+			standard_draws = _draw_standard(size=n_samples)
+			day_to_shift[day] = std_day * standard_draws
 	for t, day in enumerate(idx_to_day):
 		temp_samples[t, :] = T_mean_c[t] + day_to_shift[day]
 
@@ -227,9 +246,9 @@ def generate_samples(
 	sqrt_1mrho = np.sqrt(max(0.0, 1.0 - rho_pv))
 	# For each timestep, draw common and idiosyncratic components
 	for t in range(nT):
-		zc = rng.standard_normal(size=n_samples)  # common shock per t
+		zc = _draw_standard(size=n_samples)  # common shock per t
 		for b in pv_bus_ids:
-			zi = rng.standard_normal(size=n_samples)
+			zi = _draw_standard(size=n_samples)
 			sigma_bus_t = float(const_pv_std[t]) * float(installed_pv_mw.get(b, 0.0))
 			mu_bus_t = float(pv_avail_means[b][t])
 			noise = sigma_bus_t * (sqrt_rho * zc + sqrt_1mrho * zi)
@@ -241,12 +260,21 @@ def generate_samples(
 
 	# 3) HP residual samples per HP bus (MW), zero-mean Normal
 	hp_resid_sigma_mw = meta['hp_pred_pmax_mw'] * meta['hp_residual_sigma_norm']
-	hp_samples_by_bus: Dict[int, np.ndarray] = {b: rng.normal(loc=0.0, scale=hp_resid_sigma_mw, size=(nT, n_samples)) for b in hp_bus_ids}
+	hp_samples_by_bus: Dict[int, np.ndarray] = {}
+	for b in hp_bus_ids:
+		if hp_resid_sigma_mw <= 0:
+			hp_samples_by_bus[b] = np.zeros((nT, n_samples), dtype=float)
+		else:
+			standard_draws = _draw_standard(size=(nT, n_samples))
+			hp_samples_by_bus[b] = hp_resid_sigma_mw * standard_draws
 
 	# Write outputs (consolidated to minimize file count)
 	# Build long-form vectors: t repeats each sample; sample_id cycles fastest per time
 	ts_vec = np.repeat(index.astype(str).values, n_samples)
 	sid_vec = np.tile(sample_cols, nT)
+
+	# Choose suffix for distribution in filenames
+	file_suffix = f"_{distribution}"
 
 	# Temperature CSV (long format)
 	temp_flat = temp_samples.reshape(nT * n_samples, order='C')
@@ -255,7 +283,7 @@ def generate_samples(
 		'sample_id': sid_vec,
 		'temperature_c': temp_flat,
 	})
-	temp_out = os.path.join(outdir, 'samples_temperature_c.csv')
+	temp_out = os.path.join(outdir, f'samples_temperature_c{file_suffix}.csv')
 	temp_df.to_csv(temp_out, index=False)
 
 	# PV samples consolidated across buses (wide per bus, long over samples)
@@ -263,7 +291,7 @@ def generate_samples(
 	for b in pv_bus_ids:
 		pv_cols[f'pv_bus_{b}_mw'] = pv_samples_by_bus[b].reshape(nT * n_samples, order='C')
 	pv_df = pd.DataFrame({'timestamp': ts_vec, 'sample_id': sid_vec, **pv_cols})
-	pv_out = os.path.join(outdir, 'samples_pv.csv')
+	pv_out = os.path.join(outdir, f'samples_pv{file_suffix}.csv')
 	pv_df.to_csv(pv_out, index=False)
 
 	# HP residual consolidated across buses (wide per bus, long over samples)
@@ -271,7 +299,7 @@ def generate_samples(
 	for b in hp_bus_ids:
 		hp_cols[f'hp_residual_bus_{b}_mw'] = hp_samples_by_bus[b].reshape(nT * n_samples, order='C')
 	hp_df = pd.DataFrame({'timestamp': ts_vec, 'sample_id': sid_vec, **hp_cols})
-	hp_out = os.path.join(outdir, 'samples_hp_residual.csv')
+	hp_out = os.path.join(outdir, f'samples_hp_residual{file_suffix}.csv')
 	hp_df.to_csv(hp_out, index=False)
 
 	# Metadata JSON
@@ -292,6 +320,7 @@ def generate_samples(
 		'hp_bus_ids': hp_bus_ids,
 		'notes': "PV samples represent available PV MW (pre-curtailment); temperature samples add daily-average uncertainty; HP residual is additive to HP predictor."
 	}
+	meta_out['distribution'] = distribution
 	with open(os.path.join(outdir, 'samples_meta.json'), 'w', encoding='utf-8') as f:
 		json.dump(meta_out, f, indent=2)
 
@@ -306,6 +335,7 @@ def main():
 	parser.add_argument('--results-csv', type=str, default=None, help='Optional: path to dso_model_v2 results CSV; if omitted, uses USER CONFIG or latest in CWD')
 	parser.add_argument('--n-samples', type=int, default=None, help='Optional: override USER CONFIG N_SAMPLES (or ENV GEN_N_SAMPLES)')
 	parser.add_argument('--seed', type=int, default=None, help='Optional: override USER CONFIG SEED')
+	parser.add_argument('--distribution', '--dist', type=str, choices=['gaussian', 'uniform'], default='gaussian', help='Distribution for random draws (default: gaussian)')
 	parser.add_argument('--outdir', type=str, default=None, help='Optional: override USER CONFIG OUTDIR')
 	parser.add_argument('--clean-old', action='store_true', help='Optional: override USER CONFIG CLEAN_OLD to True')
 	args = parser.parse_args()
@@ -344,6 +374,7 @@ def main():
 		n_samples=n_samples,
 		seed=seed,
 		outdir=outdir,
+		distribution=args.distribution,
 	)
 
 
