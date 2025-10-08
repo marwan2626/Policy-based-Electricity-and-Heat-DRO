@@ -64,7 +64,7 @@ OUTDIR: str = "v3_oos"
 LOADING_VIOLATION_THRESHOLD_PCT: float = 80.0
 
 # Phase 1: Use mean-centered residual for policy activation (instead of schedule-referenced residual)
-USE_MEAN_CENTERED_POLICY: bool = True  # set False to use schedule-based residual directly
+USE_MEAN_CENTERED_POLICY: bool = False  # set False to use schedule-based residual directly
 
 # Logging of transformer loading distributions (for CVaR / tail risk analysis)
 LOG_TRAFO_LOADING: bool = True  # set True to enable logging
@@ -920,15 +920,16 @@ def main() -> None:
         hp_dev = hp_temp_dev_total + hp_resid_total
         pv_dev = base_pv_da_total - pv_total_rt  # signed PV deviation vs DA schedule (for reporting)
         base_residual = hp_dev + pv_dev          # schedule-based residual
-        # Mean-centered policy residual if enabled:
-        # hp mean deviation = -hp_resid_total (hp_pred_total used as mean predictor)
-        # pv mean deviation = pv_mean_total - pv_total_rt
-        # residual_policy_array = hp_mean_dev + pv_mean_dev
+        # Mean-centered policy residual if enabled (and now also used for settlement & constraint evaluation):
+        #   hp mean deviation = -hp_resid_total  (hp_pred_total acts as mean predictor)
+        #   pv mean deviation = pv_mean_total - pv_total_rt
+        #   residual_policy_array = hp_mean_dev + pv_mean_dev
+        # If flag is off we revert to schedule-based residual (legacy behavior).
         if USE_MEAN_CENTERED_POLICY:
             pv_mean_dev = pv_mean_total - pv_total_rt
             residual_policy_array = (-hp_resid_total) + pv_mean_dev
         else:
-            residual_policy_array = base_residual  # legacy schedule-based activation
+            residual_policy_array = base_residual  # schedule-based residual
 
         # Accumulators for metrics and voltages
         net_import_rt = np.zeros(len(index))
@@ -950,11 +951,14 @@ def main() -> None:
         for t, ts in enumerate(index):
             row = df.iloc[t]
             pv_sched_t = float(base_pv_da_total[t])
-            resid_t = float(base_residual[t])  # schedule-referenced residual used for settlement evolution
+            # Residual used for BOTH policy activation and settlement/constraint evolution:
+            # When mean-centering is active this is the centered residual; otherwise schedule-based.
+            resid_t = float(residual_policy_array[t])
 
-            # Choose residual signal for policy activation
+            # Residual signal for policy activation (identical to settlement residual now),
+            # keep collecting series only when flag enabled for diagnostics.
             if USE_MEAN_CENTERED_POLICY:
-                resid_policy_t = float(residual_policy_array[t])
+                resid_policy_t = resid_t
                 residual_policy_vals.append(resid_policy_t)
             else:
                 resid_policy_t = resid_t
