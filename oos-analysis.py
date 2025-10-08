@@ -20,7 +20,8 @@ import math
 
 # === User config ===
 RESULTS_DIR = "v3_oos"
-EPSILONS: List[float] = [0.30, 0.25, 0.20, 0.15, 0.10, 0.05]
+# Reduced epsilon set (removed 0.25 and 0.15 per user request)
+EPSILONS: List[float] = [0.30, 0.20, 0.10, 0.05]
 # Include baseline (k=1, no network tightening) summary as an extra category.
 # We now call this 'stochastic' (it still has RT budgets sized by forecast std but no quantile amplification).
 INCLUDE_DETERMINISTIC: bool = True
