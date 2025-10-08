@@ -90,7 +90,7 @@ ENABLE_RT_POLICIES = True  # <--- EDIT ME (base default)
 # Set to False to lock the above value regardless of CLI/env.
 ALLOW_RT_FLAG_RUNTIME_OVERRIDE = True
 ENABLE_DRCC_RT_BUDGETS = True  # <--- EDIT ME (uses PV/temperature std to size D+ / D-)
-DRCC_EPSILON = 0.05            # chance violation level; k = sqrt((1-eps)/eps)
+DRCC_EPSILON = 0.10            # chance violation level; k = sqrt((1-eps)/eps)
 
 # DRCC-based network tightening (transformers, lines, voltages)
 ENABLE_DRCC_NETWORK_TIGHTENING = True  # <--- EDIT ME (base default)
@@ -98,6 +98,10 @@ ENABLE_DRCC_NETWORK_TIGHTENING = True  # <--- EDIT ME (base default)
 DRCC_TIGHTEN_TRAFO = True
 DRCC_TIGHTEN_LINES = True
 DRCC_TIGHTEN_VOLTAGES = True
+# Deterministic baseline semantics when DRCC tightening is OFF:
+# True  -> k_epsilon = 0.0 (fully deterministic design: no nominal sigma allowance)
+# False -> k_epsilon = 1.0 (legacy neutral baseline retaining a 1σ allowance without amplification)
+DETERMINISTIC_STRICT = True  # <--- EDIT to toggle baseline semantics
 ## Base deterministic constraint enforcement (always-on network physics caps)
 ENFORCE_BASE_VOLT_LIMITS = True   # if False, voltage magnitude limits are skipped entirely (debug only)
 ENFORCE_BASE_LINE_LIMITS = True   # if False, line thermal limits are skipped (debug only)
@@ -111,7 +115,7 @@ RHO_TEMP_AVG = 0             # 0=independent, 1=fully correlated within day
 # Flexible load curtailment economics (simple formulation):
 # flex_load(t,b) = baseline(t,b) - curt(t,b); y_cap(t) = sum_b curt(t,b)
 # Cost contribution (per period): y_cap(t) * CURT_PENALTY (optionally * dt_hours later)
-CURT_PENALTY_EUR_PER_MW = 1000.0   # <--- EDIT ME (penalty per MW curtailed in a period)
+CURT_PENALTY_EUR_PER_MW = 15000.0   # <--- EDIT ME (penalty per MW curtailed in a period) 15Eur/kW
 APPLY_DT_TO_CURT_COST = True       # If True multiply by dt_hours (treat penalty as EUR/MWh); False => EUR/MW-period
 C_SHED_EUR_PER_MW_H = 0.0          # Shedding disabled in this formulation
 
@@ -150,7 +154,7 @@ HP_DRCC_BHDD = HP_COEFF_BHDD
 
 # Residual uncertainty for HP predictor (normalized units, multiply by HP_PRED_PMAX to get MW)
 HP_INCLUDE_RESIDUAL = True
-HP_RESIDUAL_SIGMA_NORM = 0.01616 # std of predictor residual in normalized y_dev units
+HP_RESIDUAL_SIGMA_NORM = 0.0157 # std of predictor residual in normalized y_dev units
 HP_RESIDUAL_CORRELATION = 0.0     # 0=independent across HP buses, 1=fully correlated (not used in current RSS)
 
 # Allow runtime override of START_DATE/DURATION_HOURS via CLI args or environment
@@ -1512,8 +1516,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
 
     bess_eff = 0.95  # Round-trip efficiency
     bess_initial_soc = 0.5  # Initial state of charge as a percentage of capacity
-    bess_capacity_mwh = 0.1  # BESS capacity in MWh
-    bess_cost_per_mwh = 5.1 # Cost per MWh of BESS capacity
+    bess_capacity_mwh = 0.40  # BESS capacity in MWh
+    bess_cost_per_mwh = 200000.0 # Cost per MWh of BESS capacity
     # Baseline (intercept) BESS throughput cost (EUR/MWh) for p0 channel
     c_base_bess = 1.5
     # Extract transformer capacity in MW (assuming sn_mva is in MVA)
@@ -1791,10 +1795,16 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         hp_pred_nominal[t] = float(P_t * len(hp_load_buses)) if len(hp_load_buses) > 0 else 0.0
 
     # Precompute k_epsilon (quantile amplification) and aggregate sigma when DRCC tightening is enabled.
-    # Option 1 semantics: if tightening disabled, keep RT budgets but neutralize chance amplification with k=1.
+    # Baseline semantics (when DRCC disabled) selectable via DETERMINISTIC_STRICT flag:
+    #   True  -> k_epsilon = 0.0 (pure deterministic baseline)
+    #   False -> k_epsilon = 1.0 (legacy neutral baseline)
     use_net_drcc = bool(ENABLE_DRCC_NETWORK_TIGHTENING)
-    k_epsilon = 1.0  # default neutral scaling when DRCC inactive
-    k_source = "neutral"
+    if use_net_drcc:
+        k_epsilon = 1.0  # placeholder; overwritten below when epsilon parsed
+        k_source = "drcc_pending"
+    else:
+        k_epsilon = 0.0 if bool(globals().get('DETERMINISTIC_STRICT', True)) else 1.0
+        k_source = 'deterministic_strict' if k_epsilon == 0.0 else 'baseline_neutral'
     sigma_net = {t: 0.0 for t in time_steps}
     if use_net_drcc:
         try:
@@ -1825,9 +1835,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             sigma_hp = hp_temp_sens * float(T_amb_std[t])
             sigma_net[t] = float(np.sqrt(sigma_pv**2 + sigma_hp**2))
     else:
-        # When not using DRCC tightening, we still may use std-based RT budgets elsewhere with k=1.
-        # No network sigma aggregation needed for tightening margins.
-        pass
+    # DRCC tightening disabled: k_epsilon already set (0 strict or 1 neutral). No sigma aggregation needed.
+    print(f"[INFO] DRCC tightening disabled -> baseline mode: {k_source} (k_epsilon={k_epsilon})")
 
     # Add variables for each time step
     for t in time_steps:
@@ -1911,7 +1920,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                     # electrical_time_series keys are original names (string), match exactly
                     if load_name in electrical_time_series:
                         # series is in kW per timestep -> convert to MW
-                        mapped_series = np.array(electrical_time_series[load_name])*10 / 1000.0 #scaling factor of 10 applied here
+                        mapped_series = np.array(electrical_time_series[load_name])* 7 / 1000.0 #scaling factor of 6 applied here
 
                 if mapped_series is None:
                     # Fallback: assign zero-series for unmatched electrical load
@@ -3424,7 +3433,6 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             results_df['meta_enforce_base_line_limits'] = [bool(ENFORCE_BASE_LINE_LIMITS)] * len(results_df)
             results_df['meta_enforce_base_volt_limits'] = [bool(ENFORCE_BASE_VOLT_LIMITS)] * len(results_df)
             # DRCC parameters
-            # Epsilon/k metadata: blank them when tightening disabled (we neutralize k to 1 internally)
             if bool(ENABLE_DRCC_NETWORK_TIGHTENING):
                 try:
                     eps_val = float(DRCC_EPSILON)
@@ -3436,12 +3444,24 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 except Exception:
                     k_eps = np.nan
                 results_df['meta_drcc_k_epsilon'] = [k_eps] * len(results_df)
+                results_df['meta_drcc_mode'] = ['drcc'] * len(results_df)
             else:
+                # Record deterministic / neutral baseline mode and actual k_epsilon used
+                try:
+                    k_base = float(globals().get('k_epsilon', 0.0))
+                except Exception:
+                    k_base = 0.0
+                mode_base = 'deterministic_strict' if k_base == 0.0 else 'baseline_neutral'
                 results_df['meta_drcc_epsilon'] = ["" for _ in range(len(results_df))]
-                results_df['meta_drcc_k_epsilon'] = ["" for _ in range(len(results_df))]
+                results_df['meta_drcc_k_epsilon'] = [k_base] * len(results_df)
+                results_df['meta_drcc_mode'] = [mode_base] * len(results_df)
             # Record how RT budgets were sized (quantile or neutral)
             try:
-                results_df['meta_rt_budget_mode'] = ["quantile_drcc" if ENABLE_DRCC_NETWORK_TIGHTENING else "std_only_k1"] * len(results_df)
+                if ENABLE_DRCC_NETWORK_TIGHTENING:
+                    rt_mode = 'quantile_drcc'
+                else:
+                    rt_mode = 'deterministic_strict' if globals().get('k_epsilon',0.0) == 0.0 else 'std_only_k1'
+                results_df['meta_rt_budget_mode'] = [rt_mode] * len(results_df)
             except Exception:
                 pass
             # PV uncertainty handling
