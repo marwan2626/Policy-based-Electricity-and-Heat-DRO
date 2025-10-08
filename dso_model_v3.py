@@ -129,12 +129,13 @@ def _load_v2_results(path: str) -> pd.DataFrame:
     else:
         # Try reconstructing from meta_time_start and dt_hours
         try:
-            start_raw = df.get('meta_time_start', [None])[0]
+            # Use .iloc[0] instead of [0] on a list to avoid FutureWarning about positional indexing
+            start_raw = df.get('meta_time_start', [None]).__getitem__(0)
             start = pd.to_datetime(start_raw) if start_raw is not None else pd.NaT
         except Exception:
             start = pd.NaT
         try:
-            dt_hours = float(df.get('meta_dt_hours', [np.nan])[0])
+            dt_hours = float(df.get('meta_dt_hours', [np.nan]).__getitem__(0))
         except Exception:
             dt_hours = np.nan
         if pd.isna(start) or not np.isfinite(dt_hours):
@@ -554,8 +555,15 @@ def main() -> None:
 
     # Load HP predictor coefficients from v2 export meta (fallback to v2 defaults)
     def _get_meta_float(col: str, default: float) -> float:
+        val = df.get(col, None)
+        if val is None:
+            return default
         try:
-            return float(df.get(col, [default])[0])
+            if isinstance(val, (list, tuple)):
+                return float(val[0])
+            if isinstance(val, pd.Series):
+                return float(val.iloc[0])
+            return float(val)
         except Exception:
             return default
     HP_PRED_PMAX = _get_meta_float('meta_hp_pred_pmax_mw', 0.30)
@@ -755,22 +763,22 @@ def main() -> None:
 
     # BESS meta from v2 (capacity MWh, initial SOC fraction, efficiency)
     try:
-        bess_eff = float(df.get('meta_bess_eff', [0.95])[0])
+        bess_eff = _get_meta_float('meta_bess_eff', 0.95)
     except Exception:
         bess_eff = 0.95
     try:
-        bess_initial_soc = float(df.get('meta_bess_initial_soc', [0.5])[0])
+        bess_initial_soc = _get_meta_float('meta_bess_initial_soc', 0.5)
     except Exception:
         bess_initial_soc = 0.5
     # total capacity across all BESS units (MWh)
     try:
-        total_bess_capacity_mwh = float(df.get('bess_total_capacity_mwh', [np.nan])[0])
+        total_bess_capacity_mwh = _get_meta_float('bess_total_capacity_mwh', np.nan)
         if not np.isfinite(total_bess_capacity_mwh) or total_bess_capacity_mwh <= 0:
             raise ValueError()
     except Exception:
         # fallback: per-unit capacity if present multiplied by number of BESS buses
         try:
-            per_bess_cap = float(df.get('meta_bess_capacity_mwh', [np.nan])[0])
+            per_bess_cap = _get_meta_float('meta_bess_capacity_mwh', np.nan)
         except Exception:
             per_bess_cap = np.nan
         if not np.isfinite(per_bess_cap) or per_bess_cap <= 0:
@@ -930,6 +938,26 @@ def main() -> None:
             residual_policy_array = (-hp_resid_total) + pv_mean_dev
         else:
             residual_policy_array = base_residual  # schedule-based residual
+
+        # --- Diagnostics: residual statistics & K*mu shift (printed once for first trajectory) ---
+        if i == 1:  # only for first trajectory to avoid log spam
+            mean_base = float(np.mean(base_residual))
+            mean_policy = float(np.mean(residual_policy_array))
+            std_base = float(np.std(base_residual))
+            std_policy = float(np.std(residual_policy_array))
+            l2_diff = float(np.linalg.norm(residual_policy_array - base_residual))
+            print(f"[resid-diag] base_mean={mean_base:.6f} policy_mean={mean_policy:.6f} | base_std={std_base:.6f} policy_std={std_policy:.6f} | l2_diff={l2_diff:.6f}")
+            mu_shift = mean_base - mean_policy
+            row0 = df.iloc[0]
+            lam_p = float(row0.get('lambda_plus', 0.0)); lam_m = float(row0.get('lambda_minus', 0.0))
+            chi_m = float(row0.get('chi_minus', 0.0))
+            if mean_base >= 0:
+                k_mu_bess = lam_p * max(0.0, mu_shift)
+                k_mu_curt = 0.0
+            else:
+                k_mu_bess = - lam_m * max(0.0, -mu_shift)
+                k_mu_curt = chi_m * max(0.0, -mu_shift)
+            print(f"[resid-diag] mu_shift={mu_shift:.6f} -> approx ΔBESS={k_mu_bess:.6f} MW, ΔCurtail={k_mu_curt:.6f} MW (heuristic)")
 
         # Accumulators for metrics and voltages
         net_import_rt = np.zeros(len(index))
