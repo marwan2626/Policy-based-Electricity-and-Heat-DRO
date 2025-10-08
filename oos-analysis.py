@@ -484,7 +484,7 @@ def main() -> None:
     # Create boxplot
     ax_box = axes[4]
     # Matplotlib expects a list of arrays; we already have it
-    box = ax_box.boxplot(distributions, labels=labels_box, showfliers=True, patch_artist=True,
+    box = ax_box.boxplot(distributions, labels=labels_box, showfliers=False, patch_artist=True,
                          boxprops=dict(facecolor='#cccccc', alpha=0.7), medianprops=dict(color='black'))
     ax_box.set_ylabel('Transformer loading %')
     ax_box.set_xlabel('epsilon / mode')
