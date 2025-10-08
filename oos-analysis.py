@@ -58,57 +58,51 @@ def epsilon_token(eps: float) -> str:
 
 def load_summary_for_epsilon(eps: float) -> pd.DataFrame:
     token = epsilon_token(eps)
-    # New naming pattern includes drcc mode: v3_summary_<mode>_epsilon_<token>.csv
-    # We'll search for any file matching that epsilon token; fall back to legacy name.
+    # Preferred new naming (strict): v3_summary_drcc_true_epsilon_<token>.csv
+    preferred = os.path.join(RESULTS_DIR, f"v3_summary_drcc_true_epsilon_{token}.csv")
+    if os.path.exists(preferred):
+        return pd.read_csv(preferred)
+    # Fallback 1: legacy (pre-refactor) name (only use if no new drcc_true file found)
     legacy = os.path.join(RESULTS_DIR, f"v3_summary_epsilon_{token}.csv")
     if os.path.exists(legacy):
+        print(f"[WARN] Using legacy summary file for epsilon={eps:.2f}: {os.path.basename(legacy)} (consider re-running to produce drcc_true file)")
         return pd.read_csv(legacy)
-    # Deterministic (drcc_false) file now omits epsilon entirely; allow reuse across eps loop
-    det_path = os.path.join(RESULTS_DIR, 'v3_summary_drcc_false.csv')
-    if os.path.exists(det_path):
-        # Return a copy with an added column to tag it (caller groups by epsilon anyway)
-        df_det = pd.read_csv(det_path).copy()
-        return df_det
-    # Scan directory for pattern
-    prefix = f"v3_summary_"
-    suffix = f"_epsilon_{token}.csv"
-    candidates = [f for f in os.listdir(RESULTS_DIR) if f.startswith(prefix) and f.endswith(suffix)]
-    if not candidates:
-        raise FileNotFoundError(f"Missing summary for epsilon={eps}: looked for {legacy} or *{suffix}")
-    # If multiple (e.g., drcc_true + drcc_false), choose all? For now pick each individually later.
-    # Here we just pick the first sorted; multi-mode comparison could be an extension.
-    candidates.sort()
-    return pd.read_csv(os.path.join(RESULTS_DIR, candidates[0]))
+    # Fallback 2: stray misnamed files (e.g., v3_summary_drcc_false_epsilon_<token>.csv) – ignore unless nothing else
+    stray = os.path.join(RESULTS_DIR, f"v3_summary_drcc_false_epsilon_{token}.csv")
+    if os.path.exists(stray):
+        print(f"[WARN] Falling back to stray drcc_false_epsilon file for epsilon={eps:.2f} (treating as placeholder): {os.path.basename(stray)}")
+        return pd.read_csv(stray)
+    raise FileNotFoundError(f"Missing summary for epsilon={eps:.2f}: expected {os.path.basename(preferred)} (or legacy {os.path.basename(legacy)})")
 
 
 def load_meta_for_epsilon(eps: float) -> Dict:
     token = epsilon_token(eps)
+    # Preferred
+    preferred = os.path.join(RESULTS_DIR, f"v3_meta_drcc_true_epsilon_{token}.json")
+    if os.path.exists(preferred):
+        try:
+            with open(preferred, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    # Legacy fallback
     legacy = os.path.join(RESULTS_DIR, f"v3_meta_epsilon_{token}.json")
     if os.path.exists(legacy):
         try:
             with open(legacy, 'r', encoding='utf-8') as f:
+                print(f"[WARN] Using legacy meta file for epsilon={eps:.2f}: {os.path.basename(legacy)}")
                 return json.load(f)
         except Exception:
             pass
-    # Deterministic meta (no epsilon) support
-    det_meta = os.path.join(RESULTS_DIR, 'v3_meta_drcc_false.json')
-    if os.path.exists(det_meta):
+    # Stray drcc_false_epsilon (should not exist – fallback warning)
+    stray = os.path.join(RESULTS_DIR, f"v3_meta_drcc_false_epsilon_{token}.json")
+    if os.path.exists(stray):
         try:
-            with open(det_meta, 'r', encoding='utf-8') as f:
+            with open(stray, 'r', encoding='utf-8') as f:
+                print(f"[WARN] Falling back to stray drcc_false meta for epsilon={eps:.2f}: {os.path.basename(stray)}")
                 return json.load(f)
         except Exception:
             pass
-    # Look for new pattern v3_meta_<mode>_epsilon_<token>.json
-    prefix = "v3_meta_"
-    suffix = f"_epsilon_{token}.json"
-    try:
-        candidates = [f for f in os.listdir(RESULTS_DIR) if f.startswith(prefix) and f.endswith(suffix)]
-        if candidates:
-            candidates.sort()
-            with open(os.path.join(RESULTS_DIR, candidates[0]), 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except Exception:
-        pass
     return {}
 
 
@@ -339,6 +333,36 @@ def main() -> None:
 
     summary.to_csv(os.path.join(RESULTS_DIR, OUT_CSV), index=False)
 
+    # === Radial-only adaptation ===
+    # New v3 (post-refactor) provides only radial (Option A) network loading; voltages are NaN/omitted.
+    # Detect this to adjust plot labels & console messaging.
+    radial_only_mode = True  # currently always true after removal of admittance logic
+    if radial_only_mode:
+        print("[INFO] Detected radial-only flow evaluation mode (Option A); voltage metrics suppressed / NaN.")
+
+    # Derive transformer violation threshold (default 80%) from any available summary column
+    threshold_candidates = []
+    if 'loading_violation_threshold_pct' in summary.columns:
+        threshold_candidates.extend(list(pd.to_numeric(summary['loading_violation_threshold_pct'], errors='coerce').dropna().unique()))
+    # Fallback: look directly into a representative v3_summary file if not populated (older runs)
+    if not threshold_candidates:
+        for eps in EPSILONS:
+            token = epsilon_token(eps)
+            fpath = os.path.join(RESULTS_DIR, f"v3_summary_drcc_true_epsilon_{token}.csv")
+            if os.path.exists(fpath):
+                try:
+                    tmp_df = pd.read_csv(fpath, nrows=1)
+                    if 'loading_violation_threshold_pct' in tmp_df.columns:
+                        val = pd.to_numeric(tmp_df['loading_violation_threshold_pct'], errors='coerce').iloc[0]
+                        if np.isfinite(val):
+                            threshold_candidates.append(val)
+                            break
+                except Exception:
+                    pass
+    # Final fallback constant
+    violation_threshold_pct = float(threshold_candidates[0]) if threshold_candidates else 80.0
+    print(f"[INFO] Using transformer violation threshold = {violation_threshold_pct:.0f}% for plots.")
+
     # Added two more subplots for CVaR90 / CVaR95 of transformer loading severity
     fig, axes = plt.subplots(1, 8, figsize=(48, 4), constrained_layout=True)
     x = np.arange(len(rt_summary))
@@ -382,7 +406,7 @@ def main() -> None:
     axes[2].set_xticklabels(rt_summary['label'])
     axes[2].set_xlabel('epsilon / mode')
     axes[2].set_ylabel('Steps (sum across trajectories)')
-    axes[2].set_title('Transformer loading violations')
+    axes[2].set_title(f'Transformer loading violations (> {violation_threshold_pct:.0f}%)')
     axes[2].grid(axis='y', alpha=0.3)
     # Annotate bars (always show value, even if very small or large)
     for rect, val in zip(bars, t_steps):
@@ -398,7 +422,7 @@ def main() -> None:
     axes[3].set_xticklabels(rt_summary['label'])
     axes[3].set_xlabel('epsilon / mode')
     axes[3].set_ylabel('% of total timesteps')
-    axes[3].set_title('Transformer violation probability')
+    axes[3].set_title(f'Transformer violation probability (> {violation_threshold_pct:.0f}%)')
     axes[3].grid(axis='y', alpha=0.3)
     axes[3].legend()
 
@@ -409,7 +433,7 @@ def main() -> None:
     axes[4].set_xticklabels(rt_summary['label'])
     axes[4].set_xlabel('epsilon / mode')
     axes[4].set_ylabel('Loading %')
-    axes[4].set_title('Transformer loading CVaR90')
+    axes[4].set_title('Transformer loading CVaR90 (radial)')
     axes[4].grid(axis='y', alpha=0.3)
     axes[4].legend()
 
@@ -420,7 +444,7 @@ def main() -> None:
     axes[5].set_xticklabels(rt_summary['label'])
     axes[5].set_xlabel('epsilon / mode')
     axes[5].set_ylabel('Loading %')
-    axes[5].set_title('Transformer loading CVaR95')
+    axes[5].set_title('Transformer loading CVaR95 (radial)')
     axes[5].grid(axis='y', alpha=0.3)
     axes[5].legend()
     # 7. Transformer Violation Excess CVaR90 (excess >100%)
@@ -430,7 +454,7 @@ def main() -> None:
     axes[6].set_xticklabels(rt_summary['label'])
     axes[6].set_xlabel('epsilon / mode')
     axes[6].set_ylabel('Excess % over 100')
-    axes[6].set_title('Transformer excess CVaR90')
+    axes[6].set_title('Transformer excess CVaR90 (radial)')
     axes[6].grid(axis='y', alpha=0.3)
     axes[6].legend()
     # 8. Transformer Violation Excess CVaR95 (excess >100%)
@@ -440,7 +464,7 @@ def main() -> None:
     axes[7].set_xticklabels(rt_summary['label'])
     axes[7].set_xlabel('epsilon / mode')
     axes[7].set_ylabel('Excess % over 100')
-    axes[7].set_title('Transformer excess CVaR95')
+    axes[7].set_title('Transformer excess CVaR95 (radial)')
     axes[7].grid(axis='y', alpha=0.3)
     axes[7].legend()
 
@@ -459,6 +483,16 @@ def main() -> None:
             except Exception:
                 continue
             fname = os.path.basename(path)
+            # Skip legacy simple names if a preferred drcc_true exists for same epsilon
+            legacy_match = re.match(r'v3_summary_epsilon_([0-9]+_[0-9]+)\.csv', fname)
+            if legacy_match:
+                tok = legacy_match.group(1)
+                preferred = os.path.join(results_dir, f"v3_summary_drcc_true_epsilon_{tok}.csv")
+                if os.path.exists(preferred):
+                    continue  # ignore legacy because updated file present
+            # Skip misnamed drcc_false_epsilon_ variants (deterministic should not carry epsilon)
+            if 'drcc_false_epsilon_' in fname:
+                continue
             # Mode & epsilon inference
             if 'drcc_false' in fname:
                 mode = 'stochastic'
@@ -762,7 +796,7 @@ def main() -> None:
     # --- Transformer violation probability per timestep ---
     if PLOT_TRAFO_VIOLATION_TIME_PROFILE:
         # Correct per-timestep probability: for each (sample_id, t) take max loading across trafos; violation if > threshold.
-        threshold_pct = 80.0
+        threshold_pct = violation_threshold_pct
         profiles: List[Tuple[str, np.ndarray]] = []
         t_axis: np.ndarray | None = None
         # Helper to compute profile from a parquet path
