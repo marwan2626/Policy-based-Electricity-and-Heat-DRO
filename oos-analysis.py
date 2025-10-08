@@ -364,8 +364,13 @@ def main() -> None:
     violation_threshold_pct = float(threshold_candidates[0]) if threshold_candidates else 80.0
     print(f"[INFO] Using transformer violation threshold = {violation_threshold_pct:.0f}% for plots.")
 
-    # Added two more subplots for CVaR90 / CVaR95 of transformer loading severity
-    fig, axes = plt.subplots(1, 8, figsize=(48, 4), constrained_layout=True)
+    # New condensed overview: 5 panels
+    # 0: RT imbalance cost (already simplified earlier)
+    # 1: DA import cost
+    # 2: Transformer violation steps
+    # 3: Transformer violation probability
+    # 4: Boxplot of transformer loading distribution (per-timestep max loading across trafos per trajectory)
+    fig, axes = plt.subplots(1, 5, figsize=(34, 4.2), constrained_layout=True)
     x = np.arange(len(rt_summary))
     width = 0.6
 
@@ -423,47 +428,75 @@ def main() -> None:
     axes[3].grid(axis='y', alpha=0.3)
     axes[3].legend()
 
-    # 5. Transformer Loading Severity CVaR90
-    cvar90 = rt_summary.get('trafo_cvar90_loading_pct', pd.Series([np.nan]*len(rt_summary))).to_numpy()
-    axes[4].bar(x, cvar90, width=width, color='#c44e52', label='Trafo CVaR90 loading %')
-    axes[4].set_xticks(x)
-    axes[4].set_xticklabels(rt_summary['label'])
-    axes[4].set_xlabel('epsilon / mode')
-    axes[4].set_ylabel('Loading %')
-    axes[4].set_title('Transformer loading CVaR90 (radial)')
-    axes[4].grid(axis='y', alpha=0.3)
-    axes[4].legend()
+    # 4. Transformer loading distribution boxplot (per-timestep max loading across trafos per trajectory)
+    # Build distributions
+    distributions: List[np.ndarray] = []
+    labels_box: List[str] = []
 
-    # 6. Transformer Loading Severity CVaR95
-    cvar95 = rt_summary.get('trafo_cvar95_loading_pct', pd.Series([np.nan]*len(rt_summary))).to_numpy()
-    axes[5].bar(x, cvar95, width=width, color='#8172b3', label='Trafo CVaR95 loading %')
-    axes[5].set_xticks(x)
-    axes[5].set_xticklabels(rt_summary['label'])
-    axes[5].set_xlabel('epsilon / mode')
-    axes[5].set_ylabel('Loading %')
-    axes[5].set_title('Transformer loading CVaR95 (radial)')
-    axes[5].grid(axis='y', alpha=0.3)
-    axes[5].legend()
-    # 7. Transformer Violation Excess CVaR90 (excess >100%)
-    sev_cvar90 = rt_summary.get('trafo_violation_excess_cvar90_pct', pd.Series([np.nan]*len(rt_summary))).to_numpy()
-    axes[6].bar(x, sev_cvar90, width=width, color='#4c72b0', label='Trafo Excess CVaR90 (>100%)')
-    axes[6].set_xticks(x)
-    axes[6].set_xticklabels(rt_summary['label'])
-    axes[6].set_xlabel('epsilon / mode')
-    axes[6].set_ylabel('Excess % over 100')
-    axes[6].set_title('Transformer excess CVaR90 (radial)')
-    axes[6].grid(axis='y', alpha=0.3)
-    axes[6].legend()
-    # 8. Transformer Violation Excess CVaR95 (excess >100%)
-    sev_cvar95 = rt_summary.get('trafo_violation_excess_cvar95_pct', pd.Series([np.nan]*len(rt_summary))).to_numpy()
-    axes[7].bar(x, sev_cvar95, width=width, color='#dd8452', label='Trafo Excess CVaR95 (>100%)')
-    axes[7].set_xticks(x)
-    axes[7].set_xticklabels(rt_summary['label'])
-    axes[7].set_xlabel('epsilon / mode')
-    axes[7].set_ylabel('Excess % over 100')
-    axes[7].set_title('Transformer excess CVaR95 (radial)')
-    axes[7].grid(axis='y', alpha=0.3)
-    axes[7].legend()
+    def _load_loading_distribution(meta: Dict) -> np.ndarray:
+        """Return flattened array of per-(sample_id,t) max transformer loading percentages.
+
+        Strategy: read parquet referenced in meta['trafo_loading_file'] (if present), group by (sample_id,t)
+        to take max loading across trafos, and return all those maxima as a 1-D numpy array.
+        """
+        if not meta or 'trafo_loading_file' not in meta:
+            return np.array([])
+        rel_path = meta.get('trafo_loading_file')
+        if not rel_path:
+            return np.array([])
+        abs_path = os.path.join(RESULTS_DIR, rel_path.replace('/', os.sep))
+        if not os.path.exists(abs_path):
+            # try direct path
+            if os.path.exists(rel_path):
+                abs_path = rel_path
+            else:
+                return np.array([])
+        try:
+            pdf = pd.read_parquet(abs_path)
+        except Exception:
+            return np.array([])
+        must_cols = {'sample_id','t','trafo_index','loading_pct'}
+        if not must_cols <= set(pdf.columns):
+            return np.array([])
+        grp = pdf.groupby(['sample_id','t'])['loading_pct'].max().reset_index()
+        arr = pd.to_numeric(grp['loading_pct'], errors='coerce').to_numpy()
+        return arr[np.isfinite(arr)]
+
+    # Collect meta mapping for epsilons during earlier loop wasn't stored; reload here
+    meta_cache: Dict[str, Dict] = {}
+    # Deterministic baseline
+    if INCLUDE_DETERMINISTIC and os.path.exists(os.path.join(RESULTS_DIR,'v3_meta_drcc_false.json')):
+        try:
+            with open(os.path.join(RESULTS_DIR,'v3_meta_drcc_false.json'),'r',encoding='utf-8') as f:
+                meta_cache[DETERMINISTIC_LABEL] = json.load(f)
+        except Exception:
+            meta_cache[DETERMINISTIC_LABEL] = {}
+    for eps in EPSILONS:
+        lab = f"{eps:.2f}"
+        meta_cache[lab] = load_meta_for_epsilon(eps)
+
+    for lab in rt_summary['label']:
+        meta = meta_cache.get(lab, {})
+        dist = _load_loading_distribution(meta)
+        distributions.append(dist if dist.size else np.array([np.nan]))
+        labels_box.append(lab)
+
+    # Create boxplot
+    ax_box = axes[4]
+    # Matplotlib expects a list of arrays; we already have it
+    box = ax_box.boxplot(distributions, labels=labels_box, showfliers=True, patch_artist=True,
+                         boxprops=dict(facecolor='#cccccc', alpha=0.7), medianprops=dict(color='black'))
+    ax_box.set_ylabel('Transformer loading %')
+    ax_box.set_xlabel('epsilon / mode')
+    ax_box.set_title('Transformer loading distribution (per-timestep maxima)')
+    ax_box.grid(axis='y', alpha=0.3)
+    # Optional: annotate median values above boxes
+    try:
+        for i, dist in enumerate(distributions, start=1):
+            if dist.size and np.isfinite(np.nanmedian(dist)):
+                ax_box.text(i, np.nanmedian(dist)+1.0, f"{np.nanmedian(dist):.1f}", ha='center', va='bottom', fontsize=7)
+    except Exception:
+        pass
 
     out_path = os.path.join(RESULTS_DIR, OUT_FIG)
     fig.savefig(out_path, dpi=150)
