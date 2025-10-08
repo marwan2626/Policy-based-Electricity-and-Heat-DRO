@@ -369,19 +369,15 @@ def main() -> None:
     x = np.arange(len(rt_summary))
     width = 0.6
 
+    # RT imbalance-only cost plot (simplified per user request: removed PV curtail & BESS cycle components + legend)
     c_imb = rt_summary['rt_imbalance_cost_mean'].to_numpy()
-    c_pv = rt_summary['rt_pv_cost_mean'].to_numpy()
-    c_bess = rt_summary['rt_bess_cost_mean'].to_numpy()
-    axes[0].bar(x, c_imb, width=width, label='RT Imbalance')
-    axes[0].bar(x, c_pv, width=width, bottom=c_imb, label='RT PV Curtail')
-    axes[0].bar(x, c_bess, width=width, bottom=c_imb + c_pv, label='RT BESS Cycle')
+    axes[0].bar(x, c_imb, width=width, color='#dd8452')
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(rt_summary['label'])
     axes[0].set_xlabel('epsilon / mode')
     axes[0].set_ylabel('EUR (mean across samples)')
-    axes[0].set_title('RT cost components (stacked)')
+    axes[0].set_title('RT imbalance cost')
     axes[0].grid(axis='y', alpha=0.3)
-    axes[0].legend()
 
     c_da = rt_summary['da_import_cost_mean'].to_numpy()
     axes[1].bar(x, c_da, width=width, color='#4c72b0', label='DA Import Cost')
