@@ -40,6 +40,10 @@ RESULTS_CSV: str | None = None
 # Number of Monte Carlo samples to generate per timestamp
 N_SAMPLES: int = 1000
 
+# Distribution type for random draws (affects all stochastic components).
+# Options: "gaussian" (standard normal based) or "uniform" (variance-matched U(-sqrt(3), +sqrt(3))).
+DISTRIBUTION: str = "gaussian"
+
 # Random seed for reproducibility. Use any integer to change the random stream.
 SEED: int = 42
 
@@ -335,7 +339,7 @@ def main():
 	parser.add_argument('--results-csv', type=str, default=None, help='Optional: path to dso_model_v2 results CSV; if omitted, uses USER CONFIG or latest in CWD')
 	parser.add_argument('--n-samples', type=int, default=None, help='Optional: override USER CONFIG N_SAMPLES (or ENV GEN_N_SAMPLES)')
 	parser.add_argument('--seed', type=int, default=None, help='Optional: override USER CONFIG SEED')
-	parser.add_argument('--distribution', '--dist', type=str, choices=['gaussian', 'uniform'], default='gaussian', help='Distribution for random draws (default: gaussian)')
+	parser.add_argument('--distribution', '--dist', type=str, choices=['gaussian', 'uniform'], default=None, help='Override distribution (gaussian|uniform). If omitted, uses USER CONFIG DISTRIBUTION.')
 	parser.add_argument('--outdir', type=str, default=None, help='Optional: override USER CONFIG OUTDIR')
 	parser.add_argument('--clean-old', action='store_true', help='Optional: override USER CONFIG CLEAN_OLD to True')
 	args = parser.parse_args()
@@ -369,12 +373,15 @@ def main():
 		except FileNotFoundError:
 			pass
 
+	# Distribution: CLI override or USER CONFIG
+	distribution = args.distribution if args.distribution is not None else DISTRIBUTION
+
 	generate_samples(
 		results_csv=results_csv,
 		n_samples=n_samples,
 		seed=seed,
 		outdir=outdir,
-		distribution=args.distribution,
+		distribution=distribution,
 	)
 
 
