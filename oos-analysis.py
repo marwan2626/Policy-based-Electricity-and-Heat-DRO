@@ -25,7 +25,7 @@ EPSILONS: List[float] = [0.30, 0.20, 0.10, 0.05]
 # Include baseline (k=1, no network tightening) summary as an extra category.
 # We now call this 'stochastic' (it still has RT budgets sized by forecast std but no quantile amplification).
 INCLUDE_DETERMINISTIC: bool = True
-DETERMINISTIC_LABEL: str = "stochastic"  # displayed label for drcc_false (k=1) run
+DETERMINISTIC_LABEL: str = "deterministic"  # displayed label for drcc_false baseline run
 OUT_FIG = "oos_overview.png"
 OUT_CSV = "oos_overview_summary.csv"
 SHOW: bool = False  # set True to display interactively
@@ -628,7 +628,7 @@ def main() -> None:
             ax_f.scatter(
                 base_df['trafo_violation_rate_mean'],
                 base_df['mean_cost_eur'],
-                marker='x', s=80, c='black', linewidths=1.2
+                marker='o', s=80, c='black', edgecolors='none'
             )
         # Annotate epsilon values
         for _, r in drcc_df.iterrows():
@@ -640,8 +640,8 @@ def main() -> None:
         ax_f.grid(alpha=0.35)
         from matplotlib.lines import Line2D
         legend_handles = [
-            Line2D([], [], marker='o', linestyle='None', color='black', markersize=7, label='DRCC trajectories'),
-            Line2D([], [], marker='x', linestyle='None', color='black', markersize=7, label='stochastic trajectories'),
+            Line2D([], [], marker='o', linestyle='None', color='black', markersize=7, label='DRCC mean points'),
+            Line2D([], [], marker='o', linestyle='None', color='black', markersize=7, label='deterministic mean'),
         ]
     # Legend removed per request
     # ax_f.legend(handles=legend_handles, fontsize=8, frameon=True)
@@ -719,7 +719,7 @@ def main() -> None:
                 fig_t.colorbar(sc2, ax=ax_t, label='epsilon')
             if not base_pts.empty:
                 ax_t.scatter(
-                    base_pts['vrate'], base_pts['cost'], marker='x', s=70, c='black', linewidths=1.0
+                    base_pts['vrate'], base_pts['cost'], marker='o', s=55, c='black', edgecolors='none', alpha=0.85
                 )
             ax_t.set_xlabel('Transformer violation rate (trajectory)')
             ax_t.set_ylabel('Trajectory total cost (EUR)')
@@ -728,7 +728,7 @@ def main() -> None:
             from matplotlib.lines import Line2D
             legend_handles_traj = [
                 Line2D([], [], marker='o', linestyle='None', color='black', markersize=6, label='DRCC trajectories'),
-                Line2D([], [], marker='x', linestyle='None', color='black', markersize=7, label='stochastic trajectories'),
+                Line2D([], [], marker='o', linestyle='None', color='black', markersize=7, label='deterministic trajectories'),
             ]
             # Legend removed per request
             # ax_t.legend(handles=legend_handles_traj, fontsize=8, frameon=True)
@@ -794,8 +794,8 @@ def main() -> None:
                 ax_h.scatter(drcc_cloud['vrate'], drcc_cloud['cost'], c=eps_vals, cmap=cmap_c,
                              s=20, alpha=0.12, edgecolors='none')
             if not base_cloud.empty:
-                ax_h.scatter(base_cloud['vrate'], base_cloud['cost'], marker='x', s=30,
-                             c='black', alpha=0.12, linewidths=0.6)
+                ax_h.scatter(base_cloud['vrate'], base_cloud['cost'], marker='o', s=30,
+                             c='black', alpha=0.15, edgecolors='none')
             # Mean overlay (reuse style from mean frontier)
             drcc_mean = mean_df[mean_df['mode'] != 'stochastic']
             base_mean = mean_df[mean_df['mode'] == 'stochastic']
@@ -808,7 +808,7 @@ def main() -> None:
                 fig_h.colorbar(sc_m, ax=ax_h, label='epsilon')
             if not base_mean.empty:
                 ax_h.scatter(base_mean['trafo_violation_rate_mean'], base_mean['mean_cost_eur'],
-                             marker='x', s=80, c='black', linewidths=1.2)
+                             marker='o', s=85, c='black', edgecolors='white', linewidths=0.4)
             for _, r in drcc_mean.iterrows():
                 if r['epsilon'] is not None and np.isfinite(r['epsilon']):
                     ax_h.annotate(f"{r['epsilon']:.2f}", (r['trafo_violation_rate_mean'], r['mean_cost_eur']),
