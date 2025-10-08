@@ -108,8 +108,16 @@ PV_STD_CORRELATION = 1.00      # used only if constructing from per-bus stds (no
 HP_FULLY_CORRELATED = True     # temperature is common across HPs
 RHO_TEMP_AVG = 0             # 0=independent, 1=fully correlated within day
 # Capacity buy-back pricing (EUR per MW-hour of purchased connection reduction)
-C_CAP_EUR_PER_MW_H = 5.0  # <--- EDIT ME (capacity price); set 0 to disable economic impact
-C_SHED_EUR_PER_MW_H = 10000.0
+# Flexible load curtailment economics (simple formulation):
+# flex_load(t,b) = baseline(t,b) - curt(t,b); y_cap(t) = sum_b curt(t,b)
+# Cost contribution (per period): y_cap(t) * CURT_PENALTY (optionally * dt_hours later)
+CURT_PENALTY_EUR_PER_MW = 1000.0   # <--- EDIT ME (penalty per MW curtailed in a period)
+APPLY_DT_TO_CURT_COST = True       # If True multiply by dt_hours (treat penalty as EUR/MWh); False => EUR/MW-period
+C_SHED_EUR_PER_MW_H = 0.0          # Shedding disabled in this formulation
+
+# (Paper model) We disable artificial served-load utility and minimum service fraction.
+VALUE_OF_SERVED_LOAD_EUR_PER_MWH = 0.0
+MIN_FLEX_SERVICE_FRAC = 0.0
 
 # =====================================================================
 ## Debug flags for aggregated flexibility mechanism
@@ -118,6 +126,10 @@ DEBUG_PRINT_FLEX_DIAGNOSTICS = True   # Print per-period cap diagnostics (first 
 RELAX_AGG_CONN_CAP = False            # (Removed) kept for backward compatibility; no slack will be created
 MAX_FLEX_DIAG_PERIODS = 8             # How many early periods to print diagnostics
 SHOW_BASELINE_FLEX_FIG = True         # If True, create a standalone figure with baseline (deterministic) flexible loads per bus
+# Deprecated capacity purchase variable (unused now)
+ycap_var = None
+ycap_vars = {}   # aggregate curtailed MW per period (y_cap(t))
+flex_curt_vars = {}  # per-bus curtailment variables curt(t,b)
 ## End debug flags
 
 # --- Heat Pump predictor and DRCC constants (single source of truth) ---
@@ -245,12 +257,10 @@ electrical_loads_df = pd.read_csv(os.path.join(NETWORK_DIR, "electrical_loads.cs
 hex_names = set(hex_df['name'].astype(str).values)
 hex_norm_map = {normalize_name(n): n for n in hex_names}
 el_names = electrical_loads_df['name'].astype(str).fillna('').values
+el_time_series = {}
 el_norm_map = {normalize_name(n): n for n in el_names}
 
 # Containers for assigned time series (kW)
-el_time_series = {}
-
-
 # Deterministic mapping: map each network electrical load name to the exact CSV column '<base>_electricity'
 # Try both '.' and '_' variants of the base name to match common formatting differences.
 for el_orig in el_names:
@@ -532,13 +542,10 @@ def create_comprehensive_plots(results_df, hp_power_values, ambient_temps_c=None
         # Plot both thermal and electrical power for comparison
         plt.plot(hours, hp_power_values, 'r-', linewidth=2, label='Thermal Power (kW)')
         plt.plot(hours, total_hp_elec_power, 'b-', linewidth=2, label='Electrical Power (kW)')
-        
         plt.xlabel('Hour')
-        plt.ylabel('Power (kW)')
         plt.grid(True, alpha=0.3)
         plt.legend()
         plt.title('Heat Pump Thermal vs Electrical Power', fontsize=14, fontweight='bold')
-        
         # Add some statistics in text box
         avg_thermal = np.mean(hp_power_values)
         avg_electrical = np.mean(total_hp_elec_power)
@@ -1605,7 +1612,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     # Robust SoC extreme envelope trajectories (down/up under full deviations)
     E_down_vars = {}
     E_up_vars = {}
-    ycap_var = None  # single y_cap for this model
+    # (Deprecated) single ycap_var removed; using per-period ycap_vars
 
 
     # Temporary dictionary to store updated load values per time step
@@ -2029,20 +2036,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 print(f"  Created p_hp_vars for buses: {hp_load_buses}")
 
     # ------------------------------------------------------------------
-    # Aggregated flexible connection capacity buy-back variable (ycap)
-    # ------------------------------------------------------------------
-    if len(flexible_load_buses) > 0:
-        total_conn_cap_MW = 11.0/1000.0 * len(flexible_load_buses)  # 11 kW per connection -> MW
-        try:
-            ycap_var = model.addVar(lb=0.0, ub=total_conn_cap_MW, name="ycap")
-            print(f"Added aggregated connection capacity variable ycap with upper bound {total_conn_cap_MW:.4f} MW")
-        except Exception as _e:
-            print(f"Warning: failed to add ycap variable: {_e}")
-            ycap_var = None
-    else:
-        ycap_var = None
-                            
-       
+    print("Using simple per-bus curtailment formulation: flex = baseline - curt; cost = penalty * sum curt")
+
     
     non_slack_buses = [bus for bus in net.bus.index if bus != slack_bus_index]
 
@@ -2086,45 +2081,38 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
 
     # (Removed obsolete safeguard for late creation of flexible load vars after loop repair)
 
+    # (Removed) scaling factors — we use explicit curtailment variables instead
+    # Removed obsolete scaling formulation; keeping placeholder comment for traceability.
+    # scale_frac_vars removed per simplified curtailment model.
+
     # Add power balance and load flow constraints for each time step
     for t in time_steps:
         # ------------------------------------------------------------------
-        # Per-bus flexible load bounds (0 <= P_tb <= baseline_tb) and
-        # aggregated connection capacity constraint: sum_flex_t <= total_conn_cap_MW - ycap
-        # These implement the single scalar buy-back design; keeps feasibility at night.
+        # Flexible load modeling (simple curtailment):
+        #   flexible_P[t,b] + curt[t,b] = baseline_tb
+        #   ycap_vars[t] = sum_b curt[t,b]
+        #   Cost adds CURT_PENALTY * ycap_vars[t] (* dt_hours if configured)
         # ------------------------------------------------------------------
         if len(flexible_load_buses) > 0:
-            shed_t = model.addVars(flexible_load_buses, lb=0.0, name=f"shed_{t}")
-            shed_vars[t] = shed_t
-
-            sum_baseline_t = gp.quicksum(float(flexible_time_synchronized_loads_P[t].get(b,0.0))
-                                        for b in flexible_load_buses)
-            sum_flex_t = gp.quicksum(flexible_load_P_vars[t][b] for b in flexible_load_buses)
-
+            # Create per-bus curtailment vars and aggregate y_cap(t)
+            flex_curt_vars[t] = model.addVars(flexible_load_buses, lb=0.0, name=f"flex_curt_{t}")
+            ycap_vars[t] = model.addVar(lb=0.0, name=f"ycap_flex_{t}")
+            # Baseline reconstruction and per-bus equalities
             for bus in flexible_load_buses:
                 baseline_tb = float(flexible_time_synchronized_loads_P[t].get(bus, 0.0))
-                model.addConstr(flexible_load_P_vars[t][bus] >= 0.0, name=f"flex_lb_t{t}_b{bus}")
-                model.addConstr(flexible_load_P_vars[t][bus] <= baseline_tb, name=f"flex_ub_t{t}_b{bus}")
-
-                # reactive power constraint
-                model.addConstr(flexible_load_Q_vars[t][bus] == 0.0, name=f"flex_Q_pf_t{t}_b{bus}")
-
-                model.addConstr(flexible_load_P_vars[t][bus] + shed_t[bus] == baseline_tb,
-                    name=f"flex_track_t{t}_b{bus}")
-
-            # Aggregated connection capacity (only if ycap_var exists)
-            if 'ycap_var' in locals() and ycap_var is not None:
-                total_conn_cap_MW = 11.0/1000.0 * len(flexible_load_buses)
-                # baseline tracking (aggregate)
-                model.addConstr(sum_flex_t <= total_conn_cap_MW - ycap_var,
-                    name=f"agg_conn_cap_t{t}")
-                # connection capacity after buy-back (activated by default)
-                model.addConstr(sum_flex_t <= total_conn_cap_MW - ycap_var, name=f"agg_conn_cap_t{t}")
-
-                if bool(DEBUG_PRINT_FLEX_DIAGNOSTICS):
-                    globals().setdefault('diag_sum_flex', {})[t] = gp.quicksum(flexible_load_P_vars[t][b] for b in flexible_load_buses)
-                    globals().setdefault('diag_cap_rhs', {})[t] = total_conn_cap_MW - ycap_var
-                    
+                # flexible_load_P + curt = baseline
+                model.addConstr(flexible_load_P_vars[t][bus] + flex_curt_vars[t][bus] == baseline_tb,
+                                name=f"flex_curt_balance_t{t}_b{bus}")
+                model.addConstr(flexible_load_Q_vars[t][bus] == flexible_load_P_vars[t][bus] * qfactor_household,
+                                name=f"flex_Q_pf_t{t}_b{bus}")
+            # Aggregate y_cap(t)
+            model.addConstr(gp.quicksum(flex_curt_vars[t][b] for b in flexible_load_buses) == ycap_vars[t],
+                            name=f"flex_ycap_agg_t{t}")
+            if bool(DEBUG_PRINT_FLEX_DIAGNOSTICS):
+                served_expr = gp.quicksum(flexible_load_P_vars[t][b] for b in flexible_load_buses)
+                baseline_sum = sum(float(flexible_time_synchronized_loads_P[t].get(b, 0.0)) for b in flexible_load_buses)
+                globals().setdefault('diag_flex_served', {})[t] = served_expr
+                globals().setdefault('diag_flex_base', {})[t] = baseline_sum
 
 
         # Power injection vector P
@@ -2746,18 +2734,21 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     else:
         baseline_bess_cost = 0
     pv_curtail_cost = gp.quicksum(electricity_price[t] * curtailment_vars[t][bus] * dt_hours for bus in pv_buses for t in time_steps) if len(pv_buses) > 0 else 0
-    flex_capacity_cost = C_CAP_EUR_PER_MW_H * ycap_var * dt_hours * len(time_steps)
+    # (Removed old single-variable capacity cost)
+    # Per-period capacity cost (interpret C_CAP_EUR_PER_MW as EUR per MW-hour): multiply by dt_hours
+    total_horizon_hours = dt_hours * len(time_steps)
+    flex_capacity_cost = 0
+    # Curtailment cost: penalty * y_cap(t)
+    if len(ycap_vars) > 0 and CURT_PENALTY_EUR_PER_MW != 0:
+        if APPLY_DT_TO_CURT_COST:
+            flex_curtail_cost = CURT_PENALTY_EUR_PER_MW * gp.quicksum(ycap_vars[t] * dt_hours for t in ycap_vars)
+        else:
+            flex_curtail_cost = CURT_PENALTY_EUR_PER_MW * gp.quicksum(ycap_vars[t] for t in ycap_vars)
+    else:
+        flex_curtail_cost = 0
     # Shedding cost: shed_vars[t] is a tupledict (per-bus shedding vars) — must sum its values.
     # Previous code attempted: float * tupledict -> TypeError. We expand explicitly.
-    if C_SHED_EUR_PER_MW_H != 0 and len(shed_vars) > 0:
-        shed_cost = gp.quicksum(
-            C_SHED_EUR_PER_MW_H * v * dt_hours
-            for t in time_steps
-            for v in (shed_vars[t].values() if isinstance(shed_vars[t], gp.tupledict) else (
-                shed_vars[t].values() if hasattr(shed_vars[t], 'values') else []))
-        )
-    else:
-        shed_cost = 0
+    shed_cost = 0
 
     # New: first-stage capacity and RT proxy costs for robust policies (only if enabled)
     if ENABLE_RT_POLICIES:
@@ -2777,7 +2768,9 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         bess_rt_proxy_cost = 0
 
     # Objective: Minimize total cost (import, export, and curtailment costs)
-    total_cost = electricity_cost + bess_cost + baseline_bess_cost + flex_capacity_cost + pv_curtail_cost + shed_cost
+    # Utility (negative cost) for serving flexible load: sum_t VALUE_OF_SERVED_LOAD * served_energy_t
+    # Paper model: no artificial served utility
+    total_cost = electricity_cost + bess_cost + baseline_bess_cost + flex_capacity_cost + pv_curtail_cost + shed_cost + flex_curtail_cost
     total_cost += cap_cost + imb_proxy_cost + pv_curt_proxy_cost + bess_rt_proxy_cost
     model.setObjective(total_cost, GRB.MINIMIZE)
 
@@ -3114,18 +3107,15 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
 
         # Derive flexible connection capacity (y_cap) cost and shedding cost
         try:
-            capacity_cost_value = C_CAP_EUR_PER_MW_H * (ycap_var.X if ('ycap_var' in locals() and ycap_var is not None) else 0.0) * dt_hours * len(time_steps)
+            capacity_cost_value = 0.0
         except Exception:
             capacity_cost_value = None
         # Aggregate shedding over all buses/time (power MW per period -> energy MWh via dt_hours in cost)
         try:
             total_shed_power_sum = 0.0  # sum of MW over periods (will multiply by dt_hours for energy-based cost)
-            for t in time_steps:
-                if t in shed_vars and hasattr(shed_vars[t], 'values'):
-                    for v in shed_vars[t].values():
-                        total_shed_power_sum += getattr(v, 'X', 0.0)
-            shed_cost_value = C_SHED_EUR_PER_MW_H * total_shed_power_sum * dt_hours
-            avg_shed_mw = total_shed_power_sum / len(time_steps) if len(time_steps) else 0.0
+            total_shed_power_sum = 0.0
+            shed_cost_value = 0.0
+            avg_shed_mw = 0.0
         except Exception:
             shed_cost_value = None
             total_shed_power_sum = None
@@ -3134,12 +3124,29 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         print("\nCOST BREAKDOWN:")
         print(f"  electricity_cost = {electricity_cost_value}")
         print(f"  bess_cost = {bess_cost_value}")
-        print(f"  flex_capacity_cost (y_cap) = {capacity_cost_value}")
-        print(f"  shed_cost = {shed_cost_value}")
+        # Legacy capacity purchase removed; exclude from breakdown. Keeping a line for clarity.
+        print(f"  flex_capacity_cost (removed) = {capacity_cost_value}")
+        # No served load utility printed (paper model)
+        print(f"  shed_cost = {shed_cost_value} (no shedding model)")
+        # Compute realized curtailment cost
         try:
-            if 'ycurt_vars' in locals() and ycurt_vars:
-                total_curt = sum(v.X for v in ycurt_vars.values())
-                avg_curt = total_curt / len(ycurt_vars)
+            if len(ycap_vars) > 0:
+                ycap_vals = [ycap_vars[t].X for t in ycap_vars]
+                if APPLY_DT_TO_CURT_COST:
+                    curtailment_cost_val = CURT_PENALTY_EUR_PER_MW * sum(v * dt_hours for v in ycap_vals)
+                else:
+                    curtailment_cost_val = CURT_PENALTY_EUR_PER_MW * sum(ycap_vals)
+            else:
+                curtailment_cost_val = 0.0
+        except Exception:
+            curtailment_cost_val = None
+        print(f"  flex_curtail_cost = {curtailment_cost_val}")
+        # Updated curtailment metrics based on ycap_vars (aggregate per-period curtailed MW).
+        try:
+            if ycap_vars:
+                ycap_vals = [ycap_vars[t].X for t in sorted(ycap_vars.keys())]
+                total_curt = float(sum(ycap_vals))
+                avg_curt = total_curt / len(ycap_vals) if ycap_vals else 0.0
             else:
                 total_curt = 0.0
                 avg_curt = 0.0
@@ -3148,8 +3155,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             avg_curt = None
         print(f"  total_curtailment_mw = {total_curt}")
         print(f"  avg_curtailment_mw = {avg_curt}")
-        print(f"  total_shed_power_sum_mw_periods = {total_shed_power_sum}")
-        print(f"  avg_shed_mw = {avg_shed_mw}")
+        print(f"  total_shed_power_sum_mw_periods = 0.0 (no shedding)")
+        print(f"  avg_shed_mw = 0.0")
         print(f"  pv_curtail_cost = {pv_curtail_cost_value}")
         if ENABLE_RT_POLICIES:
             try:
@@ -3191,8 +3198,17 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         except Exception:
             base_total_recomputed = base_total_value  # fallback
         if ENABLE_RT_POLICIES:
+            # Recompute grand total including RT proxies based on the updated base (which now includes capacity & shedding)
+            try:
+                grand_total_recomputed = None
+                if base_total_recomputed is not None and \
+                   'imb_proxy_cost_value' in locals() and 'pv_curt_proxy_cost_value' in locals() and 'bess_rt_proxy_cost_value' in locals() and \
+                   None not in (imb_proxy_cost_value, pv_curt_proxy_cost_value, bess_rt_proxy_cost_value):
+                    grand_total_recomputed = base_total_recomputed + imb_proxy_cost_value + pv_curt_proxy_cost_value + bess_rt_proxy_cost_value
+            except Exception:
+                grand_total_recomputed = None
             print(f"  total_cost_base (no RT proxies) = {base_total_recomputed}")
-            print(f"  total_cost_with_rt_proxies = {grand_total_value if grand_total_value is not None else 'N/A'}")
+            print(f"  total_cost_with_rt_proxies = {grand_total_recomputed if grand_total_recomputed is not None else 'N/A'}")
         else:
             print(f"  total_cost (components sum or model.ObjVal) = {base_total_recomputed if base_total_recomputed is not None else model.ObjVal}")
         try:
@@ -3200,15 +3216,19 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         except Exception:
             pass
         # Diagnostics for flexible capacity cap (print first few periods)
-        if bool(DEBUG_PRINT_FLEX_DIAGNOSTICS) and 'diag_sum_flex' in globals() and 'diag_cap_rhs' in globals():
+        if bool(DEBUG_PRINT_FLEX_DIAGNOSTICS) and 'diag_sum_flex' in globals():
             try:
-                print("\n[DIAG] Aggregated flexible capacity usage (first periods):")
-                for t in sorted(diag_sum_flex.keys())[:MAX_FLEX_DIAG_PERIODS]:
-                    rhs_val = (11.0/1000.0 * len(flexible_load_buses)) - (ycap_var.X if ("ycap_var" in locals() and ycap_var is not None) else 0.0)
-                    print(f"   t={t} sum_flex≈{diag_sum_flex[t].getValue():.5f} MW  cap_rhs≈{rhs_val:.5f} MW")
-                # Provide min/max across horizon
-                sum_vals = [diag_sum_flex[t].getValue() for t in diag_sum_flex]
-                print(f"[DIAG] sum_flex_min={min(sum_vals):.5f} max={max(sum_vals):.5f}")
+                print("\n[DIAG] Flexible load curtailment summary (ALL periods):")
+                if 'diag_flex_served' in globals() and 'diag_flex_base' in globals():
+                    for t in sorted(diag_flex_served.keys()):
+                        served = diag_flex_served[t].getValue()
+                        baseline_sum = diag_flex_base[t]
+                        curtailed = baseline_sum - served
+                        ycap_t = ycap_vars[t].X if t in ycap_vars else 0.0
+                        print(f"   t={t} baseline={baseline_sum:.5f} served={served:.5f} curt={curtailed:.5f} y_cap={ycap_t:.5f}")
+                    served_vals = [diag_flex_served[t].getValue() for t in diag_flex_served]
+                    base_vals = [diag_flex_base[t] for t in diag_flex_base]
+                    print(f"[DIAG] served_min={min(served_vals):.5f} served_max={max(served_vals):.5f} baseline_max={max(base_vals):.5f}")
             except Exception as _e:
                 print(f"[DIAG] Flex diagnostics failed: {_e}")
         print(f"✓ MULTI-PERIOD OPTIMIZATION SUCCESSFUL!")
@@ -3341,6 +3361,47 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 col_name_d = f'bess_discharge_bus_{bus}_mw'
                 results_data[col_name_d] = [results['bess_discharge'][t].get(bus, 0.0) if t in results['bess_discharge'] else 0.0 for t in time_steps]
 
+        # ------------------------------------------------------------------
+        # Derived baseline net injections (per bus P/Q) for v3 reconstruction
+        # Sign convention: positive = net injection (generation), negative = net consumption.
+        try:
+            import math as _math
+            for bus in net.bus.index:
+                pv_sched_series = []
+                if 'const_pv' in globals():
+                    for t in time_steps:
+                        pv_sched_series.append(float(base_pv_bus_limits.get(bus, 0.0)) * float(const_pv[t]))
+                else:
+                    pv_sched_series = [0.0]*len(time_steps)
+                flex_p = results_data.get(f'load_flex_p_bus_{bus}_mw', [0.0]*len(time_steps))
+                nonflex_p = results_data.get(f'load_nonflex_p_bus_{bus}_mw', [0.0]*len(time_steps))
+                hp_p = [results.get('p_hp', {}).get(t, {}).get(bus, 0.0) for t in time_steps]
+                bess_dis = results_data.get(f'bess_discharge_bus_{bus}_mw', [0.0]*len(time_steps))
+                bess_chg = results_data.get(f'bess_charge_bus_{bus}_mw', [0.0]*len(time_steps))
+                net_p_list = []
+                for k in range(len(time_steps)):
+                    p_gen = pv_sched_series[k] + bess_dis[k]
+                    p_load = flex_p[k] + nonflex_p[k] + hp_p[k] + bess_chg[k]
+                    net_p_list.append(p_gen - p_load)
+                results_data[f'baseline_net_p_bus_{bus}_mw'] = net_p_list
+                flex_q = results_data.get(f'load_flex_q_bus_{bus}_mvar', [0.0]*len(time_steps))
+                nonflex_q = results_data.get(f'load_nonflex_q_bus_{bus}_mvar', [0.0]*len(time_steps))
+                net_q_list = []
+                for k in range(len(time_steps)):
+                    q_load = flex_q[k] + nonflex_q[k]
+                    net_q_list.append(-q_load)  # assume PV/BESS Q ≈ 0
+                results_data[f'baseline_net_q_bus_{bus}_mvar'] = net_q_list
+        except Exception:
+            pass
+
+        # Serialize downstream_map for reuse (if available)
+        try:
+            import json as _json
+            _dmap_json = _json.dumps({int(k): [int(c) for c in v] for k, v in downstream_map.items()}) if 'downstream_map' in locals() else ""
+            results_data['meta_downstream_map_json'] = [_dmap_json] * len(time_steps)
+        except Exception:
+            pass
+
         results_df = pd.DataFrame(results_data)
         # Attach metadata columns for full self-containment (repeat per row)
         try:
@@ -3471,34 +3532,69 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                     pass
                 results_df['D_plus_max_mw'] = [D_plus_max[t] for t in time_steps]
                 results_df['D_minus_max_mw'] = [D_minus_max[t] for t in time_steps]
-                # Also expose DA aggregated flexible curtailment to verify the tie to y_cap
-                results_df['ycap_mw'] = [ycap_var.x if ("ycap_var" in locals() and ycap_var is not None) else 0.0 for _ in time_steps]
-                # Baseline flexible (time-synchronized) loads per bus (MW & kW)
+                # Expose single day-wide purchased curtailment capacity ycap_day (MW)
+                try:
+                    results_df['ycap_day_mw'] = [ycap_var.X if ycap_var is not None else 0.0 for _ in time_steps]
+                except Exception:
+                    results_df['ycap_day_mw'] = [0.0 for _ in time_steps]
+                # Batch-build baseline, realized, and curtailment columns to avoid fragmentation.
                 try:
                     baseline_flex_dict = globals().get('flexible_time_synchronized_loads_P', {})
-                    if baseline_flex_dict:
-                        all_buses = set()
-                        for tmap in baseline_flex_dict.values():
-                            all_buses.update(tmap.keys())
-                        buses_sorted = sorted(list(all_buses))
-                        for bus in buses_sorted:
-                            series_mw = []
-                            for t in time_steps:
-                                v = 0.0
-                                if t in baseline_flex_dict and bus in baseline_flex_dict[t]:
-                                    v = float(baseline_flex_dict[t][bus])
-                                series_mw.append(v)
-                            results_df[f'baseline_flex_bus_{bus}_mw'] = series_mw
-                            results_df[f'baseline_flex_bus_{bus}_kw'] = [val * 1000.0 for val in series_mw]
-                except Exception as _baseline_export_err:
-                    print(f"WARNING: baseline flex export failed: {_baseline_export_err}")
-                # Per-bus flexible load realized power (MW) — flat columns for plotting (unaggregated)
-                try:
-                    for bus in flexible_load_buses:
-                        col_name = f'flex_load_bus_{bus}_mw'
-                        results_df[col_name] = [flexible_load_P_vars[t][bus].x if (t in flexible_load_P_vars and bus in flexible_load_P_vars[t]) else 0.0 for t in time_steps]
-                except Exception:
-                    pass
+                    all_buses = set()
+                    for tmap in baseline_flex_dict.values():
+                        all_buses.update(tmap.keys())
+                    # Include any bus that appeared in variables even if baseline missing (unlikely but safe)
+                    all_buses.update(flexible_load_buses)
+                    buses_sorted = sorted(all_buses)
+
+                    # Precompute per-bus series
+                    baseline_cols = {}
+                    realized_cols = {}
+                    curtail_cols = {}
+                    for bus in buses_sorted:
+                        baseline_series = []
+                        realized_series = []
+                        curt_series = []
+                        for t in time_steps:
+                            base_v = 0.0
+                            if t in baseline_flex_dict and bus in baseline_flex_dict[t]:
+                                base_v = float(baseline_flex_dict[t][bus])
+                            # realized flexible load
+                            if (t in flexible_load_P_vars) and (bus in flexible_load_P_vars[t]):
+                                real_v = flexible_load_P_vars[t][bus].x
+                            else:
+                                real_v = 0.0
+                            # curtailment variable (if exists for that t,b)
+                            if t in flex_curt_vars and bus in flex_curt_vars[t]:
+                                curt_v = flex_curt_vars[t][bus].X
+                            else:
+                                # Derive as baseline - realized if explicit variable missing
+                                curt_v = max(base_v - real_v, 0.0)
+                            baseline_series.append(base_v)
+                            realized_series.append(real_v)
+                            curt_series.append(curt_v)
+                        baseline_cols[f'baseline_flex_bus_{bus}_mw'] = baseline_series
+                        baseline_cols[f'baseline_flex_bus_{bus}_kw'] = [v * 1000.0 for v in baseline_series]
+                        realized_cols[f'flex_load_bus_{bus}_mw'] = realized_series
+                        curtail_cols[f'curt_bus_{bus}_mw'] = curt_series
+
+                    # Aggregate ycap per timestep
+                    try:
+                        results_df['ycap_mw'] = [ycap_vars[t].X if t in ycap_vars else 0.0 for t in time_steps]
+                    except Exception:
+                        results_df['ycap_mw'] = [0.0 for _ in time_steps]
+
+                    # Concatenate once to minimize fragmentation
+                    import pandas as _pd
+                    batch_df = _pd.DataFrame({**baseline_cols, **realized_cols, **curtail_cols})
+                    # Merge in one operation; align on index (time_steps order)
+                    results_df = _pd.concat([results_df, batch_df], axis=1)
+                    # De-fragment by creating a compact copy
+                    results_df = results_df.copy()
+                    # Reassign to outer scope (since we replaced the object)
+                    globals()['results_df'] = results_df
+                except Exception as _flex_export_err:
+                    print(f"WARNING: flex export failed: {_flex_export_err}")
         except Exception:
             pass
         

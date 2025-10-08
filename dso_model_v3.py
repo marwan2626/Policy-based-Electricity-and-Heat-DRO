@@ -694,6 +694,78 @@ def main() -> None:
 
     # Build network and matrices once
     net = create_network_from_csv()
+
+    # --- Stage 2 Option A network reconstruction data ---
+    # Parse downstream map from v2 export if present; otherwise rebuild later.
+    downstream_map_json = df.get('meta_downstream_map_json')
+    downstream_map: Dict[int, List[int]] = {}
+    if downstream_map_json is not None:
+        try:
+            import json as _json
+            raw = downstream_map_json.iloc[0] if hasattr(downstream_map_json, 'iloc') else None
+            if isinstance(raw, str) and raw.strip():
+                parsed = _json.loads(raw)
+                downstream_map = {int(k): [int(c) for c in v] for k, v in parsed.items()}
+        except Exception:
+            downstream_map = {}
+    # Build parent map (single parent per bus for radial assumption)
+    parent_map: Dict[int, int] = {}
+    if downstream_map:
+        for p, children in downstream_map.items():
+            for c in children:
+                parent_map[c] = p
+
+    # Extract baseline net P/Q injections per bus if available
+    baseline_net_p: Dict[int, np.ndarray] = {}
+    baseline_net_q: Dict[int, np.ndarray] = {}
+    bus_indices = list(net.bus.index)
+    for bus in bus_indices:
+        colP = f'baseline_net_p_bus_{bus}_mw'
+        colQ = f'baseline_net_q_bus_{bus}_mvar'
+        if colP in df.columns:
+            baseline_net_p[bus] = df[colP].to_numpy(dtype=float)
+        if colQ in df.columns:
+            baseline_net_q[bus] = df[colQ].to_numpy(dtype=float)
+
+    # Fallback: if downstream_map missing we will reconstruct later when Option A engine is finalized.
+    def _build_downstream_from_lines() -> Dict[int, List[int]]:
+        dm: Dict[int, List[int]] = {int(b): [] for b in net.bus.index}
+        try:
+            # Assume radial: each line defines from_bus -> to_bus direction consistent with CSV; adopt that as parent->child
+            for line in net.line.itertuples():
+                fb = int(line.from_bus); tb = int(line.to_bus)
+                dm[fb].append(tb)
+            # Include transformers (hv -> lv)
+            for tr in net.trafo.itertuples():
+                hv = int(tr.hv_bus); lv = int(tr.lv_bus)
+                dm[hv].append(lv)
+        except Exception:
+            pass
+        return dm
+    if not downstream_map:
+        downstream_map = _build_downstream_from_lines()
+        parent_map = {c: p for p, ch in downstream_map.items() for c in ch}
+
+    # Prepare post-order (children first) traversal order for accumulation (leaves have no children)
+    post_order = sorted(downstream_map.keys(), key=lambda b: len(downstream_map[b]))
+
+    def accumulate_flows(P_inj: np.ndarray, Q_inj: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Accumulate downstream injections to obtain per-bus apparent power parents see.
+
+        P_inj/Q_inj: arrays indexed by bus index order net.bus.index
+        Returns (P_accum, Q_accum) arrays same shape.
+        """
+        P_acc = P_inj.copy(); Q_acc = Q_inj.copy()
+        # Walk buses in order of increasing subtree size (leaves first), propagate up one level to parent
+        for b in post_order:
+            if b in parent_map:
+                p = parent_map[b]
+                P_acc[p] += P_acc[b]
+                Q_acc[p] += Q_acc[b]
+        return P_acc, Q_acc
+
+    # (Deferred) Integration: Later we will replace admittance-based flow calc with accumulate_flows using baseline + deviations.
+    # For now we just retain parsed structures for subsequent implementation step.
     slack_bus_index = int(net.ext_grid.bus.iloc[0])
     non_slack_buses = [b for b in net.bus.index if b != slack_bus_index]
     # Build complex Ybus including lines and transformers
