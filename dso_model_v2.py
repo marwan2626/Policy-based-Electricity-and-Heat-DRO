@@ -93,11 +93,11 @@ ENABLE_DRCC_RT_BUDGETS = True  # <--- EDIT ME (uses PV/temperature std to size D
 DRCC_EPSILON = 0.10            # chance violation level; k = sqrt((1-eps)/eps)
 
 # DRCC-based network tightening (transformers, lines, voltages)
-ENABLE_DRCC_NETWORK_TIGHTENING = True  # <--- EDIT ME (base default)
+ENABLE_DRCC_NETWORK_TIGHTENING = False  # <--- EDIT ME (base default)
 # You can selectively toggle sub-components when master is ON
-DRCC_TIGHTEN_TRAFO = True
-DRCC_TIGHTEN_LINES = True
-DRCC_TIGHTEN_VOLTAGES = True
+DRCC_TIGHTEN_TRAFO = False
+DRCC_TIGHTEN_LINES = False
+DRCC_TIGHTEN_VOLTAGES = False
 # Deterministic baseline semantics when DRCC tightening is OFF:
 # True  -> k_epsilon = 0.0 (fully deterministic design: no nominal sigma allowance)
 # False -> k_epsilon = 1.0 (legacy neutral baseline retaining a 1σ allowance without amplification)
@@ -1835,8 +1835,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             sigma_hp = hp_temp_sens * float(T_amb_std[t])
             sigma_net[t] = float(np.sqrt(sigma_pv**2 + sigma_hp**2))
     else:
-    # DRCC tightening disabled: k_epsilon already set (0 strict or 1 neutral). No sigma aggregation needed.
-    print(f"[INFO] DRCC tightening disabled -> baseline mode: {k_source} (k_epsilon={k_epsilon})")
+        # DRCC tightening disabled: k_epsilon already set (0 strict or 1 neutral). No sigma aggregation needed.
+        print(f"[INFO] DRCC tightening disabled -> baseline mode: {k_source} (k_epsilon={k_epsilon})")
 
     # Add variables for each time step
     for t in time_steps:

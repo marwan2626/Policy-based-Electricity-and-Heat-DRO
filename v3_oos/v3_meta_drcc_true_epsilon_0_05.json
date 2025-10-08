@@ -16,6 +16,7 @@
     "v_max_pu",
     "max_line_loading_pct",
     "max_trafo_loading_pct",
+    "max_trafo_loading_pct_optionA",
     "steps_line_over_80pct",
     "steps_trafo_over_80pct",
     "loading_violation_threshold_pct",
@@ -32,7 +33,14 @@
     "rt_bess_cycle_cost_eur",
     "total_cost_eur",
     "sample_id",
-    "n_steps"
+    "n_steps",
+    "flex_baseline_energy_mwh",
+    "flex_realized_energy_mwh",
+    "flex_curtail_energy_mwh",
+    "flex_avg_curtailment_mw",
+    "flex_peak_curtailment_mw",
+    "flex_energy_curtailed_pct",
+    "flex_ycap_energy_mwh"
   ],
   "write_diagnostics": false,
   "rt_cost_factors": {
@@ -44,6 +52,8 @@
   "ignore_hp_residual": false,
   "use_mean_centered_policy": true,
   "trafo_loading_logging": true,
+  "use_optionA_flow": true,
+  "compare_flows": false,
   "rt_residual_basis": "mean_centered",
   "soc_envelope_file": "soc_envelope_drcc_true_epsilon_0_05.csv",
   "policy_coeffs_file": "policy_coeffs_drcc_true_epsilon_0_05.csv",

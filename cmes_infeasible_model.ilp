@@ -3,23 +3,41 @@
 Minimize
  
 Subject To
- P_accumulated_73_35: - pv_gen_73[35] - pv_gen_73[36] - pv_gen_73[37]
-   - pv_gen_73[39] - pv_gen_73[40] - pv_gen_73[41] - pv_gen_73[42]
-   - pv_gen_73[43] + flexible_load_P_73[42] + P_accumulated[73,35]
-   = -0.1760256385421194
- P_send_calc_33: P_branch[73,33] - P_accumulated[73,35] = 0
- S_branch_limit_73_33: [ P_branch[73,33] ^2 + Q_branch[73,33] ^2 ]
+ flex_scale_full_75: flex_scale_75 = 1
+ flex_prop_t75_b39: flexible_load_P_75[39] - 0.011 flex_scale_75 = 0
+ flex_prop_t75_b42: flexible_load_P_75[42] - 0.011 flex_scale_75 = 0
+ flex_prop_t75_b43: flexible_load_P_75[43] - 0.011 flex_scale_75 = 0
+ P_accumulated_75_35: - pv_gen_75[35] - pv_gen_75[36] - pv_gen_75[37]
+   - pv_gen_75[39] - pv_gen_75[40] - pv_gen_75[41] - pv_gen_75[42]
+   - pv_gen_75[43] + flexible_load_P_75[35] + flexible_load_P_75[36]
+   + flexible_load_P_75[37] + flexible_load_P_75[39]
+   + flexible_load_P_75[40] + flexible_load_P_75[41]
+   + flexible_load_P_75[42] + flexible_load_P_75[43] + P_accumulated[75,35]
+   = -0.1154225982945495
+ Q_accumulated_75_35: flexible_load_Q_75[35] + flexible_load_Q_75[36]
+   + flexible_load_Q_75[37] + flexible_load_Q_75[39]
+   + flexible_load_Q_75[40] + flexible_load_Q_75[41]
+   + flexible_load_Q_75[42] + flexible_load_Q_75[43] + Q_accumulated[75,35]
+   = -0.0234375582165879
+ P_send_calc_33: P_branch[75,33] - P_accumulated[75,35] = 0
+ Q_send_calc_33: Q_branch[75,33] - Q_accumulated[75,35] = 0
+ S_branch_limit_75_33: [ P_branch[75,33] ^2 + Q_branch[75,33] ^2 ]
    <= 0.02239488
 Bounds
- -infinity <= pv_gen_73[35] <= 0
- -infinity <= pv_gen_73[36] <= 0
- -infinity <= pv_gen_73[37] <= 0
- -infinity <= pv_gen_73[39] <= 0
- -infinity <= pv_gen_73[40] <= 0
- -infinity <= pv_gen_73[41] <= 0
- -infinity <= pv_gen_73[42] <= 0
- -infinity <= pv_gen_73[43] <= 0
- P_branch[73,33] free
- Q_branch[73,33] free
- P_accumulated[73,35] free
+ -infinity <= pv_gen_75[35] <= 0
+ -infinity <= pv_gen_75[36] <= 0
+ -infinity <= pv_gen_75[37] <= 0
+ -infinity <= pv_gen_75[39] <= 0
+ -infinity <= pv_gen_75[40] <= 0
+ -infinity <= pv_gen_75[41] <= 0
+ -infinity <= pv_gen_75[42] <= 0
+ -infinity <= pv_gen_75[43] <= 0
+ flexible_load_P_75[39] free
+ flexible_load_P_75[42] free
+ flexible_load_P_75[43] free
+ P_branch[75,33] free
+ Q_branch[75,33] free
+ P_accumulated[75,35] free
+ Q_accumulated[75,35] free
+ flex_scale_75 free
 End

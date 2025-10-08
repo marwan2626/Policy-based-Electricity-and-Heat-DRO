@@ -1,0 +1,35 @@
+IIS Constraints:
+flex_scale_full_75
+flex_prop_t75_b39
+flex_prop_t75_b42
+flex_prop_t75_b43
+P_accumulated_75_35
+Q_accumulated_75_35
+P_send_calc_33
+Q_send_calc_33
+
+IIS Quad Constraints:
+S_branch_limit_75_33
+
+IIS Variable Bounds:
+pv_gen_75[35]
+pv_gen_75[36]
+pv_gen_75[37]
+pv_gen_75[39]
+pv_gen_75[40]
+pv_gen_75[41]
+pv_gen_75[42]
+pv_gen_75[43]
+flexible_load_P_75[35]
+flexible_load_P_75[36]
+flexible_load_P_75[37]
+flexible_load_P_75[40]
+flexible_load_P_75[41]
+flexible_load_Q_75[35]
+flexible_load_Q_75[36]
+flexible_load_Q_75[37]
+flexible_load_Q_75[39]
+flexible_load_Q_75[40]
+flexible_load_Q_75[41]
+flexible_load_Q_75[42]
+flexible_load_Q_75[43]
