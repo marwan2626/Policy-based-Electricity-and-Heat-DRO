@@ -64,7 +64,7 @@ OUTDIR: str = "v3_oos"
 LOADING_VIOLATION_THRESHOLD_PCT: float = 80.0
 
 # Phase 1: Use mean-centered residual for policy activation (instead of schedule-referenced residual)
-USE_MEAN_CENTERED_POLICY: bool = True
+USE_MEAN_CENTERED_POLICY: bool = True  # set False to use schedule-based residual directly
 
 # Logging of transformer loading distributions (for CVaR / tail risk analysis)
 LOG_TRAFO_LOADING: bool = True  # set True to enable logging
@@ -494,6 +494,28 @@ def main() -> None:
     pv_ts = pd.to_datetime(pv_df['timestamp'])
     hp_ts = pd.to_datetime(hp_df['timestamp'])
     sample_index = pd.DatetimeIndex(sorted(set(temp_ts) & set(pv_ts) & set(hp_ts)))
+
+    # --- Runtime overrides for mean-centering flag ---
+    # Priority order: command-line arg > environment variable > user config above.
+    # CLI usage examples (optional):
+    #   python dso_model_v3.py --mean-centered
+    #   python dso_model_v3.py --schedule-residual
+    import sys as _sys
+    global USE_MEAN_CENTERED_POLICY  # make explicit we may override the module-level setting
+    if any(arg in ('--mean-centered', '--mean_centered') for arg in _sys.argv[1:]):
+        USE_MEAN_CENTERED_POLICY = True
+    elif any(arg in ('--schedule-residual', '--schedule_residual', '--no-mean-centered') for arg in _sys.argv[1:]):
+        USE_MEAN_CENTERED_POLICY = False
+    else:
+        env_flag = os.getenv('V3_USE_MEAN_CENTERED')  # '1','true','yes' => True; '0','false','no' => False
+        if env_flag is not None:
+            val = env_flag.strip().lower()
+            if val in ('1','true','t','yes','y'):  # truthy
+                USE_MEAN_CENTERED_POLICY = True
+            elif val in ('0','false','f','no','n'):  # falsy
+                USE_MEAN_CENTERED_POLICY = False
+
+    print(f"[config] USE_MEAN_CENTERED_POLICY = {USE_MEAN_CENTERED_POLICY} | residual basis = {'mean_centered' if USE_MEAN_CENTERED_POLICY else 'schedule'}")
 
     # Fix v2 timeline if needed
     index = df.index
