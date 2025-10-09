@@ -364,13 +364,14 @@ def main() -> None:
     violation_threshold_pct = float(threshold_candidates[0]) if threshold_candidates else 80.0
     print(f"[INFO] Using transformer violation threshold = {violation_threshold_pct:.0f}% for plots.")
 
-    # New condensed overview: 5 panels
+    # New condensed overview: 6 panels
     # 0: RT imbalance cost (already simplified earlier)
     # 1: DA import cost
     # 2: Transformer violation steps
     # 3: Transformer violation probability
     # 4: Boxplot of transformer loading distribution (per-timestep max loading across trafos per trajectory)
-    fig, axes = plt.subplots(1, 5, figsize=(34, 4.2), constrained_layout=True)
+    # 5: Violin plot of the same distribution (requested)
+    fig, axes = plt.subplots(1, 6, figsize=(40, 4.2), constrained_layout=True)
     x = np.arange(len(rt_summary))
     width = 0.6
 
@@ -497,6 +498,39 @@ def main() -> None:
                 ax_box.text(i, np.nanmedian(dist)+1.0, f"{np.nanmedian(dist):.1f}", ha='center', va='bottom', fontsize=7)
     except Exception:
         pass
+
+    # 5. Violin plot (same underlying distributions)
+    ax_vio = axes[5]
+    # Filter out non-finite values per group
+    violin_data: List[np.ndarray] = []
+    violin_positions: List[int] = []
+    violin_labels: List[str] = []
+    for i, (lab, dist) in enumerate(zip(labels_box, distributions), start=1):
+        vals = dist[np.isfinite(dist)] if isinstance(dist, np.ndarray) else np.array([])
+        if vals.size > 0:
+            violin_data.append(vals)
+            violin_positions.append(i)
+            violin_labels.append(lab)
+    if violin_data:
+        parts = ax_vio.violinplot(violin_data, positions=violin_positions, showmeans=False, showmedians=True, showextrema=False)
+        # Style violins
+        for pc in parts['bodies']:
+            pc.set_facecolor('#b2df8a')
+            pc.set_edgecolor('#1b7837')
+            pc.set_alpha(0.6)
+        if 'cmedians' in parts:
+            parts['cmedians'].set_color('#1b7837')
+        ax_vio.set_xticks(violin_positions)
+        ax_vio.set_xticklabels(violin_labels)
+    else:
+        # No data available: show placeholder
+        ax_vio.text(0.5, 0.5, 'No transformer loading data', ha='center', va='center', transform=ax_vio.transAxes, fontsize=9, color='gray')
+        ax_vio.set_xticks(range(1, len(labels_box)+1))
+        ax_vio.set_xticklabels(labels_box)
+    ax_vio.set_ylabel('Transformer loading %')
+    ax_vio.set_xlabel('epsilon / mode')
+    ax_vio.set_title('Transformer loading (violin)')
+    ax_vio.grid(axis='y', alpha=0.3)
 
     out_path = os.path.join(RESULTS_DIR, OUT_FIG)
     fig.savefig(out_path, dpi=150)
