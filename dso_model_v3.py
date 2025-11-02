@@ -36,17 +36,22 @@ import pandas as pd
 # ===========================
 # Epsilon used in the v2 filename suffix: dso_model_v2_results_drcc_true_epsilon_{EPSILON_TOKEN}.csv
 # The token uses two decimals with underscore as decimal separator, e.g., 0.05 -> "0_05"
-EPSILON: float = 0.30
+EPSILON: float = 0.10
 # When running the deterministic (no DRCC tightening) case, set RUN_DRCC_FALSE = True.
 # In that mode we ignore EPSILON for locating the v2 results CSV and instead look for
 # files named like: dso_model_v2_results_drcc_false*.csv
-RUN_DRCC_FALSE: bool = True
+RUN_DRCC_FALSE: bool = False
 
 # If RESULTS_CSV is None, we'll try to find a file named with the epsilon token in the current folder.
 RESULTS_CSV: Optional[str] = None
 
 # Directory containing consolidated samples from generate_samples.py
 SAMPLES_DIR: str = "samples"
+
+# Sample distribution selector: "gaussian" (default), "uniform", "contaminated", or "studentt".
+# Controls which sample files to load (expects suffix _gaussian, _uniform, _contaminated, or _studentt written by generate_samples.py)
+# and which output directory to use (v3_oos, v3_oos_uniform, v3_oos_contaminated, or v3_oos_studentt).
+SAMPLE_DISTRIBUTION: str = "studentt"
 
 # Limit number of trajectories (sample_id) for a quick run. None means evaluate all.
 MAX_TRAJ: Optional[int] = None
@@ -57,7 +62,7 @@ IGNORE_HP_RESIDUAL: bool = False
 # Write per-trajectory time series diagnostics (large files). Disabled by default.
 WRITE_DIAGNOSTICS: bool = False
 
-# Output directory for v3 results
+# Output directory for v3 results (derived below based on SAMPLE_DISTRIBUTION; can be overridden later)
 OUTDIR: str = "v3_oos"
 
 # Threshold (in percent) above which a line or transformer loading counts as a violation step
@@ -110,6 +115,11 @@ LOAD_LOAD_VALUES_FROM_V2: bool = True
 # and inject (discharge - charge) as the baseline BESS power prior to adding the affine recourse delta.
 # Recourse delta is still distributed by capacity share. Missing columns default to zero.
 REPLAY_V2_BESS_SCHEDULE: bool = True
+
+# Align OOS stochastic structure with v2 DRCC tightening assumptions
+# - Inject an additional HP temperature noise from HDD variance (per-interval), sized as in v2
+# - Rescale aggregate HP residual so its std matches the v2 aggregate residual std
+MATCH_DRCC_HP_SCALING: bool = True
 
 
 # ===========================
@@ -184,14 +194,62 @@ def _load_v2_results(path: str) -> pd.DataFrame:
 
 
 def _load_samples(samples_dir: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    # Temperature (long)
-    temp_path = os.path.join(samples_dir, 'samples_temperature_c.csv')
-    pv_path = os.path.join(samples_dir, 'samples_pv.csv')
-    hp_path = os.path.join(samples_dir, 'samples_hp_residual.csv')
-    if not (os.path.exists(temp_path) and os.path.exists(pv_path) and os.path.exists(hp_path)):
-        raise FileNotFoundError(
-            f"Missing sample files in {samples_dir}. Expected samples_temperature_c.csv, samples_pv.csv, samples_hp_residual.csv"
+    """Load consolidated samples according to selected distribution.
+
+    Behavior:
+    - uniform: requires files with suffix _uniform (fail loudly if missing)
+    - gaussian: prefers files with suffix _gaussian; if not present, falls back to legacy unsuffixed names
+    """
+    dist = (SAMPLE_DISTRIBUTION or "gaussian").strip().lower()
+    if dist not in {"gaussian", "uniform", "contaminated", "studentt"}:
+        raise ValueError(f"Unsupported SAMPLE_DISTRIBUTION '{SAMPLE_DISTRIBUTION}'. Use 'gaussian', 'uniform', 'contaminated', or 'studentt'.")
+
+    # Build candidate paths
+    def _paths_with_suffix(suffix: str) -> Tuple[str, str, str]:
+        return (
+            os.path.join(samples_dir, f'samples_temperature_c{suffix}.csv'),
+            os.path.join(samples_dir, f'samples_pv{suffix}.csv'),
+            os.path.join(samples_dir, f'samples_hp_residual{suffix}.csv'),
         )
+
+    def _paths_legacy() -> Tuple[str, str, str]:
+        return (
+            os.path.join(samples_dir, 'samples_temperature_c.csv'),
+            os.path.join(samples_dir, 'samples_pv.csv'),
+            os.path.join(samples_dir, 'samples_hp_residual.csv'),
+        )
+
+    if dist == 'uniform':
+        temp_path, pv_path, hp_path = _paths_with_suffix('_uniform')
+        if not (os.path.exists(temp_path) and os.path.exists(pv_path) and os.path.exists(hp_path)):
+            raise FileNotFoundError(
+                "Uniform mode selected but missing sample files. Expected files with suffix '_uniform' in "
+                f"{samples_dir}: samples_temperature_c_uniform.csv, samples_pv_uniform.csv, samples_hp_residual_uniform.csv"
+            )
+    elif dist == 'contaminated':
+        temp_path, pv_path, hp_path = _paths_with_suffix('_contaminated')
+        if not (os.path.exists(temp_path) and os.path.exists(pv_path) and os.path.exists(hp_path)):
+            raise FileNotFoundError(
+                "Contaminated mode selected but missing sample files. Expected files with suffix '_contaminated' in "
+                f"{samples_dir}: samples_temperature_c_contaminated.csv, samples_pv_contaminated.csv, samples_hp_residual_contaminated.csv"
+            )
+    elif dist == 'studentt':
+        temp_path, pv_path, hp_path = _paths_with_suffix('_studentt')
+        if not (os.path.exists(temp_path) and os.path.exists(pv_path) and os.path.exists(hp_path)):
+            raise FileNotFoundError(
+                "Student-t mode selected but missing sample files. Expected files with suffix '_studentt' in "
+                f"{samples_dir}: samples_temperature_c_studentt.csv, samples_pv_studentt.csv, samples_hp_residual_studentt.csv"
+            )
+    else:  # gaussian
+        temp_path, pv_path, hp_path = _paths_with_suffix('_gaussian')
+        if not (os.path.exists(temp_path) and os.path.exists(pv_path) and os.path.exists(hp_path)):
+            # Fallback to legacy unsuffixed names for backward compatibility
+            temp_path, pv_path, hp_path = _paths_legacy()
+            if not (os.path.exists(temp_path) and os.path.exists(pv_path) and os.path.exists(hp_path)):
+                raise FileNotFoundError(
+                    "Gaussian mode selected but neither suffixed '_gaussian' nor legacy unsuffixed sample files were found in "
+                    f"{samples_dir}. Missing one of: samples_temperature_c_gaussian.csv or samples_temperature_c.csv (and corresponding PV/HP files)."
+                )
 
     temp_df = pd.read_csv(temp_path, parse_dates=['timestamp'])
     pv_df = pd.read_csv(pv_path, parse_dates=['timestamp'])
@@ -208,6 +266,75 @@ def _load_samples_meta(samples_dir: str) -> Optional[Dict[str, object]]:
         except Exception:
             return None
     return None
+
+
+def _compute_hdd_variance(index: pd.DatetimeIndex, df_v2: pd.DataFrame) -> np.ndarray:
+    """Compute Var(HDD_t) per timestep using the same closed-form used in v2.
+
+    HDD_t = max(0, Tbase - T_C_t), with T_C_t ~ N(mu, s^2). We use:
+      - mu from v2 column 'ambient_temp_c' if available; else from temperature_data_complete.csv
+      - s from 'temperature_std_K' (interpreted in Celsius)
+    Var(Y) where Y = max(0, Z) and Z ~ N(delta, s^2) with delta=Tbase-mu is:
+      E[Y]   = s*phi(a) + delta*Phi(a)
+      E[Y^2] = (s^2 + delta^2)*Phi(a) + s*delta*phi(a)
+      Var[Y] = E[Y^2] - (E[Y])^2
+    """
+    if index is None or len(index) == 0:
+        return np.zeros(0, dtype=float)
+    # Try take mu_t from v2 export, else from temperature file (K->C)
+    try:
+        if 'ambient_temp_c' in df_v2.columns:
+            mu_c = pd.to_numeric(df_v2.reindex(index)['ambient_temp_c'], errors='coerce').to_numpy(dtype=float)
+        else:
+            raise KeyError
+    except Exception:
+        temp_path = os.path.join(os.getcwd(), 'temperature_data_complete.csv')
+        if not os.path.exists(temp_path):
+            return np.zeros(len(index), dtype=float)
+        try:
+            temp_df = pd.read_csv(temp_path, parse_dates=['datetime'])
+            temp_df = temp_df.set_index('datetime')
+            mu_k = temp_df.reindex(index)['temperature_K'].to_numpy(dtype=float)
+            mu_c = mu_k - 273.15
+        except Exception:
+            return np.zeros(len(index), dtype=float)
+    # Std per interval from file (Kelvin ~ Celsius difference)
+    temp_path = os.path.join(os.getcwd(), 'temperature_data_complete.csv')
+    if not os.path.exists(temp_path):
+        s_c = np.zeros(len(index), dtype=float)
+    else:
+        try:
+            temp_df2 = pd.read_csv(temp_path, parse_dates=['datetime'])
+            temp_df2 = temp_df2.set_index('datetime')
+            s_c = pd.to_numeric(temp_df2.reindex(index)['temperature_std_K'], errors='coerce').fillna(0.0).to_numpy(dtype=float)
+        except Exception:
+            s_c = np.zeros(len(index), dtype=float)
+    # Parameters
+    Tbase = 10.0  # Celsius
+    delta = Tbase - mu_c  # vector
+    s = np.maximum(0.0, s_c)
+    var = np.zeros(len(index), dtype=float)
+    # Handle zero-variance fast path
+    mask = s > 1e-12
+    if np.any(mask):
+        from math import sqrt, pi, exp
+        # vectorized phi and Phi via numpy
+        a = np.zeros_like(s)
+        a[mask] = delta[mask] / s[mask]
+        # standard normal pdf and cdf
+        phi = (1.0/np.sqrt(2.0*np.pi)) * np.exp(-0.5 * a**2)
+        from scipy.stats import norm  # optional; fallback approx if not available
+        try:
+            Phi = norm.cdf(a)
+        except Exception:
+            # simple erf-based cdf if scipy missing
+            from math import erf
+            Phi = 0.5 * (1.0 + np.vectorize(lambda x: erf(x/np.sqrt(2.0)))(a))
+        EY = s * phi + delta * Phi
+        EY2 = (s**2 + delta**2) * Phi + s * delta * phi
+        var[mask] = np.maximum(0.0, EY2[mask] - EY[mask]**2)
+    # If s==0 use deterministic HDD variance 0
+    return var
 
 
 def _get_bus_ids_from_columns(df: pd.DataFrame, prefix: str, suffix: str) -> List[int]:
@@ -514,6 +641,38 @@ def apply_recourse_for_step(residual: float, v2_row: pd.Series, pv_sched_mw: flo
 
 
 def main() -> None:
+    # --- Resolve distribution and OUTDIR early (CLI/env overrides supported) ---
+    import sys as _sys
+    global SAMPLE_DISTRIBUTION, OUTDIR  # allow overrides of module-level settings
+    argv = list(_sys.argv[1:])
+    # CLI: --dist <gaussian|uniform|contaminated|studentt> or --distribution <...>
+    for flag in ('--dist', '--distribution'):
+        if flag in argv:
+            try:
+                val = argv[argv.index(flag) + 1].strip().lower()
+                if val in ('gaussian','uniform','contaminated','studentt'):
+                    SAMPLE_DISTRIBUTION = val
+                else:
+                    raise ValueError()
+            except Exception:
+                raise ValueError("Provide --dist/--distribution followed by 'gaussian', 'uniform', 'contaminated', or 'studentt'.")
+    # ENV: V3_SAMPLE_DISTRIBUTION
+    env_dist = os.getenv('V3_SAMPLE_DISTRIBUTION')
+    if env_dist:
+        _val = env_dist.strip().lower()
+        if _val in ('gaussian','uniform','contaminated','studentt'):
+            SAMPLE_DISTRIBUTION = _val
+
+    # Derive OUTDIR from distribution unless user kept a custom override by editing code
+    _dist = SAMPLE_DISTRIBUTION.strip().lower()
+    if _dist == 'uniform':
+        OUTDIR = "v3_oos_uniform"
+    elif _dist == 'contaminated':
+        OUTDIR = "v3_oos_contaminated"
+    elif _dist == 'studentt':
+        OUTDIR = "v3_oos_studentt"
+    else:
+        OUTDIR = "v3_oos"
     os.makedirs(OUTDIR, exist_ok=True)
 
     v2_csv = RESULTS_CSV or _infer_v2_csv(EPSILON)
@@ -571,6 +730,7 @@ def main() -> None:
         elif val in ('0','false','f','no','n'):
             USE_MEAN_CENTERED_POLICY = False
 
+    print(f"[config] SAMPLE_DISTRIBUTION = {SAMPLE_DISTRIBUTION} | OUTDIR = {OUTDIR}")
     print(f"[config] USE_MEAN_CENTERED_POLICY = {USE_MEAN_CENTERED_POLICY} | residual basis = {'mean_centered' if USE_MEAN_CENTERED_POLICY else 'schedule'}")
     if VALIDATE_BASELINE_ONLY:
         print("[config] VALIDATE_BASELINE_ONLY = True (will compute baseline transformer loading using Option A accumulation and exit)")
@@ -902,6 +1062,9 @@ def main() -> None:
     else:
         print("[HP-Scaling] No HP devices detected; predictor deviation will be zero.")
 
+    # Precompute Var(HDD_t) per timestep to align HDD uncertainty with v2 DRCC tightening (used if MATCH_DRCC_HP_SCALING)
+    var_HDD_series = _compute_hdd_variance(index, df) if MATCH_DRCC_HP_SCALING else np.zeros(len(index), dtype=float)
+
     # Load mapping for non-flex loads from VDI
     time_index = index
     # Build electrical time series only if not sourcing directly from v2
@@ -1084,8 +1247,8 @@ def main() -> None:
     # Settlement & RT cost factors (DA + imbalance model)
     IMB_UP_FACTOR = 1.3  # premium multiplier for upward imbalance energy (deficit)
     IMB_DN_FACTOR = 1.3  # premium multiplier for downward imbalance energy (surplus absorption)
-    PV_CURT_PRICE_FACTOR = 1.0  # opportunity cost factor for curtailed scheduled PV (if any)
-    BESS_THROUGHPUT_COST_EUR_PER_MWH = 0.5  # optional degradation proxy
+    PV_CURT_PRICE_FACTOR = 1.3  # opportunity cost factor for curtailed scheduled PV (if any)
+    BESS_THROUGHPUT_COST_EUR_PER_MWH = 5.1  # BESS RT Cost
 
     # Day-ahead energy cost (constant across trajectories): only pay for DA scheduled imports
     da_import_mw = np.maximum(base_net_import, 0.0)
@@ -1131,6 +1294,26 @@ def main() -> None:
 
     total = len(sample_ids)
     report_step = max(1, total // 20)  # ~5% steps
+
+    # Prepare a unique transformer loading filename per mode to avoid collisions between deterministic and DRCC runs
+    token_for_files = _epsilon_token(EPSILON)
+    if drcc_mode == 'drcc_false':
+        trafo_loading_filename = 'trafo_loading_raw_drcc_false.parquet'
+    else:
+        trafo_loading_filename = f"{TRAFO_LOADING_FILENAME_PREFIX}{token_for_files}.parquet"
+    trafo_loading_relpath = os.path.join(TRAFO_LOADING_DIR_NAME, trafo_loading_filename)
+
+    # Clear existing parquet once per run to prevent accumulation across runs (but do not clear per trajectory)
+    if LOG_TRAFO_LOADING:
+        try:
+            os.makedirs(os.path.join(OUTDIR, TRAFO_LOADING_DIR_NAME), exist_ok=True)
+            existing_parquet = os.path.join(OUTDIR, trafo_loading_relpath)
+            if os.path.exists(existing_parquet):
+                os.remove(existing_parquet)
+                print(f"[v3] Cleared existing transformer loading log: {existing_parquet}")
+        except Exception as _e_clear:
+            print(f"[WARN] Could not clear existing transformer loading file: {_e_clear}")
+
     for i, sid in enumerate(sample_ids, start=1):
         if i % report_step == 0 or i == 1 or i == total:
             print(f"[v3] processing sample {i}/{total} ({int(100*i/total)}%)...", flush=True)
@@ -1143,7 +1326,15 @@ def main() -> None:
         pv_avail_rt = pv_sid[pv_bus_cols].to_numpy(dtype=float) if pv_bus_cols else np.zeros((len(index), 0))
         hp_resid_rt = hp_sid[hp_resid_cols].to_numpy(dtype=float) if hp_resid_cols else np.zeros((len(index), 0))
         pv_total_rt = pv_avail_rt.sum(axis=1) if pv_avail_rt.size else np.zeros(len(index))
-        hp_resid_total = hp_resid_rt.sum(axis=1) if hp_resid_rt.size else np.zeros(len(index))
+        # Aggregate HP residuals across buses. To match v2 DRCC aggregate std, use mean*sqrt(n) instead of sum when enabled.
+        if hp_resid_rt.size:
+            n_hp_b = hp_resid_rt.shape[1]
+            if MATCH_DRCC_HP_SCALING and n_hp_b > 0:
+                hp_resid_total = hp_resid_rt.mean(axis=1) * float(np.sqrt(n_hp_b))
+            else:
+                hp_resid_total = hp_resid_rt.sum(axis=1)
+        else:
+            hp_resid_total = np.zeros(len(index))
         if IGNORE_HP_RESIDUAL:
             hp_resid_total[:] = 0.0  # discard residual noise component
 
@@ -1157,6 +1348,43 @@ def main() -> None:
         # Option A: per-device prediction scaled by number of active HP devices (hp_bus_ids_final)
         n_hp = max(1, len(hp_bus_ids_final))
         hp_pred_total = np.zeros(len(index))
+        # Additional HDD-variance-based additive temperature noise per device (aligns with v2 HDD σ)
+        # If temperature samples already include per-interval equicorrelated noise (preferred), skip extra HDD noise to avoid double counting.
+        temp_model = (samples_meta.get('temperature_model') if isinstance(samples_meta, dict) else None)
+        inject_hdd_noise = bool(MATCH_DRCC_HP_SCALING and var_HDD_series.size == len(index) and temp_model != 'per_interval_equicorr')
+        if inject_hdd_noise:
+            # Choose RNG seeded by sample id for reproducibility across runs
+            try:
+                seed_val = int(sid) + 100001
+            except Exception:
+                seed_val = 12345
+            rng_noise = np.random.default_rng(seed_val)
+            dist = (SAMPLE_DISTRIBUTION or 'gaussian').strip().lower()
+            def _draw_std_norm(size):
+                if dist == 'uniform':
+                    b = np.sqrt(3.0)
+                    return rng_noise.uniform(-b, b, size=size)
+                elif dist == 'studentt':
+                    df_t = 3.0
+                    # scale to unit variance
+                    return rng_noise.standard_t(df_t, size=size) * (1.0/np.sqrt(df_t/(df_t-2.0)))
+                elif dist == 'contaminated':
+                    meta_s = _load_samples_meta(SAMPLES_DIR) or {}
+                    p = float(meta_s.get('contamination_rate', 0.01))
+                    k = float(meta_s.get('contamination_scale_k', 1.0))
+                    var_mix = (1.0 - p) + p*(k**2)
+                    norm = np.sqrt(var_mix) if var_mix > 0 else 1.0
+                    mask = rng_noise.random(size) < p
+                    z = rng_noise.standard_normal(size)
+                    if np.any(mask):
+                        z[mask] *= k
+                    return z / norm
+                else:
+                    return rng_noise.standard_normal(size=size)
+            sigma_hdd_per_device_t = (abs(float(HP_COEFF_BHDD)) * float(HP_PRED_PMAX)) * np.sqrt(np.maximum(0.0, var_HDD_series))
+            eps_hdd = _draw_std_norm(len(index)) * sigma_hdd_per_device_t
+        else:
+            eps_hdd = np.zeros(len(index))
         for t_idx, ts in enumerate(index):
             T_C_t = float(temp_sid['temperature_c'].iloc[t_idx]) if t_idx < len(temp_sid) else float('nan')
             if not np.isfinite(T_C_t):
@@ -1175,7 +1403,8 @@ def main() -> None:
                 + HP_COEFF_A1 * sin24
                 + HP_COEFF_A2 * cos24
             )
-            P_t = baseline_lookup(ts) + HP_PRED_PMAX * y_dev
+            # Add per-device HDD variance noise only if not already embedded via sampled temperature
+            P_t = baseline_lookup(ts) + HP_PRED_PMAX * y_dev + (float(eps_hdd[t_idx]) if inject_hdd_noise else 0.0)
             P_t = min(max(P_t, 0.0), HP_PRED_PMAX)
             hp_pred_total[t_idx] = P_t * n_hp
 
@@ -1630,9 +1859,8 @@ def main() -> None:
                 import pandas as _pd
                 buf_df = _pd.DataFrame(trafo_loading_buffer, columns=['sample_id', 't', 'trafo_index', 'loading_pct'])
                 # Write/append parquet
-                token = _epsilon_token(EPSILON)
                 out_dir = os.path.join(OUTDIR, TRAFO_LOADING_DIR_NAME)
-                out_path = os.path.join(out_dir, f"{TRAFO_LOADING_FILENAME_PREFIX}{token}.parquet")
+                out_path = os.path.join(OUTDIR, trafo_loading_relpath)
                 if TRAFO_LOADING_WRITE_PARQUET:
                     # Append mode: if file exists, concat then overwrite (simpler than row-group append without pyarrow writer state)
                     if os.path.exists(out_path):
@@ -1906,6 +2134,7 @@ def main() -> None:
         'epsilon': EPSILON,
         'drcc_mode': drcc_mode,
         'samples_dir': os.path.abspath(SAMPLES_DIR),
+        'sample_distribution': SAMPLE_DISTRIBUTION,
         'dt_hours': float(dt_hours),
         'n_trajectories': int(len(summary_df)),
         'metrics': list(summary_df.columns),
@@ -1918,9 +2147,11 @@ def main() -> None:
         },
         'ignore_hp_residual': bool(IGNORE_HP_RESIDUAL),
         'use_mean_centered_policy': bool(USE_MEAN_CENTERED_POLICY),
-    'trafo_loading_logging': bool(LOG_TRAFO_LOADING),
-    'use_optionA_flow': bool(USE_OPTIONA_FLOW),
-    'compare_flows': bool(COMPARE_FLOWS)
+        'match_drcc_hp_scaling': bool(MATCH_DRCC_HP_SCALING),
+        'n_hp_devices': int(len(base_hp_by_bus)) if isinstance(base_hp_by_bus, dict) else 0,
+        'trafo_loading_logging': bool(LOG_TRAFO_LOADING),
+        'use_optionA_flow': bool(USE_OPTIONA_FLOW),
+        'compare_flows': bool(COMPARE_FLOWS)
     }
     # Add residual basis descriptor
     meta['rt_residual_basis'] = 'mean_centered' if USE_MEAN_CENTERED_POLICY else 'schedule'
@@ -1949,7 +2180,7 @@ def main() -> None:
         except Exception as e:
             print(f"[WARN] Failed to export policy coefficients: {e}")
     if LOG_TRAFO_LOADING and trafo_meta_records:
-        meta['trafo_loading_file'] = os.path.join(TRAFO_LOADING_DIR_NAME, f"{TRAFO_LOADING_FILENAME_PREFIX}{_epsilon_token(EPSILON)}.parquet")
+        meta['trafo_loading_file'] = trafo_loading_relpath
         meta['n_trafos'] = len(trafo_meta_records)
         # Write meta for transformers if not exists
         try:

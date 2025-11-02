@@ -1,5 +1,5 @@
 {
-  "generated_at": "2025-10-08T18:00:04.419682Z",
+  "generated_at": "2025-10-30T09:42:09.749140Z",
   "results_csv": "C:\\Users\\ckw5258\\Desktop\\Github\\Policy-based-Electricity-and-Heat-DRO\\dso_model_v2_results_drcc_false.csv",
   "n_samples": 1000,
   "seed": 42,
@@ -7,8 +7,9 @@
   "index_end": "2023-01-10 23:45:00",
   "dt_hours": 0.25,
   "pv_rho": 1.0,
-  "rho_temp_avg": 0.0,
-  "hp_residual_sigma_norm": 0.0157,
+  "rho_temp_avg": 1.0,
+  "temperature_model": "per_interval_equicorr",
+  "hp_residual_sigma_norm": 0.0435,
   "hp_pred_pmax_mw": 0.3,
   "pv_installed_mw": {
     "1": 0.0049999999999998605,
@@ -127,5 +128,6 @@
     43
   ],
   "notes": "PV samples represent available PV MW (pre-curtailment); temperature samples add daily-average uncertainty; HP residual is additive to HP predictor.",
-  "distribution": "gaussian"
+  "distribution": "studentt",
+  "student_t_df": 3
 }

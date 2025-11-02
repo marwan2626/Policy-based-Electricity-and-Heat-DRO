@@ -63,8 +63,22 @@ OUTDIR: str = "v3_oos"
 # Threshold (in percent) above which a line or transformer loading counts as a violation step
 LOADING_VIOLATION_THRESHOLD_PCT: float = 80.0
 
+# Voltage evaluation configuration (reintroduced for full flow metrics in OOS)
+VOLTAGE_EVAL_ENABLED: bool = True          # Set False to skip voltage reconstruction
+VOLTAGE_SLACK_PU: float = 1.0              # Slack/reference bus voltage
+VOLTAGE_MIN_PU: float = 0.90               # Base compliance band min (replicate v2 default if tightened not applied)
+VOLTAGE_MAX_PU: float = 1.10               # Base compliance band max
+VOLTAGE_TIGHT_MIN_PU: float | None = None  # Optionally override with tightened limits (leave None to use base)
+VOLTAGE_TIGHT_MAX_PU: float | None = None
+COUNT_VIOLATION_ON_ANY_BUS: bool = True    # If True, a timestep counts as 1 violation if any bus is out-of-band
+
 # Phase 1: Use mean-centered residual for policy activation (instead of schedule-referenced residual)
-USE_MEAN_CENTERED_POLICY: bool = True
+USE_MEAN_CENTERED_POLICY: bool = True  # set False to use schedule-based residual directly
+VALIDATE_BASELINE_ONLY: bool = False  # Stage 2b: if True (or CLI flag) run only deterministic baseline accumulation and exit
+
+# Stage 3: Use Option A radial accumulation instead of admittance-based proxy for transformer loading in stochastic loop
+USE_OPTIONA_FLOW: bool = True  # if True, compute transformer loading from accumulated downstream P/Q (consistent with v2 export)
+COMPARE_FLOWS: bool = False  # if True, compute both Option A and admittance-based transformer loading for comparison
 
 # Logging of transformer loading distributions (for CVaR / tail risk analysis)
 LOG_TRAFO_LOADING: bool = True  # set True to enable logging
@@ -73,6 +87,29 @@ TRAFO_LOADING_DIR_NAME: str = "v3_loading"  # subdirectory inside OUTDIR
 TRAFO_LOADING_FILENAME_PREFIX: str = "trafo_loading_raw_epsilon_"  # suffix token + .parquet
 TRAFO_LOADING_FLOAT_DTYPE = "float32"
 TRAFO_LOADING_WRITE_PARQUET: bool = True  # requires pyarrow
+
+# Full per-trajectory series export (heavy). When enabled, writes one CSV per trajectory with
+# bus voltages, line & transformer loading/flows, component powers (HP, flex, base load, PV, BESS),
+# residuals & balancing actions, and SoC.
+EXPORT_FULL_SERIES: bool = True
+FULL_SERIES_DIR: str = "v3_series"
+
+# If only one trajectory is simulated (MAX_TRAJ == 1 or resulting n_trajectories == 1) produce
+# comprehensive diagnostic plots similar to v2 (voltages, line/trafo loadings, component powers, prices, SoC).
+PLOT_SINGLE_TRAJECTORY_DIAGNOSTICS: bool = True
+
+# Use per-bus flexible and non-flexible load P/Q time series directly from v2 results CSV.
+# When True: we ignore profile reconstruction and take columns:
+#   load_nonflex_p_bus_{bus}_mw, load_nonflex_q_bus_{bus}_mvar,
+#   load_flex_p_bus_{bus}_mw,    load_flex_q_bus_{bus}_mvar.
+# If a Q column is missing for a bus we treat Q=0. Magnitudes are used exactly as stored.
+LOAD_LOAD_VALUES_FROM_V2: bool = True
+
+# Replay the v2 day-ahead BESS schedule (discharge/charge) before applying residual recourse.
+# When True, we import per-bus bess_discharge_bus_{b}_mw and bess_charge_bus_{b}_mw columns (if present)
+# and inject (discharge - charge) as the baseline BESS power prior to adding the affine recourse delta.
+# Recourse delta is still distributed by capacity share. Missing columns default to zero.
+REPLAY_V2_BESS_SCHEDULE: bool = True
 
 
 # ===========================
@@ -129,12 +166,13 @@ def _load_v2_results(path: str) -> pd.DataFrame:
     else:
         # Try reconstructing from meta_time_start and dt_hours
         try:
-            start_raw = df.get('meta_time_start', [None])[0]
+            # Use .iloc[0] instead of [0] on a list to avoid FutureWarning about positional indexing
+            start_raw = df.get('meta_time_start', [None]).__getitem__(0)
             start = pd.to_datetime(start_raw) if start_raw is not None else pd.NaT
         except Exception:
             start = pd.NaT
         try:
-            dt_hours = float(df.get('meta_dt_hours', [np.nan])[0])
+            dt_hours = float(df.get('meta_dt_hours', [np.nan]).__getitem__(0))
         except Exception:
             dt_hours = np.nan
         if pd.isna(start) or not np.isfinite(dt_hours):
@@ -495,6 +533,50 @@ def main() -> None:
     hp_ts = pd.to_datetime(hp_df['timestamp'])
     sample_index = pd.DatetimeIndex(sorted(set(temp_ts) & set(pv_ts) & set(hp_ts)))
 
+    # --- Runtime overrides for mean-centering flag ---
+    # Priority order: command-line arg > environment variable > user config above.
+    # CLI usage examples (optional):
+    #   python dso_model_v3.py --mean-centered
+    #   python dso_model_v3.py --schedule-residual
+    import sys as _sys
+    global USE_MEAN_CENTERED_POLICY, VALIDATE_BASELINE_ONLY, MAX_TRAJ, COMPARE_FLOWS  # allow override of module-level settings
+    argv = list(_sys.argv[1:])
+    # Residual basis overrides
+    if any(arg in ('--mean-centered', '--mean_centered') for arg in argv):
+        USE_MEAN_CENTERED_POLICY = True
+    elif any(arg in ('--schedule-residual', '--schedule_residual', '--no-mean-centered') for arg in argv):
+        USE_MEAN_CENTERED_POLICY = False
+    # Baseline validation flag
+    if any(arg in ('--validate-baseline', '--baseline-validate') for arg in argv):
+        VALIDATE_BASELINE_ONLY = True
+    if any(arg in ('--no-baseline-validate','--no-baseline','--skip-baseline-validate') for arg in argv):
+        VALIDATE_BASELINE_ONLY = False
+    # Flow comparison flag
+    if any(arg in ('--compare-flows', '--flow-compare') for arg in argv):
+        COMPARE_FLOWS = True
+    # Max trajectories CLI
+    if '--max-traj' in argv:
+        try:
+            idx = argv.index('--max-traj')
+            MAX_TRAJ = int(argv[idx+1])
+            print(f"[config] Limiting trajectories to first {MAX_TRAJ} via --max-traj")
+        except Exception:
+            print('[WARN] --max-traj provided but could not parse integer; ignoring.')
+    # Env var for residual basis if not explicitly set
+    env_flag = os.getenv('V3_USE_MEAN_CENTERED')  # '1','true','yes' => True; '0','false','no' => False
+    if env_flag is not None:
+        val = env_flag.strip().lower()
+        if val in ('1','true','t','yes','y'):
+            USE_MEAN_CENTERED_POLICY = True
+        elif val in ('0','false','f','no','n'):
+            USE_MEAN_CENTERED_POLICY = False
+
+    print(f"[config] USE_MEAN_CENTERED_POLICY = {USE_MEAN_CENTERED_POLICY} | residual basis = {'mean_centered' if USE_MEAN_CENTERED_POLICY else 'schedule'}")
+    if VALIDATE_BASELINE_ONLY:
+        print("[config] VALIDATE_BASELINE_ONLY = True (will compute baseline transformer loading using Option A accumulation and exit)")
+    if COMPARE_FLOWS:
+        print("[config] COMPARE_FLOWS = True (dual computation of Option A & admittance transformer loadings)")
+
     # Fix v2 timeline if needed
     index = df.index
     index_is_datetime = isinstance(index, pd.DatetimeIndex)
@@ -532,8 +614,15 @@ def main() -> None:
 
     # Load HP predictor coefficients from v2 export meta (fallback to v2 defaults)
     def _get_meta_float(col: str, default: float) -> float:
+        val = df.get(col, None)
+        if val is None:
+            return default
         try:
-            return float(df.get(col, [default])[0])
+            if isinstance(val, (list, tuple)):
+                return float(val[0])
+            if isinstance(val, pd.Series):
+                return float(val.iloc[0])
+            return float(val)
         except Exception:
             return default
     HP_PRED_PMAX = _get_meta_float('meta_hp_pred_pmax_mw', 0.30)
@@ -571,8 +660,74 @@ def main() -> None:
     base_pv_by_bus = _collect_da_series(df, pv_bus_ids, 'pv_avail_bus_', '_mw')
     base_pv_da_by_bus = _collect_da_series(df, pv_gen_bus_ids, 'pv_gen_bus_', '_mw')
     base_hp_by_bus_raw = _collect_da_series(df, hp_bus_ids_raw, 'hp_elec_bus_', '_mw')
+    # Flexible load exports (baseline, realized, curtailment) added in v2 refactor
+    flex_baseline_bus_ids = _get_bus_ids_from_columns(df, 'baseline_flex_bus_', '_mw')
+    flex_realized_bus_ids = _get_bus_ids_from_columns(df, 'flex_load_bus_', '_mw')
+    flex_curt_bus_ids = _get_bus_ids_from_columns(df, 'curt_bus_', '_mw')
+    flex_baseline_by_bus = _collect_da_series(df, flex_baseline_bus_ids, 'baseline_flex_bus_', '_mw') if flex_baseline_bus_ids else {}
+    flex_realized_by_bus = _collect_da_series(df, flex_realized_bus_ids, 'flex_load_bus_', '_mw') if flex_realized_bus_ids else {}
+    flex_curt_by_bus = _collect_da_series(df, flex_curt_bus_ids, 'curt_bus_', '_mw') if flex_curt_bus_ids else {}
+    # Aggregate flexible load series (they are deterministic across OOS trajectories)
+    if flex_baseline_by_bus:
+        flex_baseline_total = np.sum(list(flex_baseline_by_bus.values()), axis=0)
+    else:
+        flex_baseline_total = np.zeros(len(index))
+    if flex_realized_by_bus:
+        flex_realized_total = np.sum(list(flex_realized_by_bus.values()), axis=0)
+    else:
+        flex_realized_total = np.zeros(len(index))
+    if flex_curt_by_bus:
+        flex_curt_total = np.sum(list(flex_curt_by_bus.values()), axis=0)
+    else:
+        # Fallback: difference baseline - realized if curtail columns absent
+        flex_curt_total = np.maximum(0.0, flex_baseline_total - flex_realized_total)
+    # ycap_mw (aggregate curtailment) consistency check
+    if 'ycap_mw' in df.columns:
+        try:
+            ycap_series = df['ycap_mw'].to_numpy(dtype=float)
+            # Only warn if discrepancy is material
+            diff_norm = np.max(np.abs(ycap_series - flex_curt_total)) if len(ycap_series) else 0.0
+            if diff_norm > 1e-6:
+                print(f"[flex-load] Warning: ycap_mw mismatch vs summed curt_bus_ series (max abs diff {diff_norm:.3e})")
+        except Exception:
+            ycap_series = None
+    else:
+        ycap_series = None
+    # Pre-compute flexible load energy / power metrics (constant across trajectories)
+    if dt_hours > 0 and len(flex_baseline_total):
+        flex_metrics_static = {
+            'flex_baseline_energy_mwh': float(np.sum(flex_baseline_total * dt_hours)),
+            'flex_realized_energy_mwh': float(np.sum(flex_realized_total * dt_hours)),
+            'flex_curtail_energy_mwh': float(np.sum(flex_curt_total * dt_hours)),
+            'flex_avg_curtailment_mw': float(np.mean(flex_curt_total)),
+            'flex_peak_curtailment_mw': float(np.max(flex_curt_total)) if len(flex_curt_total) else 0.0,
+        }
+        baseline_energy = flex_metrics_static['flex_baseline_energy_mwh']
+        if baseline_energy > 0:
+            flex_metrics_static['flex_energy_curtailed_pct'] = 100.0 * flex_metrics_static['flex_curtail_energy_mwh'] / baseline_energy
+        else:
+            flex_metrics_static['flex_energy_curtailed_pct'] = np.nan
+        if ycap_series is not None and len(ycap_series) == len(flex_curt_total):
+            flex_metrics_static['flex_ycap_energy_mwh'] = float(np.sum(ycap_series * dt_hours))
+    else:
+        flex_metrics_static = {
+            'flex_baseline_energy_mwh': np.nan,
+            'flex_realized_energy_mwh': np.nan,
+            'flex_curtail_energy_mwh': np.nan,
+            'flex_avg_curtailment_mw': np.nan,
+            'flex_peak_curtailment_mw': np.nan,
+            'flex_energy_curtailed_pct': np.nan,
+        }
+    # Log detection summary
+    if flex_baseline_by_bus:
+        print(f"[flex-load] Detected {len(flex_baseline_by_bus)} flexible load buses (baseline). Total baseline energy = {flex_metrics_static['flex_baseline_energy_mwh']:.6f} MWh")
+        print(f"[flex-load] Realized energy = {flex_metrics_static['flex_realized_energy_mwh']:.6f} MWh | Curtailment energy = {flex_metrics_static['flex_curtail_energy_mwh']:.6f} MWh ({flex_metrics_static['flex_energy_curtailed_pct']:.3f}%)")
+    else:
+        print("[flex-load] No flexible load columns detected in v2 results CSV.")
     # DA PV setpoints (what was actually scheduled in v2)
     base_pv_da_total = np.sum(list(base_pv_da_by_bus.values()), axis=0) if base_pv_da_by_bus else np.zeros(len(index))
+    # Forecast (mean) PV availability total for mean-centering policy residuals
+    pv_mean_total = np.sum(list(base_pv_by_bus.values()), axis=0) if base_pv_by_bus else np.zeros(len(index))
 
     # Filter samples to our timestamps
     temp_df = temp_df[temp_df['timestamp'].isin(index)]
@@ -583,29 +738,136 @@ def main() -> None:
     sample_ids = sorted(set(pv_df['sample_id'].unique()) & set(hp_df['sample_id'].unique()) & set(temp_df['sample_id'].unique()))
     if MAX_TRAJ is not None:
         sample_ids = sample_ids[: int(MAX_TRAJ)]
+    # Optional environment override for quick testing (does not alter stored config)
+    env_max = os.getenv('V3_MAX_TRAJ')
+    if env_max:
+        try:
+            env_lim = int(env_max)
+            if env_lim > 0:
+                sample_ids = sample_ids[:env_lim]
+                print(f"[v3] ENV override: limiting trajectories to {env_lim} via V3_MAX_TRAJ")
+        except Exception:
+            pass
     if not sample_ids:
         raise RuntimeError("No overlapping sample_ids found across PV/HP/Temperature samples")
 
     # Build network and matrices once
     net = create_network_from_csv()
-    slack_bus_index = int(net.ext_grid.bus.iloc[0])
+
+    # --- Stage 2 Option A network reconstruction data ---
+    # Parse downstream map from v2 export if present; otherwise rebuild later.
+    downstream_map_json = df.get('meta_downstream_map_json')
+    downstream_map: Dict[int, List[int]] = {}
+    if downstream_map_json is not None:
+        try:
+            import json as _json
+            raw = downstream_map_json.iloc[0] if hasattr(downstream_map_json, 'iloc') else None
+            if isinstance(raw, str) and raw.strip():
+                parsed = _json.loads(raw)
+                downstream_map = {int(k): [int(c) for c in v] for k, v in parsed.items()}
+        except Exception:
+            downstream_map = {}
+    # Build parent map (single parent per bus for radial assumption)
+    parent_map: Dict[int, int] = {}
+    if downstream_map:
+        for p, children in downstream_map.items():
+            for c in children:
+                parent_map[c] = p
+
+    # Extract baseline net P/Q injections per bus if available
+    baseline_net_p: Dict[int, np.ndarray] = {}
+    baseline_net_q: Dict[int, np.ndarray] = {}
+    bus_indices = list(net.bus.index)
+    for bus in bus_indices:
+        colP = f'baseline_net_p_bus_{bus}_mw'
+        colQ = f'baseline_net_q_bus_{bus}_mvar'
+        if colP in df.columns:
+            baseline_net_p[bus] = df[colP].to_numpy(dtype=float)
+        if colQ in df.columns:
+            baseline_net_q[bus] = df[colQ].to_numpy(dtype=float)
+
+    # Fallback: if downstream_map missing we will reconstruct later when Option A engine is finalized.
+    def _build_downstream_from_lines() -> Dict[int, List[int]]:
+        dm: Dict[int, List[int]] = {int(b): [] for b in net.bus.index}
+        try:
+            # Assume radial: each line defines from_bus -> to_bus direction consistent with CSV; adopt that as parent->child
+            for line in net.line.itertuples():
+                fb = int(line.from_bus); tb = int(line.to_bus)
+                dm[fb].append(tb)
+            # Include transformers (hv -> lv)
+            for tr in net.trafo.itertuples():
+                hv = int(tr.hv_bus); lv = int(tr.lv_bus)
+                dm[hv].append(lv)
+        except Exception:
+            pass
+        return dm
+    if not downstream_map:
+        downstream_map = _build_downstream_from_lines()
+        parent_map = {c: p for p, ch in downstream_map.items() for c in ch}
+
+    # Prepare post-order (children first) traversal order for accumulation (leaves have no children)
+    post_order = sorted(downstream_map.keys(), key=lambda b: len(downstream_map[b]))
+
+    def accumulate_flows(P_inj: np.ndarray, Q_inj: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Accumulate downstream injections to obtain per-bus apparent power parents see.
+
+        P_inj/Q_inj: arrays indexed by bus index order net.bus.index
+        Returns (P_accum, Q_accum) arrays same shape.
+        """
+        P_acc = P_inj.copy(); Q_acc = Q_inj.copy()
+        # Walk buses in order of increasing subtree size (leaves first), propagate up one level to parent
+        for b in post_order:
+            if b in parent_map:
+                p = parent_map[b]
+                P_acc[p] += P_acc[b]
+                Q_acc[p] += Q_acc[b]
+        return P_acc, Q_acc
+
+    # --- Stage 2b: Deterministic baseline validation path ---
+    if VALIDATE_BASELINE_ONLY:
+        if not baseline_net_p:
+            print("[baseline-validation] No baseline_net_p_* columns found; re-run v2 export after Stage 1 changes.")
+            return
+        horizon = len(next(iter(baseline_net_p.values())))
+        n_buses = len(bus_indices)
+        # Build matrices (time, bus)
+        P_base_mat = np.zeros((horizon, n_buses), dtype=float)
+        Q_base_mat = np.zeros((horizon, n_buses), dtype=float)
+        bus_pos = {b: i for i, b in enumerate(bus_indices)}
+        for b, arr in baseline_net_p.items():
+            P_base_mat[:, bus_pos[b]] = arr
+        for b, arr in baseline_net_q.items():
+            Q_base_mat[:, bus_pos[b]] = arr
+        # Accumulate each timestep
+        trafo_loading_series: Dict[int, np.ndarray] = {idx: np.zeros(horizon, dtype=float) for idx in net.trafo.index}
+        for t in range(horizon):
+            P_acc, Q_acc = accumulate_flows(P_base_mat[t], Q_base_mat[t])
+            for tr in net.trafo.itertuples():
+                lv = int(tr.lv_bus)
+                idx_tr = tr.Index
+                S_lv = np.sqrt(P_acc[lv]**2 + Q_acc[lv]**2)
+                loading_pct = (S_lv / float(tr.sn_mva)) * 100.0 if tr.sn_mva > 0 else 0.0
+                trafo_loading_series[idx_tr][t] = loading_pct
+        # Summary stats
+        for idx_tr, series in trafo_loading_series.items():
+            print(f"[baseline-validation] Trafo {idx_tr}: max={series.max():.2f}% avg={series.mean():.2f}% >80% steps={(series>80).sum()} / {horizon}")
+        # Write CSV
+        import pandas as _pd
+        out_df = _pd.DataFrame({'t': list(range(horizon))})
+        for idx_tr, series in trafo_loading_series.items():
+            out_df[f'trafo_{idx_tr}_loading_pct'] = series
+        token = _epsilon_token(EPSILON)
+        out_path = os.path.join(OUTDIR, f'baseline_optionA_transformer_loading_{token}.csv')
+        try:
+            out_df.to_csv(out_path, index=False)
+            print(f"[baseline-validation] Wrote {out_path}")
+        except Exception as e:
+            print(f"[baseline-validation] Failed to write CSV: {e}")
+        return
+
+    # Radial accumulation for flows; now also (optionally) reconstruct approximate voltage profile along radial tree.
+    slack_bus_index = int(net.ext_grid.bus.iloc[0]) if hasattr(net, 'ext_grid') and len(net.ext_grid) else 0
     non_slack_buses = [b for b in net.bus.index if b != slack_bus_index]
-    # Build complex Ybus including lines and transformers
-    Ybus = build_Ybus(net)
-    Ybus_reduced = np.delete(np.delete(Ybus, slack_bus_index, axis=0), slack_bus_index, axis=1)
-    # Use pseudo-inverse if singular
-    try:
-        Zbus_reduced = np.linalg.inv(Ybus_reduced)
-    except np.linalg.LinAlgError:
-        Zbus_reduced = np.linalg.pinv(Ybus_reduced)
-    Rmat = np.real(Zbus_reduced); X = np.imag(Zbus_reduced)
-    # For DC angle approximation: B' = -Im(Ybus)
-    Bprime = -np.imag(Ybus)
-    Bprime_reduced = np.delete(np.delete(Bprime, slack_bus_index, axis=0), slack_bus_index, axis=1)
-    try:
-        Bprime_inv = np.linalg.inv(Bprime_reduced)
-    except np.linalg.LinAlgError:
-        Bprime_inv = np.linalg.pinv(Bprime_reduced)
 
     # Re-identify HP load buses directly from the network (names starting with 'HP'),
     # ensuring "per-device" semantics (Option A). This guards against accidental
@@ -642,7 +904,56 @@ def main() -> None:
 
     # Load mapping for non-flex loads from VDI
     time_index = index
-    elec_ts_map = build_electrical_time_series(time_index)
+    # Build electrical time series only if not sourcing directly from v2
+    elec_ts_map = {} if LOAD_LOAD_VALUES_FROM_V2 else build_electrical_time_series(time_index)
+
+    # Optionally extract per-bus flexible / non-flex load P/Q directly from v2 results
+    nonflex_p_by_bus: Dict[int, np.ndarray] = {}
+    nonflex_q_by_bus: Dict[int, np.ndarray] = {}
+    flex_p_by_bus: Dict[int, np.ndarray] = {}
+    flex_q_by_bus: Dict[int, np.ndarray] = {}
+    if LOAD_LOAD_VALUES_FROM_V2:
+        for col in df.columns:
+            if col.startswith('load_nonflex_p_bus_') and col.endswith('_mw'):
+                try:
+                    bus = int(col[len('load_nonflex_p_bus_'):-len('_mw')])
+                except Exception:
+                    continue
+                nonflex_p_by_bus[bus] = df[col].to_numpy(dtype=float)
+            elif col.startswith('load_nonflex_q_bus_') and col.endswith('_mvar'):
+                try:
+                    bus = int(col[len('load_nonflex_q_bus_'):-len('_mvar')])
+                except Exception:
+                    continue
+                nonflex_q_by_bus[bus] = df[col].to_numpy(dtype=float)
+            elif col.startswith('load_flex_p_bus_') and col.endswith('_mw'):
+                try:
+                    bus = int(col[len('load_flex_p_bus_'):-len('_mw')])
+                except Exception:
+                    continue
+                flex_p_by_bus[bus] = df[col].to_numpy(dtype=float)
+            elif col.startswith('load_flex_q_bus_') and col.endswith('_mvar'):
+                try:
+                    bus = int(col[len('load_flex_q_bus_'):-len('_mvar')])
+                except Exception:
+                    continue
+                flex_q_by_bus[bus] = df[col].to_numpy(dtype=float)
+
+        # Zero-fill missing Q where P exists
+        for b in list(nonflex_p_by_bus.keys()):
+            if b not in nonflex_q_by_bus:
+                nonflex_q_by_bus[b] = np.zeros_like(nonflex_p_by_bus[b])
+        for b in list(flex_p_by_bus.keys()):
+            if b not in flex_q_by_bus:
+                flex_q_by_bus[b] = np.zeros_like(flex_p_by_bus[b])
+
+        print(f"[v3] Loaded P/Q loads from v2: nonflex buses={len(nonflex_p_by_bus)}, flex buses={len(flex_p_by_bus)}")
+        # Basic length consistency check
+        horizon = len(time_index)
+        for dmap_name, dmap in [('nonflex_p', nonflex_p_by_bus), ('flex_p', flex_p_by_bus)]:
+            for b, arr in dmap.items():
+                if len(arr) != horizon:
+                    raise ValueError(f"Length mismatch for {dmap_name} bus {b}: expected {horizon}, got {len(arr)}. Ensure v2 CSV horizon matches samples.")
 
     # Helpers for sgen caps
     if 'type' in net.sgen.columns:
@@ -655,24 +966,74 @@ def main() -> None:
     bess_caps_by_bus = net.sgen.loc[bess_mask].groupby('bus')['p_mw'].sum().to_dict()
     bess_pmax_total = float(sum(bess_caps_by_bus.values())) if bess_caps_by_bus else 0.0
 
+    # Optional: import baseline BESS schedule (per-bus discharge/charge) from v2
+    baseline_bess_p_by_bus: Dict[int, np.ndarray] = {}
+    if REPLAY_V2_BESS_SCHEDULE and bess_caps_by_bus:
+        horizon = len(time_index)
+        for col in df.columns:
+            if col.startswith('bess_discharge_bus_') and col.endswith('_mw'):
+                try:
+                    bus = int(col[len('bess_discharge_bus_'):-len('_mw')])
+                except Exception:
+                    continue
+                dis = df[col].to_numpy(dtype=float)
+                ch_col = f"bess_charge_bus_{bus}_mw"
+                ch = df[ch_col].to_numpy(dtype=float) if ch_col in df.columns else np.zeros_like(dis)
+                # Baseline net BESS power: discharge positive, charge negative
+                net_series = dis - ch
+                if len(net_series) != horizon:
+                    continue
+                baseline_bess_p_by_bus[bus] = net_series
+        if baseline_bess_p_by_bus:
+            print(f"[v3] Imported baseline BESS schedule for {len(baseline_bess_p_by_bus)} bus(es).")
+        else:
+            print("[v3] Baseline BESS schedule replay enabled but no per-bus discharge/charge columns found; defaulting to zero baseline.")
+
+    # Aggregate baseline BESS net power (sum across buses) per timestep for SoC evolution convenience
+    if baseline_bess_p_by_bus:
+        try:
+            baseline_bess_total_series = np.sum(list(baseline_bess_p_by_bus.values()), axis=0)
+        except Exception:
+            baseline_bess_total_series = None
+    else:
+        baseline_bess_total_series = None
+
+    # Optional: initialize SoC from v2 exported energy columns if present (sum per-bus energy at t=0)
+    bess_energy_cols = [c for c in df.columns if c.startswith('bess_energy_bus_') and c.endswith('_mwh')]
+    baseline_initial_energy_mwh = None
+    # Collect full baseline energy trajectory (aggregate across BESS buses) for anchoring SoC path
+    baseline_bess_energy_total_series = None
+    if bess_energy_cols:
+        try:
+            baseline_initial_energy_mwh = float(np.sum([df[c].iloc[0] for c in bess_energy_cols]))
+            # Sum per timestep to reconstruct aggregate baseline energy trajectory
+            baseline_bess_energy_total_series = df[bess_energy_cols].sum(axis=1).to_numpy(dtype=float)
+        except Exception:
+            baseline_initial_energy_mwh = None
+            baseline_bess_energy_total_series = None
+        if baseline_initial_energy_mwh is not None and baseline_initial_energy_mwh > 0:
+            print(f"[v3] Detected baseline aggregate BESS energy at t=0 = {baseline_initial_energy_mwh:.4f} MWh from v2 export.")
+    else:
+        baseline_initial_energy_mwh = None
+
     # BESS meta from v2 (capacity MWh, initial SOC fraction, efficiency)
     try:
-        bess_eff = float(df.get('meta_bess_eff', [0.95])[0])
+        bess_eff = _get_meta_float('meta_bess_eff', 0.95)
     except Exception:
         bess_eff = 0.95
     try:
-        bess_initial_soc = float(df.get('meta_bess_initial_soc', [0.5])[0])
+        bess_initial_soc = _get_meta_float('meta_bess_initial_soc', 0.5)
     except Exception:
         bess_initial_soc = 0.5
     # total capacity across all BESS units (MWh)
     try:
-        total_bess_capacity_mwh = float(df.get('bess_total_capacity_mwh', [np.nan])[0])
+        total_bess_capacity_mwh = _get_meta_float('bess_total_capacity_mwh', np.nan)
         if not np.isfinite(total_bess_capacity_mwh) or total_bess_capacity_mwh <= 0:
             raise ValueError()
     except Exception:
         # fallback: per-unit capacity if present multiplied by number of BESS buses
         try:
-            per_bess_cap = float(df.get('meta_bess_capacity_mwh', [np.nan])[0])
+            per_bess_cap = _get_meta_float('meta_bess_capacity_mwh', np.nan)
         except Exception:
             per_bess_cap = np.nan
         if not np.isfinite(per_bess_cap) or per_bess_cap <= 0:
@@ -753,6 +1114,21 @@ def main() -> None:
                 'sn_mva': float(sn_tr)
             })
 
+    # Collect SoC trajectories for envelope export
+    collect_soc_frac: List[np.ndarray] = []
+
+    # Determine DRCC mode label early so it's available for per-trajectory series naming
+    try:
+        base_v2_name = os.path.basename(v2_csv) if v2_csv else ''
+    except Exception:
+        base_v2_name = ''
+    if 'drcc_true' in base_v2_name:
+        drcc_mode = 'drcc_true'
+    elif 'drcc_false' in base_v2_name:
+        drcc_mode = 'drcc_false'
+    else:
+        drcc_mode = 'drcc_unspecified'
+
     total = len(sample_ids)
     report_step = max(1, total // 20)  # ~5% steps
     for i, sid in enumerate(sample_ids, start=1):
@@ -819,37 +1195,110 @@ def main() -> None:
         hp_dev = hp_temp_dev_total + hp_resid_total
         pv_dev = base_pv_da_total - pv_total_rt  # signed PV deviation vs DA schedule (for reporting)
         base_residual = hp_dev + pv_dev          # schedule-based residual
+        # Mean-centered policy residual if enabled (and now also used for settlement & constraint evaluation):
+        #   hp mean deviation = -hp_resid_total  (hp_pred_total acts as mean predictor)
+        #   pv mean deviation = pv_mean_total - pv_total_rt
+        #   residual_policy_array = hp_mean_dev + pv_mean_dev
+        # If flag is off we revert to schedule-based residual (legacy behavior).
+        if USE_MEAN_CENTERED_POLICY:
+            pv_mean_dev = pv_mean_total - pv_total_rt
+            residual_policy_array = (-hp_resid_total) + pv_mean_dev
+        else:
+            residual_policy_array = base_residual  # schedule-based residual
 
-        # Mean-centered policy residual (hp mean = hp_pred_total, hp residual adds zero mean; pv mean = base_pv_da_total)
-        # Realized pre-action net stochastic deviation relative to forecast mean:
-        #   hp_mean_dev = -hp_resid_total (since hp_pred_total is mean)
-        #   pv_mean_dev = (base_pv_da_total - pv_total_rt) = pv_dev
-        # Combine for a mean-centered residual: hp_mean_dev + pv_mean_dev
-        residual_policy_array = (-hp_resid_total) + pv_dev
+        # --- Diagnostics: residual statistics & K*mu shift (printed once for first trajectory) ---
+        if i == 1:  # only for first trajectory to avoid log spam
+            mean_base = float(np.mean(base_residual))
+            mean_policy = float(np.mean(residual_policy_array))
+            std_base = float(np.std(base_residual))
+            std_policy = float(np.std(residual_policy_array))
+            l2_diff = float(np.linalg.norm(residual_policy_array - base_residual))
+            print(f"[resid-diag] base_mean={mean_base:.6f} policy_mean={mean_policy:.6f} | base_std={std_base:.6f} policy_std={std_policy:.6f} | l2_diff={l2_diff:.6f}")
+            mu_shift = mean_base - mean_policy
+            row0 = df.iloc[0]
+            lam_p = float(row0.get('lambda_plus', 0.0)); lam_m = float(row0.get('lambda_minus', 0.0))
+            chi_m = float(row0.get('chi_minus', 0.0))
+            if mean_base >= 0:
+                k_mu_bess = lam_p * max(0.0, mu_shift)
+                k_mu_curt = 0.0
+            else:
+                k_mu_bess = - lam_m * max(0.0, -mu_shift)
+                k_mu_curt = chi_m * max(0.0, -mu_shift)
+            print(f"[resid-diag] mu_shift={mu_shift:.6f} -> approx ΔBESS={k_mu_bess:.6f} MW, ΔCurtail={k_mu_curt:.6f} MW (heuristic)")
 
-        # Accumulators for metrics and voltages
+        # Accumulators for metrics and voltages (per trajectory, inside sample loop)
         net_import_rt = np.zeros(len(index))
-        v_min = 10.0; v_max = 0.0
+        v_min = float('inf'); v_max = float('-inf')
+        steps_voltage_violation = 0
         max_line_loading = 0.0; max_trafo_loading = 0.0
-        steps_line_over_thresh = 0; steps_trafo_over_thresh = 0; steps_voltage_violation = 0
+        max_trafo_loading_optionA = 0.0
+        steps_line_over_thresh = 0; steps_trafo_over_thresh = 0
         pv_curtail_energy = 0.0; bess_rt_energy_throughput = 0.0
         pv_rt_curt_cost_eur = 0.0; imbalance_cost_eur = 0.0; bess_cycle_cost_eur = 0.0
 
-        # Initialize BESS state for this trajectory
-        E_mwh = max(0.0, min(1.0, bess_initial_soc)) * max(0.0, total_bess_capacity_mwh)
+        # Initialize cumulative recourse adjustment (delta energy) separate from baseline energy path.
+        if baseline_initial_energy_mwh is not None and np.isfinite(baseline_initial_energy_mwh) and baseline_bess_energy_total_series is not None:
+            # Anchor: baseline energy trajectory gives E_base(t); we track only deviations.
+            recourse_energy_delta_mwh = 0.0
+            # Provide debug on baseline extrema for context
+        else:
+            # Fallback: treat baseline energy unknown; start from meta initial SoC * capacity and integrate full schedule+recourse (previous behavior)
+            recourse_energy_delta_mwh = None  # flag: None -> use legacy integration branch below
+            E_mwh_legacy = max(0.0, min(1.0, bess_initial_soc)) * max(0.0, total_bess_capacity_mwh)
         bess_soc_clip_steps = 0; u_plus_energy = 0.0; u_minus_energy = 0.0
+        # Track SoC fraction series for this trajectory
+        soc_series = np.zeros(len(index), dtype=float)
 
         # Collect policy residual stats if enabled
         residual_policy_vals = [] if USE_MEAN_CENTERED_POLICY else None
 
+        # Precompute per-line (parent,child)->(r_pu,x_pu) for voltage drop (once per trajectory)
+        # We treat transformers separately using their series impedance (derived earlier) approximated to (r_pu,x_pu)
+        line_rx_map: dict[tuple[int,int], tuple[float,float]] = {}
+        Sbase_sys = float(net.sn_mva)
+        for line in net.line.itertuples():
+            fb = int(line.from_bus); tb = int(line.to_bus)
+            Vbase_kV = float(net.bus.at[fb, 'vn_kv'])
+            Z_base = (Vbase_kV ** 2) / Sbase_sys
+            r_pu = float(line.r_ohm_per_km) * float(line.length_km) / Z_base
+            x_pu = float(line.x_ohm_per_km) * float(line.length_km) / Z_base
+            line_rx_map[(fb, tb)] = (r_pu, x_pu)
+        # Transformers: derive (r,x) from vk% and vkr% on system base
+        for tr in net.trafo.itertuples():
+            hv = int(tr.hv_bus); lv = int(tr.lv_bus)
+            vk_pu = float(tr.vk_percent) / 100.0 if hasattr(tr, 'vk_percent') else 0.05
+            r_pu = float(tr.vkr_percent) / 100.0 if hasattr(tr, 'vkr_percent') else 0.01
+            x_sq = max(vk_pu**2 - r_pu**2, 1e-8)
+            x_pu = float(np.sqrt(x_sq))
+            # Scale by (Sbase / sn_mva) to put on system base
+            sn_tr = float(tr.sn_mva) if hasattr(tr, 'sn_mva') else Sbase_sys
+            scale = Sbase_sys / max(sn_tr, 1e-6)
+            line_rx_map[(hv, lv)] = (r_pu * scale, x_pu * scale)
+
+        # Build outward traversal order from slack for voltage propagation
+        from collections import deque
+        bfs_order: List[int] = []
+        q = deque([slack_bus_index])
+        seen = {slack_bus_index}
+        while q:
+            b = q.popleft()
+            bfs_order.append(b)
+            for ch in downstream_map.get(b, []):
+                if ch not in seen:
+                    seen.add(ch)
+                    q.append(ch)
+
         for t, ts in enumerate(index):
             row = df.iloc[t]
             pv_sched_t = float(base_pv_da_total[t])
-            resid_t = float(base_residual[t])  # schedule-referenced residual used for settlement evolution
+            # Residual used for BOTH policy activation and settlement/constraint evolution:
+            # When mean-centering is active this is the centered residual; otherwise schedule-based.
+            resid_t = float(residual_policy_array[t])
 
-            # Choose residual signal for policy activation
+            # Residual signal for policy activation (identical to settlement residual now),
+            # keep collecting series only when flag enabled for diagnostics.
             if USE_MEAN_CENTERED_POLICY:
-                resid_policy_t = float(residual_policy_array[t])
+                resid_policy_t = resid_t
                 residual_policy_vals.append(resid_policy_t)
             else:
                 resid_policy_t = resid_t
@@ -857,43 +1306,83 @@ def main() -> None:
             # Policy open-loop commands from affine recourse (based on chosen residual)
             p_bess_cmd, extra_curt_cmd = apply_recourse_for_step(resid_policy_t, row, pv_sched_t)
 
-            # --- Battery-first: project affine command onto feasible (power + energy) band ---
-            p_cmd = float(p_bess_cmd)
-            # Clip to nameplate power limits
-            if bess_pmax_total > 0:
-                p_cmd = max(-bess_pmax_total, min(bess_pmax_total, p_cmd))
-            else:
-                p_cmd = 0.0
+            if recourse_energy_delta_mwh is not None and baseline_bess_energy_total_series is not None:
+                # Anchor mode: baseline energy known exactly; only integrate recourse adjustment
+                E_base_t = float(baseline_bess_energy_total_series[t]) if t < len(baseline_bess_energy_total_series) else 0.0
+                E_available = E_base_t + recourse_energy_delta_mwh
+                E_available = max(0.0, min(total_bess_capacity_mwh, E_available)) if total_bess_capacity_mwh > 0 else E_available
 
-            if dt_hours > 0 and bess_eff > 0 and total_bess_capacity_mwh > 0:
-                # Energy-based instantaneous feasible range (positive discharge, negative charge)
-                p_max_energy = (E_mwh * bess_eff) / dt_hours  # max discharge allowed
-                charge_headroom = max(0.0, total_bess_capacity_mwh - E_mwh)
-                p_min_energy = - (charge_headroom / (bess_eff * dt_hours))  # max (negative) charging
-                # Combine with power bounds
-                p_min_total = max(-bess_pmax_total, p_min_energy)
-                p_max_total = min(bess_pmax_total, p_max_energy)
-                if p_min_total > p_max_total:
-                    # Degenerate band (numerical), collapse to 0
-                    p_min_total, p_max_total = 0.0, 0.0
-                p_real = min(max(p_cmd, p_min_total), p_max_total)
-            else:
-                # No meaningful capacity/efficiency info -> already power clipped
-                p_real = p_cmd if bess_pmax_total > 0 else 0.0
-
-            # SoC update (charge if p_real < 0, discharge if p_real > 0)
-            if dt_hours > 0 and bess_eff > 0 and total_bess_capacity_mwh > 0:
-                E_mwh = E_mwh + max(0.0, -p_real) * bess_eff * dt_hours - max(0.0, p_real) / bess_eff * dt_hours
-                E_mwh = max(0.0, min(total_bess_capacity_mwh, E_mwh))
-            else:
-                # Track clip if non-zero command requested but no capacity
-                if abs(p_real) > 1e-9:
+                # Project affine command onto feasible band given current adjusted energy
+                p_cmd = float(p_bess_cmd)
+                if bess_pmax_total > 0:
+                    p_cmd = max(-bess_pmax_total, min(bess_pmax_total, p_cmd))
+                else:
+                    p_cmd = 0.0
+                if dt_hours > 0 and bess_eff > 0 and total_bess_capacity_mwh > 0:
+                    p_max_energy = (E_available * bess_eff) / dt_hours
+                    charge_headroom = max(0.0, total_bess_capacity_mwh - E_available)
+                    p_min_energy = - (charge_headroom / (bess_eff * dt_hours))
+                    p_min_total = max(-bess_pmax_total, p_min_energy)
+                    p_max_total = min(bess_pmax_total, p_max_energy)
+                    if p_min_total > p_max_total:
+                        p_min_total, p_max_total = 0.0, 0.0
+                    p_real = min(max(p_cmd, p_min_total), p_max_total)
+                else:
+                    p_real = p_cmd if bess_pmax_total > 0 else 0.0
+                # Update cumulative recourse energy delta (baseline untouched)
+                if dt_hours > 0 and bess_eff > 0 and total_bess_capacity_mwh > 0:
+                    recourse_energy_delta_mwh = recourse_energy_delta_mwh + max(0.0, -p_real) * bess_eff * dt_hours - max(0.0, p_real) / bess_eff * dt_hours
+                    # Clip cumulative deviation to keep total energy within [0, cap]
+                    E_post = E_base_t + recourse_energy_delta_mwh
+                    if E_post < -1e-9 or E_post > total_bess_capacity_mwh + 1e-9:
+                        bess_soc_clip_steps += 1
+                        E_post = max(0.0, min(total_bess_capacity_mwh, E_post))
+                        # Recompute deviation after clipping
+                        recourse_energy_delta_mwh = E_post - E_base_t
+                else:
+                    if abs(p_real) > 1e-9:
+                        bess_soc_clip_steps += 1
+                soc_series[t] = ((E_base_t + recourse_energy_delta_mwh) / total_bess_capacity_mwh) if total_bess_capacity_mwh > 0 else 0.0
+                bess_delta = p_real
+                resid_t -= bess_delta
+                if abs(p_real - p_bess_cmd) > 1e-9:
                     bess_soc_clip_steps += 1
-
-            bess_delta = p_real  # (+) discharge reduces deficit/import
-            resid_t -= bess_delta
-            if abs(p_real - p_bess_cmd) > 1e-9:
-                bess_soc_clip_steps += 1
+            else:
+                # Legacy fallback branch (no baseline energy path available): integrate full schedule + recourse as before
+                if t == 0 and baseline_initial_energy_mwh is not None:
+                    print("[v3][warn] Baseline energy series unavailable; using legacy integration path (SoC scaling may deviate).")
+                # Reconstruct E_mwh_legacy variable to persist between steps
+                if 'E_mwh_legacy' not in locals():
+                    E_mwh_legacy = max(0.0, min(1.0, bess_initial_soc)) * max(0.0, total_bess_capacity_mwh)
+                # Apply baseline power if available
+                if baseline_bess_total_series is not None and dt_hours > 0 and bess_eff > 0 and total_bess_capacity_mwh > 0:
+                    p_base_bess_total = float(baseline_bess_total_series[t]) if t < len(baseline_bess_total_series) else 0.0
+                    E_mwh_legacy = E_mwh_legacy + max(0.0, -p_base_bess_total) * bess_eff * dt_hours - max(0.0, p_base_bess_total) / bess_eff * dt_hours
+                    E_mwh_legacy = max(0.0, min(total_bess_capacity_mwh, E_mwh_legacy))
+                # Recourse projection
+                p_cmd = float(p_bess_cmd)
+                if bess_pmax_total > 0:
+                    p_cmd = max(-bess_pmax_total, min(bess_pmax_total, p_cmd))
+                else:
+                    p_cmd = 0.0
+                if dt_hours > 0 and bess_eff > 0 and total_bess_capacity_mwh > 0:
+                    p_max_energy = (E_mwh_legacy * bess_eff) / dt_hours
+                    charge_headroom = max(0.0, total_bess_capacity_mwh - E_mwh_legacy)
+                    p_min_energy = - (charge_headroom / (bess_eff * dt_hours))
+                    p_min_total = max(-bess_pmax_total, p_min_energy)
+                    p_max_total = min(bess_pmax_total, p_max_energy)
+                    if p_min_total > p_max_total:
+                        p_min_total, p_max_total = 0.0, 0.0
+                    p_real = min(max(p_cmd, p_min_total), p_max_total)
+                    E_mwh_legacy = E_mwh_legacy + max(0.0, -p_real) * bess_eff * dt_hours - max(0.0, p_real) / bess_eff * dt_hours
+                    E_mwh_legacy = max(0.0, min(total_bess_capacity_mwh, E_mwh_legacy))
+                else:
+                    p_real = p_cmd if bess_pmax_total > 0 else 0.0
+                soc_series[t] = (E_mwh_legacy / total_bess_capacity_mwh) if total_bess_capacity_mwh > 0 else 0.0
+                bess_delta = p_real
+                resid_t -= bess_delta
+                if abs(p_real - p_bess_cmd) > 1e-9:
+                    bess_soc_clip_steps += 1
 
             # --- PV curtailment after battery action (only for remaining surplus) ---
             extra_curt_used = 0.0
@@ -921,18 +1410,63 @@ def main() -> None:
             imbalance_cost_eur += (IMB_UP_FACTOR * float(u_plus) + IMB_DN_FACTOR * float(u_minus)) * p_price * dt_hours
             bess_cycle_cost_eur += float(abs(bess_delta)) * float(BESS_THROUGHPUT_COST_EUR_PER_MWH) * dt_hours
 
-            # Build P/Q injections per bus for LDF
+            # Build P/Q injections per bus for LDF & capture component-wise powers
             P_inj = {b: 0.0 for b in net.bus.index}
             Q_inj = {b: 0.0 for b in net.bus.index}
+            comp_load = {}   # non-flex base load MW (positive consumption recorded as +, will subtract in injection)
+            comp_flex = {}
+            comp_hp = {}
+            comp_pv = {}
+            comp_bess = {}
 
-            # Non-flex loads
-            for load in net.load.itertuples():
-                b = load.bus; name = getattr(load, 'name', '')
-                p_kw = float(elec_ts_map.get(name, np.zeros(len(index)))[t]) if name in elec_ts_map else 0.0
-                p_mw = p_kw / 1000.0
-                P_inj[b] -= p_mw
-                # approximate Q using household pf (match v2)
-                Q_inj[b] -= p_mw * qfactor_household_const
+            # 1) Inject baseline BESS schedule first (before recourse delta) if available
+            if REPLAY_V2_BESS_SCHEDULE and baseline_bess_p_by_bus:
+                # If multiple BESS buses present, use per-bus series directly; no redistribution needed.
+                for b, series in baseline_bess_p_by_bus.items():
+                    if t < len(series):
+                        p_base_bess = float(series[t])
+                        if abs(p_base_bess) > 0.0:
+                            comp_bess[b] = comp_bess.get(b, 0.0) + p_base_bess
+                            P_inj[b] += p_base_bess  # discharge positive, charge negative already encoded
+
+            # (Recourse delta will be layered later after other components are added.)
+
+            if LOAD_LOAD_VALUES_FROM_V2:
+                # Use direct P/Q from v2 results
+                for b, series in nonflex_p_by_bus.items():
+                    p_mw = float(series[t]) if t < len(series) else 0.0
+                    q_mvar = float(nonflex_q_by_bus.get(b, np.zeros(0))[t]) if t < len(nonflex_q_by_bus.get(b, [])) else 0.0
+                    if abs(p_mw) > 0.0:
+                        comp_load[b] = comp_load.get(b, 0.0) + p_mw
+                        P_inj[b] -= p_mw
+                        Q_inj[b] -= q_mvar
+                for b, series in flex_p_by_bus.items():
+                    p_mw = float(series[t]) if t < len(series) else 0.0
+                    q_mvar = float(flex_q_by_bus.get(b, np.zeros(0))[t]) if t < len(flex_q_by_bus.get(b, [])) else 0.0
+                    if abs(p_mw) > 0.0:
+                        comp_flex[b] = comp_flex.get(b, 0.0) + p_mw
+                        P_inj[b] -= p_mw
+                        Q_inj[b] -= q_mvar
+            else:
+                # Legacy reconstruction path from profiles / realized flex schedule
+                # Non-flex loads
+                for load in net.load.itertuples():
+                    b = load.bus; name = getattr(load, 'name', '')
+                    p_kw = float(elec_ts_map.get(name, np.zeros(len(index)))[t]) if name in elec_ts_map else 0.0
+                    p_mw = p_kw / 1000.0
+                    comp_load[b] = comp_load.get(b, 0.0) + p_mw
+                    P_inj[b] -= p_mw
+                    Q_inj[b] -= p_mw * qfactor_household_const
+
+                # Flexible loads (day-ahead realized schedule after curtailment is fixed across OOS)
+                if flex_realized_by_bus:
+                    for b, series in flex_realized_by_bus.items():
+                        if t < len(series):
+                            p_flex = float(series[t])
+                            if abs(p_flex) > 0.0:
+                                comp_flex[b] = comp_flex.get(b, 0.0) + p_flex
+                                P_inj[b] -= p_flex
+                                Q_inj[b] -= p_flex * qfactor_household_const
 
             # Heat pumps: use DA hp_elec_bus_*_mw plus residual split proportionally across HP buses
             if base_hp_by_bus:
@@ -942,6 +1476,7 @@ def main() -> None:
                 for b in base_hp_by_bus.keys():
                     p_da = float(base_hp_by_bus.get(b, np.zeros(len(index)))[t])
                     adj_p = p_da + per_bus_dev
+                    comp_hp[b] = comp_hp.get(b, 0.0) + adj_p
                     P_inj[b] -= adj_p
                     Q_inj[b] -= adj_p * qfactor_hp_const
 
@@ -951,73 +1486,143 @@ def main() -> None:
                 pv_effective = max(0.0, pv_total_rt[t] - extra_curt_used)
                 for b in pv_bus_ids:
                     share = (pv_caps_by_bus.get(b, 0.0) / total_cap) if total_cap > 0 else 0.0
-                    P_inj[b] += pv_effective * share
+                    p_real_pv = pv_effective * share
+                    comp_pv[b] = comp_pv.get(b, 0.0) + p_real_pv
+                    P_inj[b] += p_real_pv
 
             # BESS: implement delta at dominant BESS bus (or distribute)
             if bess_pmax_total > 0 and bess_caps_by_bus:
                 # allocate by capacity share
+                # If we already placed baseline schedule per bus, add delta on top proportionally by capacity
                 for b, cap in bess_caps_by_bus.items():
                     share = cap / bess_pmax_total if bess_pmax_total > 0 else 0.0
-                    P_inj[b] += bess_delta * share
+                    p_bess_bus_delta = bess_delta * share
+                    if abs(p_bess_bus_delta) > 0.0:
+                        comp_bess[b] = comp_bess.get(b, 0.0) + p_bess_bus_delta
+                        P_inj[b] += p_bess_bus_delta
 
-            # Slack net import consistency (not strictly enforced here; ext_grid covers mismatch)
-            # Convert to per-unit and solve V_reduced
-            P_pu = np.array([P_inj[b] / net.sn_mva for b in non_slack_buses])
-            Q_pu = np.array([Q_inj[b] / net.sn_mva for b in non_slack_buses])
-            V_red = 1.0 + 2.0 * (Rmat @ P_pu + X @ Q_pu)
+            # Accumulate once per timestep for radial flows
+            P_vec = np.array([P_inj[b] for b in net.bus.index], dtype=float)
+            Q_vec = np.array([Q_inj[b] for b in net.bus.index], dtype=float)
+            P_acc, Q_acc = accumulate_flows(P_vec, Q_vec)
 
-            # Track voltage stats
-            v_min = min(v_min, float(np.min(V_red)))
-            v_max = max(v_max, float(np.max(V_red)))
-            # Count voltage violations against typical 0.95-1.05 limits
-            if np.any(V_red < 0.95) or np.any(V_red > 1.05):
-                steps_voltage_violation += 1
+            # Voltage reconstruction (approximate DistFlow linear drop) if enabled
+            if VOLTAGE_EVAL_ENABLED:
+                Vbus = {slack_bus_index: VOLTAGE_SLACK_PU}
+                # Propagate parent -> children using subtree P/Q at child
+                for parent in bfs_order:
+                    Vp = Vbus.get(parent, VOLTAGE_SLACK_PU)
+                    for child in downstream_map.get(parent, []):
+                        if child in Vbus:  # already set
+                            continue
+                        r_x = line_rx_map.get((parent, child))
+                        if r_x is None:
+                            # If no direct mapping (shouldn't happen in radial assumption) inherit parent voltage
+                            Vbus[child] = Vp
+                            continue
+                        r_pu, x_pu = r_x
+                        # Subtree power at child in per-unit
+                        P_pu = P_acc[child] / Sbase_sys
+                        Q_pu = Q_acc[child] / Sbase_sys
+                        # Linear voltage drop approximation (ignore losses): V_child = V_parent - (r*P + x*Q)
+                        Vc = Vp - (r_pu * P_pu + x_pu * Q_pu)
+                        Vbus[child] = Vc
+                # Record min/max & violations for this timestep
+                if Vbus:
+                    vt = np.array(list(Vbus.values()), dtype=float)
+                    # Filter out any extreme numerical artifacts
+                    vt = vt[np.isfinite(vt)]
+                    if vt.size:
+                        v_min = min(v_min, float(vt.min()))
+                        v_max = max(v_max, float(vt.max()))
+                        # Thresholds (tight band if provided)
+                        v_lo = VOLTAGE_TIGHT_MIN_PU if VOLTAGE_TIGHT_MIN_PU is not None else VOLTAGE_MIN_PU
+                        v_hi = VOLTAGE_TIGHT_MAX_PU if VOLTAGE_TIGHT_MAX_PU is not None else VOLTAGE_MAX_PU
+                        violated = (vt < v_lo) | (vt > v_hi)
+                        if COUNT_VIOLATION_ON_ANY_BUS:
+                            if np.any(violated):
+                                steps_voltage_violation += 1
+                        else:
+                            steps_voltage_violation += int(np.sum(violated))
+            else:
+                # Voltage evaluation disabled; keep placeholders
+                pass
 
-            # Build full-bus voltage vector (mag + angle) for branch loading eval
-            # DC angle approx
-            theta_red = Bprime_inv @ P_pu if len(P_pu) > 0 else np.zeros(0)
-            theta = np.zeros(len(net.bus))
-            # Insert non-slack angles in order of non_slack_buses
-            for k, b in enumerate(non_slack_buses):
-                theta[b] = theta_red[k] if k < len(theta_red) else 0.0
-            # Voltage magnitudes
-            Vmag = np.ones(len(net.bus))
-            for k, b in enumerate(non_slack_buses):
-                Vmag[b] = V_red[k]
-            # Complex voltages
-            Vcomplex = Vmag * np.exp(1j * theta)
-
-            # Line loading
+            # Line loading (radial): flow on line = apparent power of downstream subtree at child bus
             any_line_over_thresh = False
+            # Prepare per-step series containers if exporting
+            if EXPORT_FULL_SERIES:
+                if 'series_rows' not in locals():
+                    series_rows = []
+                step_record = {
+                    'timestamp': ts,
+                    'sample_id': sid,
+                    't_index': t,
+                    'u_plus_mw': u_plus,
+                    'u_minus_mw': u_minus,
+                    'residual_policy_mw': resid_policy_t,
+                    'residual_post_actions_mw': resid_t,
+                    'bess_power_cmd_mw': p_bess_cmd,
+                    'bess_power_real_mw': p_real,
+                    'pv_extra_curtail_mw': extra_curt_used,
+                    'soc_frac': soc_series[t]
+                }
             for fb, tb, y, Imax_kA, Vbase_kV in line_data:
                 if Imax_kA <= 0:
                     continue
-                I_pu = (Vcomplex[fb] - Vcomplex[tb]) * y
-                I_kA = abs(I_pu) * (Sbase / (sqrt3 * Vbase_kV))
-                loading_pct = (I_kA / Imax_kA) * 100.0
+                S_child = np.sqrt(P_acc[tb]**2 + Q_acc[tb]**2)
+                # Approx current assuming nominal voltage
+                I_est_kA = (S_child) / (sqrt3 * max(Vbase_kV, 1e-6))
+                loading_pct = (I_est_kA / Imax_kA) * 100.0
                 if loading_pct > max_line_loading:
                     max_line_loading = float(loading_pct)
                 if loading_pct > LOADING_VIOLATION_THRESHOLD_PCT:
                     any_line_over_thresh = True
+                if EXPORT_FULL_SERIES:
+                    step_record[f'line_{fb}_{tb}_loading_pct'] = loading_pct
+                    step_record[f'line_{fb}_{tb}_p_mw'] = P_acc[tb]
+                    step_record[f'line_{fb}_{tb}_q_mvar'] = Q_acc[tb]
             if any_line_over_thresh:
                 steps_line_over_thresh += 1
 
-            # Transformer loading (LV side apparent power vs nameplate)
+            # Transformer loading (radial accumulation). OptionA/admittance distinction collapsed.
             any_trafo_over_thresh = False
             for idx_tr, (hv, lv, y_tr, sn_tr) in enumerate(trafo_data):
-                I_lv_pu = (Vcomplex[lv] - Vcomplex[hv]) * y_tr
-                S_lv_pu = Vcomplex[lv] * np.conj(I_lv_pu)
-                S_lv_MVA = abs(S_lv_pu) * Sbase
+                S_lv = np.sqrt(P_acc[lv]**2 + Q_acc[lv]**2)
                 if sn_tr > 0:
-                    loading_pct = (S_lv_MVA / sn_tr) * 100.0
+                    loading_pct = (S_lv / sn_tr) * 100.0
+                    if loading_pct > max_trafo_loading_optionA:
+                        max_trafo_loading_optionA = float(loading_pct)
                     if loading_pct > max_trafo_loading:
                         max_trafo_loading = float(loading_pct)
                     if loading_pct > LOADING_VIOLATION_THRESHOLD_PCT:
                         any_trafo_over_thresh = True
                     if LOG_TRAFO_LOADING:
                         trafo_loading_buffer.append((sid, t, idx_tr, np.float32(loading_pct)))
+                    if EXPORT_FULL_SERIES:
+                        step_record[f'trafo_{hv}_{lv}_loading_pct'] = loading_pct
+                        step_record[f'trafo_{hv}_{lv}_p_mw'] = P_acc[lv]
+                        step_record[f'trafo_{hv}_{lv}_q_mvar'] = Q_acc[lv]
             if any_trafo_over_thresh:
                 steps_trafo_over_thresh += 1
+
+            if EXPORT_FULL_SERIES:
+                # Bus voltages
+                if VOLTAGE_EVAL_ENABLED and 'Vbus' in locals():
+                    for b, vpu in Vbus.items():
+                        step_record[f'bus_{b}_voltage_pu'] = vpu
+                # Component powers (store even if zero when present earlier)
+                for b, val in comp_load.items():
+                    step_record[f'load_bus_{b}_p_mw'] = val
+                for b, val in comp_flex.items():
+                    step_record[f'flex_bus_{b}_p_mw'] = val
+                for b, val in comp_hp.items():
+                    step_record[f'hp_bus_{b}_p_mw'] = val
+                for b, val in comp_pv.items():
+                    step_record[f'pv_bus_{b}_p_mw'] = val
+                for b, val in comp_bess.items():
+                    step_record[f'bess_bus_{b}_p_mw'] = val
+                series_rows.append(step_record)
 
         # Flush buffer periodically
         if LOG_TRAFO_LOADING and trafo_loading_buffer and (i % TRAFO_LOADING_BUFFER_SAMPLES == 0 or i == total):
@@ -1045,12 +1650,13 @@ def main() -> None:
             except Exception as e:
                 print(f"[WARN] Failed to write transformer loading buffer: {e}")
 
-        # Summarize metrics including voltage and thermal bounds
+        # Summarize metrics including voltage & thermal bounds
         summ = _summarize_trajectory(index, price, net_import_rt, dt_hours, pv_total_rt, hp_resid_total, temp_sid['temperature_c'].to_numpy(dtype=float))
-        summ['v_min_pu'] = v_min
-        summ['v_max_pu'] = v_max
+        summ['v_min_pu'] = float(v_min) if np.isfinite(v_min) else np.nan
+        summ['v_max_pu'] = float(v_max) if np.isfinite(v_max) else np.nan
         summ['max_line_loading_pct'] = max_line_loading
         summ['max_trafo_loading_pct'] = max_trafo_loading
+        summ['max_trafo_loading_pct_optionA'] = max_trafo_loading_optionA
         summ['steps_line_over_80pct'] = int(steps_line_over_thresh)
         summ['steps_trafo_over_80pct'] = int(steps_trafo_over_thresh)
         summ['loading_violation_threshold_pct'] = float(LOADING_VIOLATION_THRESHOLD_PCT)
@@ -1073,21 +1679,35 @@ def main() -> None:
         summ['rt_bess_cycle_cost_eur'] = float(bess_cycle_cost_eur)
         summ['total_cost_eur'] = float(da_energy_cost_eur_const + pv_rt_curt_cost_eur + imbalance_cost_eur + bess_cycle_cost_eur)
         summ['sample_id'] = sid
+        # Store trajectory length and append (inside loop; previously mis-indented causing only last trajectory retained)
+        summ['n_steps'] = int(len(index))
+        # Attach static flexible load metrics (same for all trajectories)
+        summ.update(flex_metrics_static)
         per_traj_summary.append(summ)
+        collect_soc_frac.append(soc_series)
+
+        # Write full series for this trajectory (after loop) to avoid holding all trajectories in memory
+    # Only persist heavy per-trajectory series CSV when exactly one trajectory is simulated
+    if EXPORT_FULL_SERIES and total == 1 and 'series_rows' in locals() and series_rows:
+            os.makedirs(os.path.join(OUTDIR, FULL_SERIES_DIR), exist_ok=True)
+            try:
+                import pandas as _pd
+                series_df = _pd.DataFrame(series_rows)
+                # Order columns: timestamp, sample_id, then rest sorted for reproducibility
+                fixed_cols = ['timestamp','sample_id','t_index']
+                ordered = fixed_cols + [c for c in series_df.columns if c not in fixed_cols]
+                series_df = series_df[ordered]
+                token = _epsilon_token(EPSILON)
+                series_fname = f"trajectory_{drcc_mode}_epsilon_{token}_sample_{sid}.csv" if drcc_mode != 'drcc_false' else f"trajectory_{drcc_mode}_sample_{sid}.csv"
+                series_path = os.path.join(OUTDIR, FULL_SERIES_DIR, series_fname)
+                series_df.to_csv(series_path, index=False)
+                print(f"[series] Wrote full series for sample {sid} -> {series_path}")
+            except Exception as e:
+                print(f"[WARN] Failed to write full series for sample {sid}: {e}")
+            finally:
+                del series_rows
 
     token = _epsilon_token(EPSILON)
-    # Derive DRCC mode label from v2 filename if present
-    try:
-        base_v2_name = os.path.basename(v2_csv) if v2_csv else ''
-    except Exception:
-        base_v2_name = ''
-    if 'drcc_true' in base_v2_name:
-        drcc_mode = 'drcc_true'
-    elif 'drcc_false' in base_v2_name:
-        drcc_mode = 'drcc_false'
-    else:
-        # Fallback: infer from meta flags we wrote (network tightening logging flag not available here, so leave generic)
-        drcc_mode = 'drcc_unspecified'
 
     summary_df = pd.DataFrame(per_traj_summary)
     # Filename logic: omit epsilon token for deterministic (drcc_false) case
@@ -1098,10 +1718,193 @@ def main() -> None:
     summary_path = os.path.join(OUTDIR, summary_filename)
     summary_df.to_csv(summary_path, index=False)
 
+    # === Single-trajectory comprehensive plots ===
+    if PLOT_SINGLE_TRAJECTORY_DIAGNOSTICS and len(summary_df) == 1:
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            traj = summary_df.iloc[0]
+            # Locate the full series file we just wrote (if export enabled)
+            series_file = None
+            if EXPORT_FULL_SERIES:
+                token = _epsilon_token(EPSILON)
+                pattern_name = f"trajectory_{drcc_mode}_epsilon_{token}_sample_{traj['sample_id']}.csv" if drcc_mode != 'drcc_false' else f"trajectory_{drcc_mode}_sample_{traj['sample_id']}.csv"
+                candidate = os.path.join(OUTDIR, FULL_SERIES_DIR, pattern_name)
+                if os.path.exists(candidate):
+                    series_file = candidate
+            series_df = None
+            if series_file:
+                series_df = pd.read_csv(series_file, parse_dates=['timestamp'])
+                series_df = series_df.sort_values('timestamp')
+            # Helper plotting utilities
+            def _ts(ax, x, y, label=None, **kw):
+                ax.plot(x, y, label=label, **kw)
+            def _save(fig, name):
+                outp = os.path.join(OUTDIR, name)
+                fig.tight_layout()
+                fig.savefig(outp, dpi=140)
+                print(f"[plot] {outp}")
+            # 1. Voltages (all buses) if available
+            if series_df is not None:
+                v_cols = [c for c in series_df.columns if c.startswith('bus_') and c.endswith('_voltage_pu')]
+                if v_cols:
+                    fig, ax = plt.subplots(figsize=(10,4))
+                    for c in v_cols:
+                        ax.plot(series_df['timestamp'], series_df[c], linewidth=0.7, alpha=0.7)
+                    ax.set_title('Bus Voltages (p.u.)')
+                    ax.set_ylabel('p.u.')
+                    ax.grid(alpha=0.3)
+                    _save(fig, 'singletraj_bus_voltages.png')
+            # 2. Transformer loading
+            if series_df is not None:
+                trafo_cols = [c for c in series_df.columns if c.startswith('trafo_') and c.endswith('_loading_pct')]
+                if trafo_cols:
+                    fig, ax = plt.subplots(figsize=(10,4))
+                    for c in trafo_cols:
+                        ax.plot(series_df['timestamp'], series_df[c], linewidth=0.9, alpha=0.8)
+                    ax.axhline(LOADING_VIOLATION_THRESHOLD_PCT, color='red', linestyle='--', linewidth=1.0, label='threshold')
+                    ax.set_title('Transformer Loading %')
+                    ax.set_ylabel('%')
+                    ax.legend(fontsize=8)
+                    ax.grid(alpha=0.3)
+                    _save(fig, 'singletraj_trafo_loading.png')
+            # 3. Line loading (may be many; show up to first 40)
+            if series_df is not None:
+                line_cols = [c for c in series_df.columns if c.startswith('line_') and c.endswith('_loading_pct')]
+                if line_cols:
+                    subset = line_cols[:40]
+                    fig, ax = plt.subplots(figsize=(10,4))
+                    for c in subset:
+                        ax.plot(series_df['timestamp'], series_df[c], linewidth=0.6, alpha=0.6)
+                    ax.axhline(LOADING_VIOLATION_THRESHOLD_PCT, color='red', linestyle='--', linewidth=1.0)
+                    ax.set_title(f'Line Loading % (first {len(subset)})')
+                    ax.set_ylabel('%')
+                    ax.grid(alpha=0.3)
+                    _save(fig, 'singletraj_line_loading.png')
+            # 4. Component powers stacked (aggregate)
+            if series_df is not None:
+                t = series_df['timestamp']
+                # Build aggregate series from component per-bus columns
+                def _agg(prefix):
+                    cols = [c for c in series_df.columns if c.startswith(prefix)]
+                    if not cols:
+                        return np.zeros(len(series_df))
+                    return series_df[cols].sum(axis=1).to_numpy()
+                p_load = _agg('load_bus_')
+                p_flex = _agg('flex_bus_')
+                p_hp = _agg('hp_bus_')
+                p_pv = _agg('pv_bus_')
+                p_bess = _agg('bess_bus_')
+                fig, ax = plt.subplots(figsize=(10,4))
+                ax.plot(t, p_load, label='Base Load', linewidth=1.1)
+                ax.plot(t, p_flex, label='Flex Load', linewidth=1.1)
+                ax.plot(t, p_hp, label='HP Elec', linewidth=1.1)
+                ax.plot(t, p_pv, label='PV Inject', linewidth=1.1)
+                ax.plot(t, p_bess, label='BESS Power', linewidth=1.1)
+                ax.set_title('Aggregate Component Powers (MW)')
+                ax.set_ylabel('MW')
+                ax.grid(alpha=0.3)
+                ax.legend(fontsize=8, ncol=3)
+                _save(fig, 'singletraj_component_powers.png')
+
+                # --- Diagnostic: compare flex aggregate vs original v2 flex load columns ---
+                try:
+                    if LOAD_LOAD_VALUES_FROM_V2:
+                        v2_flex_cols = [c for c in df.columns if c.startswith('load_flex_p_bus_') and c.endswith('_mw')]
+                        if v2_flex_cols:
+                            # Ensure we have a pure datetime index
+                            if not isinstance(df.index, pd.DatetimeIndex):
+                                # Attempt to coerce using 'timestamp' column if present
+                                if 'timestamp' in df.columns:
+                                    _ts_coerced = pd.to_datetime(df['timestamp'])
+                                else:
+                                    _ts_coerced = pd.RangeIndex(start=0, stop=len(df), step=1)
+                            else:
+                                _ts_coerced = df.index
+                            v2_sum = df[v2_flex_cols].sum(axis=1).to_numpy()
+                            # Align by position (assumes same horizon). If lengths differ, trim to min length.
+                            n_common = min(len(v2_sum), len(p_flex))
+                            comp_df = pd.DataFrame({
+                                'timestamp': t[:n_common].to_numpy(),
+                                'flex_v2_sum_mw': v2_sum[:n_common],
+                                'flex_v3_sum_mw': p_flex[:n_common]
+                            })
+                            comp_df['diff_mw'] = comp_df['flex_v3_sum_mw'] - comp_df['flex_v2_sum_mw']
+                            comp_df['rel_pct'] = np.where(comp_df['flex_v2_sum_mw'].abs() > 1e-9,
+                                                          100.0 * comp_df['diff_mw'] / comp_df['flex_v2_sum_mw'], np.nan)
+                            token = _epsilon_token(EPSILON)
+                            sample_id = str(traj['sample_id'])
+                            out_comp = os.path.join(OUTDIR, f'flex_load_comparison_{token}_sample_{sample_id}.csv')
+                            comp_df.to_csv(out_comp, index=False)
+                            abs_max = comp_df['diff_mw'].abs().max()
+                            energy_diff = float((comp_df['diff_mw'] * dt_hours).sum()) if 'dt_hours' in locals() else float(np.nan)
+                            print(f"[diag-flex] Wrote {out_comp} | max_abs_diff={abs_max:.6f} MW | energy_diff={energy_diff:.6f} MWh")
+                        else:
+                            print("[diag-flex] No v2 load_flex_p_bus_* columns found for comparison.")
+                except Exception as _e_diag:
+                    print(f"[diag-flex] Failed flex comparison diagnostic: {_e_diag}")
+            # 5. SoC time series if envelope file exists (we have only single trajectory SoC series in series_df)
+            if series_df is not None and 'soc_frac' in series_df.columns:
+                fig, ax = plt.subplots(figsize=(10,3.2))
+                ax.plot(series_df['timestamp'], series_df['soc_frac'], color='#1b9e77')
+                ax.set_ylim(0, 1.02)
+                ax.set_title('BESS State of Charge (fraction)')
+                ax.set_ylabel('SoC')
+                ax.grid(alpha=0.3)
+                _save(fig, 'singletraj_soc.png')
+            # 6. Residual & actions
+            if series_df is not None and {'residual_policy_mw','residual_post_actions_mw'} <= set(series_df.columns):
+                fig, ax = plt.subplots(figsize=(10,3.5))
+                ax.plot(series_df['timestamp'], series_df['residual_policy_mw'], label='Policy residual', linewidth=1.0)
+                ax.plot(series_df['timestamp'], series_df['residual_post_actions_mw'], label='Post-actions residual', linewidth=1.0)
+                ax.set_title('Residual Trajectories (MW)')
+                ax.set_ylabel('MW')
+                ax.axhline(0, color='black', linewidth=0.8)
+                ax.grid(alpha=0.3)
+                ax.legend(fontsize=8)
+                _save(fig, 'singletraj_residuals.png')
+            # 7. Net import vs price (if price present)
+            if 'electricity_price_eur_mwh' in df.columns:
+                fig, ax1 = plt.subplots(figsize=(10,4))
+                ax1.plot(df.index, np.maximum(base_net_import,0.0), label='DA Import MW', color='#4c72b0')
+                ax1.set_ylabel('Import MW')
+                ax2 = ax1.twinx()
+                ax2.plot(df.index, df['electricity_price_eur_mwh'], label='Price EUR/MWh', color='#dd8452', alpha=0.7)
+                ax2.set_ylabel('EUR/MWh')
+                ax1.set_title('DA Import & Price')
+                ax1.grid(alpha=0.3)
+                _save(fig, 'singletraj_da_price.png')
+        except Exception as e:
+            print(f"[WARN] Failed to produce single trajectory plots: {e}")
+
+    # Export SoC envelope (05/50/95) across trajectories with naming consistent to summary/meta
+    soc_env_path = None
+    if collect_soc_frac:
+        try:
+            soc_mat = np.vstack(collect_soc_frac)
+            soc_p05 = np.percentile(soc_mat, 5, axis=0)
+            soc_p50 = np.percentile(soc_mat, 50, axis=0)
+            soc_p95 = np.percentile(soc_mat, 95, axis=0)
+            soc_env_df = pd.DataFrame({
+                'timestamp': index,
+                'soc_p05': soc_p05,
+                'soc_p50': soc_p50,
+                'soc_p95': soc_p95,
+            })
+            if drcc_mode == 'drcc_false':
+                soc_env_filename = 'soc_envelope_drcc_false.csv'
+            else:
+                soc_env_filename = f"soc_envelope_{drcc_mode}_epsilon_{token}.csv"
+            soc_env_path = os.path.join(OUTDIR, soc_env_filename)
+            soc_env_df.to_csv(soc_env_path, index=False)
+            print(f"✓ SoC envelope written: {soc_env_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to write SoC envelope: {e}")
+
     meta = {
         'v2_results_csv': os.path.abspath(v2_csv),
-    'epsilon': EPSILON,
-    'drcc_mode': drcc_mode,
+        'epsilon': EPSILON,
+        'drcc_mode': drcc_mode,
         'samples_dir': os.path.abspath(SAMPLES_DIR),
         'dt_hours': float(dt_hours),
         'n_trajectories': int(len(summary_df)),
@@ -1115,8 +1918,36 @@ def main() -> None:
         },
         'ignore_hp_residual': bool(IGNORE_HP_RESIDUAL),
         'use_mean_centered_policy': bool(USE_MEAN_CENTERED_POLICY),
-        'trafo_loading_logging': bool(LOG_TRAFO_LOADING)
+    'trafo_loading_logging': bool(LOG_TRAFO_LOADING),
+    'use_optionA_flow': bool(USE_OPTIONA_FLOW),
+    'compare_flows': bool(COMPARE_FLOWS)
     }
+    # Add residual basis descriptor
+    meta['rt_residual_basis'] = 'mean_centered' if USE_MEAN_CENTERED_POLICY else 'schedule'
+    if soc_env_path:
+        meta['soc_envelope_file'] = os.path.basename(soc_env_path)
+    # Policy coefficients export (raw)
+    policy_coeffs_path = None
+    policy_cols = [c for c in [
+        'lambda0_mw','lambda_plus','lambda_minus',
+        'chi0_mw','chi_minus',
+        'gamma0_mw','gamma_plus',
+        'rho_plus_0','rho_plus_1','rho_minus_0','rho_minus_1'
+    ] if c in df.columns]
+    if policy_cols:
+        try:
+            policy_df = df[policy_cols].copy()
+            policy_df.insert(0, 'timestamp', df.index)
+            if drcc_mode == 'drcc_false':
+                policy_coeffs_filename = 'policy_coeffs_drcc_false.csv'
+            else:
+                policy_coeffs_filename = f"policy_coeffs_{drcc_mode}_epsilon_{token}.csv"
+            policy_coeffs_path = os.path.join(OUTDIR, policy_coeffs_filename)
+            policy_df.to_csv(policy_coeffs_path, index=False)
+            print(f"✓ Policy coefficients written: {policy_coeffs_path}")
+            meta['policy_coeffs_file'] = os.path.basename(policy_coeffs_path)
+        except Exception as e:
+            print(f"[WARN] Failed to export policy coefficients: {e}")
     if LOG_TRAFO_LOADING and trafo_meta_records:
         meta['trafo_loading_file'] = os.path.join(TRAFO_LOADING_DIR_NAME, f"{TRAFO_LOADING_FILENAME_PREFIX}{_epsilon_token(EPSILON)}.parquet")
         meta['n_trafos'] = len(trafo_meta_records)

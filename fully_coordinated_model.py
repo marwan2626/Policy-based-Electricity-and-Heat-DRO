@@ -70,7 +70,7 @@ print("LOADING AND PROCESSING LOAD PROFILE")
 print("="*80)
 
 # Default optimization parameters
-START_DATE = "2023-06-10 00:00:00"  # Can be modified when running the optimization
+START_DATE = "2023-01-10 00:00:00"  # Can be modified when running the optimization
 DURATION_HOURS = 24  # Can be modified when running the optimization
 
 # Allow runtime override of START_DATE/DURATION_HOURS via CLI args or environment
@@ -1092,6 +1092,107 @@ def create_comprehensive_plots(results_df, hp_power_values, load_factors, ambien
     plt.tight_layout()
     plt.savefig('fully_coordinated_model_results.png', dpi=300, bbox_inches='tight')
     plt.show()
+
+    # Separate plot: Thermal Storage operation with green/red area fills (charging/discharging)
+    try:
+        if 'q_storage_kw' in results_df.columns:
+            ts_series = results_df['q_storage_kw'].to_numpy()
+            x_ts = np.arange(len(ts_series))
+
+            # Two-column paper friendly size
+            fig, ax = plt.subplots(figsize=(7.25, 4.5))
+            # Ensure white background and framed axes
+            fig.patch.set_facecolor('white')
+            ax.set_facecolor('white')
+            ax.plot(x_ts, ts_series, color='black', linewidth=1.8, label='TS power (kW)', zorder=3)
+            ax.axhline(y=0.0, color='gray', linestyle='--', linewidth=1.0, alpha=0.8)
+
+            # No legend entries for shaded areas
+
+            # Dual-color shaded areas above/below zero baseline
+            ax.fill_between(x_ts, ts_series, 0, where=(ts_series >= 0), facecolor='green', alpha=0.35, interpolate=True, zorder=1)
+            ax.fill_between(x_ts, ts_series, 0, where=(ts_series <= 0), facecolor='red', alpha=0.35, interpolate=True, zorder=1)
+
+            # Try to overlay electricity price on the right y-axis
+            price_series = None
+            try:
+                if 'price_EUR_MWh' in results_df.columns:
+                    price_series = results_df['price_EUR_MWh'].values
+                elif 'electricity_price' in results_df.columns:
+                    price_series = results_df['electricity_price'].values
+                elif 'electricity_price_eur_mwh' in results_df.columns:
+                    price_series = results_df['electricity_price_eur_mwh'].values
+                elif 'price_eur_mwh' in results_df.columns:
+                    price_series = results_df['price_eur_mwh'].values
+                elif electricity_price is not None:
+                    arr = np.asarray(electricity_price)
+                    price_series = arr
+            except Exception:
+                price_series = None
+
+            if price_series is not None:
+                try:
+                    # Normalize shape to match timeline
+                    if getattr(price_series, 'ndim', 1) == 0:
+                        price_series = np.full(len(x_ts), float(price_series))
+                    if len(price_series) < len(x_ts):
+                        pad_val = float(price_series[-1]) if len(price_series) > 0 else 0.0
+                        price_series = np.concatenate([np.asarray(price_series), np.full(len(x_ts) - len(price_series), pad_val)])
+                    price_to_plot = np.asarray(price_series)[:len(x_ts)]
+
+                    ax2 = ax.twinx()
+                    ax2.plot(x_ts, price_to_plot, color='red', linewidth=1.6, label='Electricity Price (EUR/MWh)')
+                    ax2.set_ylabel('Price (EUR/MWh)')
+                    # Match right-axis tick count to left-axis and disable right-axis grid
+                    try:
+                        from matplotlib.ticker import MaxNLocator
+                        left_tick_count = len(ax.get_yticks())
+                        if left_tick_count > 0:
+                            ax2.yaxis.set_major_locator(MaxNLocator(nbins=left_tick_count))
+                    except Exception:
+                        pass
+                    ax2.grid(False)
+
+                    # Combine legends from both axes
+                    lines1, labels1 = ax.get_legend_handles_labels()
+                    lines2, labels2 = ax2.get_legend_handles_labels()
+                    ax.legend(lines1 + lines2, labels1 + labels2, loc='lower right', fontsize=10)
+                except Exception:
+                    # If price plotting fails, proceed with TS power only
+                    ax.legend(loc='lower right', fontsize=10)
+            else:
+                ax.legend(loc='lower right', fontsize=10)
+
+            #ax.set_title('Thermal Storage Power (kW) — Shaded Area', fontsize=12, fontweight='bold', fontname='Times New Roman')
+            ax.set_xlabel('time step', fontname='Times New Roman')
+            ax.set_ylabel('Power (kW)', fontname='Times New Roman')
+            # Times New Roman ticks
+            for lbl in ax.get_xticklabels() + ax.get_yticklabels():
+                lbl.set_fontname('Times New Roman')
+            if 'ax2' in locals():
+                ax2.set_ylabel('Price (EUR/MWh)', fontname='Times New Roman')
+                for lbl in ax2.get_yticklabels():
+                    lbl.set_fontname('Times New Roman')
+            # Frame spines
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_linewidth(1.0)
+                spine.set_color('black')
+            if 'ax2' in locals():
+                for spine in ax2.spines.values():
+                    spine.set_visible(True)
+                    spine.set_linewidth(1.0)
+                    spine.set_color('black')
+            # Light gray y-grid behind shading
+            ax.set_axisbelow(True)
+            ax.grid(True, axis='y', color='lightgray', alpha=0.6, linewidth=0.6)
+            fig.tight_layout()
+            fig.savefig('thermal_storage_operation_area.png', dpi=300, bbox_inches='tight')
+            plt.show()
+        else:
+            print("Note: 'q_storage_kw' column not found in results_df; skipping TS operation area plot.")
+    except Exception as _e:
+        print(f"Warning: failed to create TS operation area plot: {_e}")
     
     print("All plots have been generated and saved!")
 
@@ -1984,7 +2085,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
 
     bess_eff = 0.95  # Round-trip efficiency
     bess_initial_soc = 0.5  # Initial state of charge as a percentage of capacity
-    bess_capacity_mwh = 0.25  # BESS capacity in MWh
+    bess_capacity_mwh = 0.40  # BESS capacity in MWh
     bess_cost_per_mwh = 5.1 # Cost per MWh of BESS capacity
 
     ### Define the variables ###
@@ -2666,7 +2767,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     # THERMAL STORAGE PARAMETERS (Series Configuration)
     
     # Storage parameters
-    STORAGE_CAPACITY_J = 5000e6        # Storage capacity: 5000 MJ (≈1390 kWh thermal)
+    STORAGE_CAPACITY_J = 2000e6        # Storage capacity: 2000 MJ (≈1390 kWh thermal)
     STORAGE_EFFICIENCY = 0.98         # Round-trip efficiency (charging/discharging)
     STORAGE_HEAT_LOSS_COEFF = 2/1e6       # Heat loss coefficient
     STORAGE_CP_J_KG_K = 4188         # Specific heat capacity of storage medium [J/kg.K]
@@ -3258,7 +3359,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     except Exception:
         dt_hours = 1.0
     
-    COST_SLACK = 100         # Cost per Wh of slack heat (expensive backup)
+    COST_SLACK = 1.25 * 120 * 15         # Cost per MWh of gas heat (expensive backup), efficiency 80%, carbon 1.5 c/kWh carbon tax all in €/MWh
+    COST_TS = 100
     
     total_slack_cost = gp.quicksum(Q_slack[t] * COST_SLACK / 1e6 for t in time_steps)
     
@@ -3392,20 +3494,20 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         # Compute and print cost breakdown from the solved variables/results
         try:
             # Electricity cost (uses import+export as in objective)
-            electricity_cost_value = sum(electricity_price[t] * (ext_grid_import_P_results.get(t, 0.0) + ext_grid_export_P_results.get(t, 0.0)) for t in time_steps)
+            electricity_cost_value = sum(electricity_price[t] * dt_hours * (ext_grid_import_P_results.get(t, 0.0) + ext_grid_export_P_results.get(t, 0.0)) for t in time_steps)
         except Exception:
             electricity_cost_value = None
 
         try:
             if len(bess_buses) > 0:
-                bess_cost_value = sum(bess_cost_per_mwh * (sum(bess_charge_results[t].values()) + sum(bess_discharge_results[t].values())) for t in time_steps)
+                bess_cost_value = sum(bess_cost_per_mwh * dt_hours * (sum(bess_charge_results[t].values()) + sum(bess_discharge_results[t].values())) for t in time_steps)
             else:
                 bess_cost_value = 0.0
         except Exception:
             bess_cost_value = None
 
         try:
-            y_cap_cost_value = sum(electricity_price[t] * flex_curtail_P_results.get(t, 0.0) for t in time_steps)
+            y_cap_cost_value = sum(2 * electricity_price[t] * dt_hours * flex_curtail_P_results.get(t, 0.0) for t in time_steps)
         except Exception:
             y_cap_cost_value = None
 
@@ -3423,10 +3525,15 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             total_slack_cost_value = None
 
         try:
+            ts_cost_value = sum(COST_TS * dt_hours * (abs(Q_storage[t].x) / 1e6) for t in time_steps)
+        except Exception:
+            ts_cost_value = None
+
+        try:
             total_cost_value = None
             # Prefer computing from components when available
-            if None not in (electricity_cost_value, bess_cost_value, y_cap_cost_value, pv_curtail_cost_value, total_slack_cost_value):
-                total_cost_value = electricity_cost_value + bess_cost_value + y_cap_cost_value + pv_curtail_cost_value + total_slack_cost_value
+            if None not in (electricity_cost_value, bess_cost_value, y_cap_cost_value, pv_curtail_cost_value, total_slack_cost_value, ts_cost_value):
+                total_cost_value = electricity_cost_value + bess_cost_value + y_cap_cost_value + pv_curtail_cost_value + total_slack_cost_value + ts_cost_value
             else:
                 # Fallback to model objective value if components couldn't be computed
                 total_cost_value = model.ObjVal
@@ -3439,6 +3546,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         print(f"  y_cap_cost (flex curtail) = {y_cap_cost_value}")
         print(f"  pv_curtail_cost = {pv_curtail_cost_value}")
         print(f"  total_slack_cost = {total_slack_cost_value}")
+        print(f"  ts_cost (thermal storage) = {ts_cost_value}")
         print(f"  total_cost (components sum or model.ObjVal) = {total_cost_value}")
         try:
             print(f"  model.ObjVal = {model.ObjVal}")
@@ -3460,6 +3568,23 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         print(f"Slack percentage of total: {(total_slack_energy_kWh/(total_hp_energy_kWh + total_slack_energy_kWh))*100:.1f}%")
         print(f"Average heat pump power: {total_hp_energy_J / (NUM_PERIODS * delta_t_s) / 1000:.1f} kW")
         print(f"Average slack power: {total_slack_energy_J / (NUM_PERIODS * delta_t_s) / 1000:.1f} kW")
+        # Report maximum transformer loading across all transformers and periods
+        try:
+            if 'transformer_loading' in results and len(net.trafo.index) > 0:
+                max_loading = float('-inf')
+                max_t = None
+                max_trafo = None
+                for t in time_steps:
+                    for trafo_idx in net.trafo.index:
+                        val = transformer_loading_results[t][trafo_idx]
+                        if val > max_loading:
+                            max_loading = val
+                            max_t = t
+                            max_trafo = trafo_idx
+                if max_t is not None:
+                    print(f"Maximum transformer loading: {max_loading:.1f}% at period {max_t+1} (trafo {max_trafo})")
+        except Exception:
+            pass
         
         # # Show results for first few and last few periods
         # print(f"\n" + "="*80)

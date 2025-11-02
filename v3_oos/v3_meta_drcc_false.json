@@ -1,10 +1,11 @@
 {
   "v2_results_csv": "C:\\Users\\ckw5258\\Desktop\\Github\\Policy-based-Electricity-and-Heat-DRO\\dso_model_v2_results_drcc_false.csv",
-  "epsilon": 0.3,
+  "epsilon": 0.1,
   "drcc_mode": "drcc_false",
   "samples_dir": "C:\\Users\\ckw5258\\Desktop\\Github\\Policy-based-Electricity-and-Heat-DRO\\samples",
+  "sample_distribution": "gaussian",
   "dt_hours": 0.25,
-  "n_trajectories": 1000,
+  "n_trajectories": 10,
   "metrics": [
     "import_mwh",
     "energy_cost_eur",
@@ -46,17 +47,19 @@
   "rt_cost_factors": {
     "imb_up_factor": 1.3,
     "imb_dn_factor": 1.3,
-    "pv_curt_price_factor": 1.0,
-    "bess_throughput_cost_eur_per_mwh": 0.5
+    "pv_curt_price_factor": 1.3,
+    "bess_throughput_cost_eur_per_mwh": 5.1
   },
   "ignore_hp_residual": false,
   "use_mean_centered_policy": true,
+  "match_drcc_hp_scaling": true,
+  "n_hp_devices": 1,
   "trafo_loading_logging": true,
   "use_optionA_flow": true,
   "compare_flows": false,
   "rt_residual_basis": "mean_centered",
   "soc_envelope_file": "soc_envelope_drcc_false.csv",
   "policy_coeffs_file": "policy_coeffs_drcc_false.csv",
-  "trafo_loading_file": "v3_loading\\trafo_loading_raw_epsilon_0_30.parquet",
+  "trafo_loading_file": "v3_loading\\trafo_loading_raw_drcc_false.parquet",
   "n_trafos": 1
 }

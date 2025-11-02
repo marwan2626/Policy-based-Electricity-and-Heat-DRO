@@ -41,8 +41,14 @@ RESULTS_CSV: str | None = None
 N_SAMPLES: int = 1000
 
 # Distribution type for random draws (affects all stochastic components).
-# Options: "gaussian" (standard normal based) or "uniform" (variance-matched U(-sqrt(3), +sqrt(3))).
-DISTRIBUTION: str = "gaussian"
+# Options: "gaussian" (standard normal), "uniform" (variance-matched U(-√3, +√3)),
+#          "contaminated" (95% N(0,1) + 5% N(0,(k)^2) normalized to unit variance; k≈5 for outliers),
+#          "studentt" (Student-t with df=3, scaled to unit variance)
+DISTRIBUTION: str = "studentt"
+
+# Contaminated normal parameters
+CONTAM_RATE: float = 0.05  # 5% of draws from the inflated-variance component
+CONTAM_SCALE_K: float = 5.0  # outlier std multiplier (kσ)
 
 # Random seed for reproducibility. Use any integer to change the random stream.
 SEED: int = 42
@@ -213,35 +219,96 @@ def generate_samples(
 	# Prep RNG & validate distribution
 	rng = np.random.default_rng(seed)
 	distribution = distribution.lower().strip()
-	if distribution not in {"gaussian", "uniform"}:
-		raise ValueError(f"Unsupported distribution '{distribution}'. Use 'gaussian' or 'uniform'.")
+	if distribution not in {"gaussian", "uniform", "contaminated", "studentt"}:
+		raise ValueError(f"Unsupported distribution '{distribution}'. Use 'gaussian', 'uniform', 'contaminated', or 'studentt'.")
+
+	# For contaminated distribution, implement sample-wise contamination:
+	# choose a fixed subset of sample_ids that get higher sigma across all draws.
+	# We normalize by sqrt((1-p) + p*k^2) so overall variance across samples remains ~1.
+	contam_scale_per_sample: np.ndarray | None = None
+	contam_meta: Dict[str, object] | None = None
+	if distribution == "contaminated":
+		p = float(CONTAM_RATE)
+		k = float(CONTAM_SCALE_K)
+		# Fixed mask over samples (trajectories): True => high-sigma sample
+		high_sigma_mask = rng.random(n_samples) < p
+		var_mix = (1.0 - p) * 1.0 + p * (k ** 2)
+		norm = float(np.sqrt(var_mix)) if var_mix > 0 else 1.0
+		contam_scale_per_sample = np.where(high_sigma_mask, k, 1.0).astype(float) / norm
+		# stash meta for later
+		contaminated_sample_ids = [f"s{str(i+1).zfill(4)}" for i, m in enumerate(high_sigma_mask) if m]
+		contam_meta = {
+			'contamination_mode': 'sample-wise',
+			'contamination_rate': p,
+			'contamination_scale_k': k,
+			'contaminated_sample_ids': contaminated_sample_ids,
+			'contamination_variance_normalizer': var_mix,
+		}
 
 	def _draw_standard(size):
-		"""Draw standard (mean 0, var 1) variates according to selected distribution."""
+		"""Draw standard (mean 0, var 1) variates according to selected distribution.
+		In 'contaminated' mode, applies a per-sample scaling on the last axis (length n_samples).
+		"""
 		if distribution == "gaussian":
 			return rng.standard_normal(size=size)
-		# Uniform with same variance as standard normal: U(-sqrt(3), +sqrt(3)) has Var=1
-		bound = np.sqrt(3.0)
-		return rng.uniform(-bound, bound, size=size)
+		if distribution == "uniform":
+			# Uniform with same variance as standard normal: U(-sqrt(3), +sqrt(3)) has Var=1
+			bound = np.sqrt(3.0)
+			return rng.uniform(-bound, bound, size=size)
+		if distribution == "studentt":
+			# Student-t with df=3 has Var = df/(df-2) = 3; scale by 1/sqrt(3) to get Var=1
+			df_t = 3.0
+			scale = 2.0 / np.sqrt(df_t / (df_t - 2.0))  # = 1/sqrt(3)
+			return rng.standard_t(df_t, size=size) * scale
+		# Contaminated normal (sample-wise): base standard normal scaled per sample id
+		z = rng.standard_normal(size=size)
+		# Ensure we can broadcast per-sample scaling along the last axis
+		assert contam_scale_per_sample is not None
+		# Build a view with ones on all leading dims and n_samples on the last
+		try:
+			last_dim = z.shape[-1]  # type: ignore[attr-defined]
+		except Exception:
+			last_dim = None
+		if last_dim is None:
+			# scalar draw not supported in contaminated mode
+			raise ValueError("Contaminated mode expects draws with a samples axis; got scalar.")
+		if last_dim != n_samples:
+			raise ValueError(
+				f"Contaminated mode expects the last dimension to equal n_samples={n_samples}, got {last_dim}."
+			)
+		scale = contam_scale_per_sample.reshape((1,) * (z.ndim - 1) + (n_samples,))
+		return z * scale
 
 	# Contract for outputs
 	nT = len(index)
 	sample_cols = [f"s{str(i+1).zfill(4)}" for i in range(n_samples)]
 
-	# 1) Temperature samples: add a daily common shift ΔT_d to all timestamps of that day
+	# 1) Temperature samples: per-interval equicorrelated structure within each day
+	#    For times t in a day, with per-interval std s_t and equicorrelation rho among times of that day:
+	#      T_t = mu_t + s_t * (sqrt(rho) * Z_c + sqrt(1-rho) * Z_t), Z_c ~ N(0,1), Z_t ~ N(0,1) iid
+	#    This matches per-interval variance s_t^2 and yields Var(daily_mean) per v2 DRCC formula.
 	temp_samples = np.zeros((nT, n_samples), dtype=float)
-	# Build map from row idx to day
+	# Group indices by day
 	idx_to_day = [ts.date() for ts in index]
-	day_to_shift = {}
-	for day in set(idx_to_day):
-		std_day = float(sigma_Tavg_by_day.get(day, 0.0))
-		if std_day <= 0:
-			day_to_shift[day] = np.zeros(n_samples)
-		else:
-			standard_draws = _draw_standard(size=n_samples)
-			day_to_shift[day] = std_day * standard_draws
-	for t, day in enumerate(idx_to_day):
-		temp_samples[t, :] = T_mean_c[t] + day_to_shift[day]
+	unique_days = sorted(set(idx_to_day))
+	rho = float(np.clip(meta['rho_temp_avg'], 0.0, 1.0))
+	sqrt_rho = np.sqrt(rho)
+	sqrt_1mrho = np.sqrt(max(0.0, 1.0 - rho))
+	# Iterate by day and fill blocks
+	for day in unique_days:
+		pos = np.array([i for i, d in enumerate(idx_to_day) if d == day], dtype=int)
+		if pos.size == 0:
+			continue
+		s_t = T_std_k[pos].astype(float)
+		mu_t = T_mean_c[pos].astype(float)
+		# Common shock per sample for this day
+		zc = _draw_standard(size=n_samples)
+		# Idiosyncratic shocks per time per sample
+		zi = _draw_standard(size=(pos.size, n_samples))
+		# Compose per interval/samples
+		# Broadcast: s_t[:,None] * (sqrt_rho*zc[None,:] + sqrt_1mrho*zi)
+		block = mu_t[:, None] + (s_t[:, None] * (sqrt_rho * zc[None, :] + sqrt_1mrho * zi))
+		temp_samples[pos, :] = block
 
 	# 2) PV samples per PV bus with equicorrelation across buses within each timestep
 	pv_samples_by_bus: Dict[int, np.ndarray] = {b: np.zeros((nT, n_samples), dtype=float) for b in pv_bus_ids}
@@ -317,6 +384,7 @@ def generate_samples(
 		'dt_hours': meta['dt_hours'],
 		'pv_rho': rho_pv,
 		'rho_temp_avg': meta['rho_temp_avg'],
+		'temperature_model': 'per_interval_equicorr',
 		'hp_residual_sigma_norm': meta['hp_residual_sigma_norm'],
 		'hp_pred_pmax_mw': meta['hp_pred_pmax_mw'],
 		'pv_installed_mw': installed_pv_mw,
@@ -325,6 +393,11 @@ def generate_samples(
 		'notes': "PV samples represent available PV MW (pre-curtailment); temperature samples add daily-average uncertainty; HP residual is additive to HP predictor."
 	}
 	meta_out['distribution'] = distribution
+	if distribution == 'contaminated' and contam_meta is not None:
+		# enrich metadata with contamination details
+		meta_out.update(contam_meta)
+	if distribution == 'studentt':
+		meta_out['student_t_df'] = 3
 	with open(os.path.join(outdir, 'samples_meta.json'), 'w', encoding='utf-8') as f:
 		json.dump(meta_out, f, indent=2)
 
@@ -339,7 +412,7 @@ def main():
 	parser.add_argument('--results-csv', type=str, default=None, help='Optional: path to dso_model_v2 results CSV; if omitted, uses USER CONFIG or latest in CWD')
 	parser.add_argument('--n-samples', type=int, default=None, help='Optional: override USER CONFIG N_SAMPLES (or ENV GEN_N_SAMPLES)')
 	parser.add_argument('--seed', type=int, default=None, help='Optional: override USER CONFIG SEED')
-	parser.add_argument('--distribution', '--dist', type=str, choices=['gaussian', 'uniform'], default=None, help='Override distribution (gaussian|uniform). If omitted, uses USER CONFIG DISTRIBUTION.')
+	parser.add_argument('--distribution', '--dist', type=str, choices=['gaussian', 'uniform', 'contaminated', 'studentt'], default=None, help='Override distribution (gaussian|uniform|contaminated|studentt). If omitted, uses USER CONFIG DISTRIBUTION.')
 	parser.add_argument('--outdir', type=str, default=None, help='Optional: override USER CONFIG OUTDIR')
 	parser.add_argument('--clean-old', action='store_true', help='Optional: override USER CONFIG CLEAN_OLD to True')
 	args = parser.parse_args()

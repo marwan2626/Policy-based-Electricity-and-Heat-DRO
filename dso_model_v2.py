@@ -86,6 +86,11 @@ that and also introduces an environment/CLI hook for DRCC tightening.
 # Real-time (second-stage) policy coefficients in day-ahead model (robust affine policy proxies)
 ENABLE_RT_POLICIES = True  # <--- EDIT ME (base default)
 
+# Residual basis for RT policy semantics (to match v3 OOS by default):
+# True  -> use mean-centered residual (Chebyshev-consistent; zero-mean shocks drive affine policy)
+# False -> use schedule-based residual semantics (legacy)
+USE_MEAN_CENTERED_POLICY = True  # <--- EDIT ME (base default to match v3)
+
 # Allow command-line or environment to override ENABLE_RT_POLICIES.
 # Set to False to lock the above value regardless of CLI/env.
 ALLOW_RT_FLAG_RUNTIME_OVERRIDE = True
@@ -93,11 +98,11 @@ ENABLE_DRCC_RT_BUDGETS = True  # <--- EDIT ME (uses PV/temperature std to size D
 DRCC_EPSILON = 0.10            # chance violation level; k = sqrt((1-eps)/eps)
 
 # DRCC-based network tightening (transformers, lines, voltages)
-ENABLE_DRCC_NETWORK_TIGHTENING = False  # <--- EDIT ME (base default)
+ENABLE_DRCC_NETWORK_TIGHTENING = True  # <--- EDIT ME (base default)
 # You can selectively toggle sub-components when master is ON
-DRCC_TIGHTEN_TRAFO = False
-DRCC_TIGHTEN_LINES = False
-DRCC_TIGHTEN_VOLTAGES = False
+DRCC_TIGHTEN_TRAFO = True
+DRCC_TIGHTEN_LINES = True
+DRCC_TIGHTEN_VOLTAGES = True
 # Deterministic baseline semantics when DRCC tightening is OFF:
 # True  -> k_epsilon = 0.0 (fully deterministic design: no nominal sigma allowance)
 # False -> k_epsilon = 1.0 (legacy neutral baseline retaining a 1σ allowance without amplification)
@@ -110,12 +115,12 @@ PV_STD_FROM_CSV = True         # try to read pv std from pv_profiles_output.csv
 PV_RELATIVE_STD = 0.20         # fallback relative std of PV availability (fraction of avail)
 PV_STD_CORRELATION = 1.00      # used only if constructing from per-bus stds (not CSV aggregate)
 HP_FULLY_CORRELATED = True     # temperature is common across HPs
-RHO_TEMP_AVG = 0             # 0=independent, 1=fully correlated within day
+RHO_TEMP_AVG = 1             # 0=independent, 1=fully correlated within day
 # Capacity buy-back pricing (EUR per MW-hour of purchased connection reduction)
 # Flexible load curtailment economics (simple formulation):
 # flex_load(t,b) = baseline(t,b) - curt(t,b); y_cap(t) = sum_b curt(t,b)
 # Cost contribution (per period): y_cap(t) * CURT_PENALTY (optionally * dt_hours later)
-CURT_PENALTY_EUR_PER_MW = 15000.0   # <--- EDIT ME (penalty per MW curtailed in a period) 15Eur/kW
+CURT_PENALTY_EUR_PER_MW = 1000.0   # <--- EDIT ME (penalty per MW curtailed in a period) 1Eur/kW
 APPLY_DT_TO_CURT_COST = True       # If True multiply by dt_hours (treat penalty as EUR/MWh); False => EUR/MW-period
 C_SHED_EUR_PER_MW_H = 0.0          # Shedding disabled in this formulation
 
@@ -154,7 +159,7 @@ HP_DRCC_BHDD = HP_COEFF_BHDD
 
 # Residual uncertainty for HP predictor (normalized units, multiply by HP_PRED_PMAX to get MW)
 HP_INCLUDE_RESIDUAL = True
-HP_RESIDUAL_SIGMA_NORM = 0.0157 # std of predictor residual in normalized y_dev units
+HP_RESIDUAL_SIGMA_NORM = 0.0435 # std of predictor residual in normalized y_dev units
 HP_RESIDUAL_CORRELATION = 0.0     # 0=independent across HP buses, 1=fully correlated (not used in current RSS)
 
 # Allow runtime override of START_DATE/DURATION_HOURS via CLI args or environment
@@ -167,6 +172,9 @@ try:
     parser.add_argument('--disable-rt-policies', dest='disable_rt_policies', action='store_true', help='Force-disable RT policies regardless of defaults')
     parser.add_argument('--enable-drcc-tightening', dest='enable_drcc_tight', action='store_true', help='Enable DRCC network tightening')
     parser.add_argument('--disable-drcc-tightening', dest='disable_drcc_tight', action='store_true', help='Disable DRCC network tightening')
+    # Residual basis override flags (match v3 semantics by default)
+    parser.add_argument('--mean-centered-policy', dest='use_mean_centered_policy', action='store_true', help='Use mean-centered residual basis for RT policy (recommended; matches v3)')
+    parser.add_argument('--schedule-policy', dest='use_schedule_policy', action='store_true', help='Use schedule-based residual semantics (legacy)')
     args, _ = parser.parse_known_args()
 
     # Window overrides
@@ -204,8 +212,24 @@ try:
         env_drcc = os.environ.get('CMES_ENABLE_DRCC_TIGHTENING')
         if env_drcc is not None:
             ENABLE_DRCC_NETWORK_TIGHTENING = str(env_drcc).strip().lower() in ('1','true','yes','on')
+
+    # Residual basis override via CLI / env
+    if args.use_schedule_policy:
+        USE_MEAN_CENTERED_POLICY = False
+    elif args.use_mean_centered_policy:
+        USE_MEAN_CENTERED_POLICY = True
+    else:
+        env_resid = os.environ.get('CMES_USE_MEAN_CENTERED_POLICY')
+        if env_resid is not None:
+            USE_MEAN_CENTERED_POLICY = str(env_resid).strip().lower() in ('1','true','yes','on')
 except Exception as _e:
     print(f"[WARN] Runtime override parsing failed: {_e}. Using file defaults.")
+
+# Announce residual basis to keep DA/OOS semantics transparent
+try:
+    print(f"[config] USE_MEAN_CENTERED_POLICY = {bool(USE_MEAN_CENTERED_POLICY)} | rt_residual_basis = {'mean_centered' if USE_MEAN_CENTERED_POLICY else 'schedule'}")
+except Exception:
+    pass
 
 # Load the VDI profiles with heating and hot water loads
 print("Loading VDI profiles from 'vdi_profiles/all_house_profiles.csv'...")
@@ -1517,7 +1541,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     bess_eff = 0.95  # Round-trip efficiency
     bess_initial_soc = 0.5  # Initial state of charge as a percentage of capacity
     bess_capacity_mwh = 0.40  # BESS capacity in MWh
-    bess_cost_per_mwh = 200000.0 # Cost per MWh of BESS capacity
+    bess_cost_per_mwh = 5000.0 # Cost per MWh of BESS capacity
     # Baseline (intercept) BESS throughput cost (EUR/MWh) for p0 channel
     c_base_bess = 1.5
     # Extract transformer capacity in MW (assuming sn_mva is in MVA)
@@ -2576,8 +2600,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         cap_price_factor = 0.0
         imb_up_factor = 1.3
         imb_dn_factor = 1.3
-        pv_curt_price_factor = 1.0
-        bess_rt_price_per_mw = 5.0
+        pv_curt_price_factor = 1.3
+        bess_rt_price_per_mw = 5.1
 
         try:
             if len(time_index) >= 2:
@@ -2761,7 +2785,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
 
     # New: first-stage capacity and RT proxy costs for robust policies (only if enabled)
     if ENABLE_RT_POLICIES:
-        # No RT capacity cost (buy-back removed)
+        # No RT capacity activation cost
         cap_cost = 0
         imb_proxy_cost = gp.quicksum(
             (imb_up_factor * electricity_price[t]) * (rho_plus0_vars[t] + rho_plus1_vars[t] * D_plus_max[t]) * dt_hours
@@ -3416,6 +3440,11 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         try:
             # DRCC / RT policy flags
             results_df['meta_enable_rt_policies'] = [bool(ENABLE_RT_POLICIES)] * len(results_df)
+            # Residual basis to align DA with OOS (v3)
+            try:
+                results_df['meta_rt_residual_basis'] = [('mean_centered' if bool(USE_MEAN_CENTERED_POLICY) else 'schedule')] * len(results_df)
+            except Exception:
+                results_df['meta_rt_residual_basis'] = ['unknown'] * len(results_df)
             results_df['meta_enable_drcc_rt_budgets'] = [bool(ENABLE_DRCC_RT_BUDGETS)] * len(results_df)
             results_df['meta_enable_drcc_network_tightening'] = [bool(ENABLE_DRCC_NETWORK_TIGHTENING)] * len(results_df)
             results_df['meta_drcc_tighten_trafo'] = [bool(DRCC_TIGHTEN_TRAFO)] * len(results_df)
