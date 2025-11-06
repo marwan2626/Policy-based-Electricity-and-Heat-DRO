@@ -13,6 +13,7 @@ try:
     import pyarrow  # noqa: F401 (ensure parquet engine availability if installed)
 except Exception:  # soft dependency
     pyarrow = None
+import shutil
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import matplotlib.ticker as mticker
@@ -26,6 +27,9 @@ import math
 # Distribution toggle: 'gaussian' (default) -> v3_oos; 'uniform' -> v3_oos_uniform; 'contaminated' -> v3_oos_contaminated; 'studentt' -> v3_oos_studentt
 DISTRIBUTION: str = os.getenv('V3_SAMPLE_DISTRIBUTION', 'studentt').strip().lower()
 import sys as _sys
+# New: optional aggregation of two distributions, e.g. --aggregate-dists gaussian,studentt --agg-weights 0.5,0.5
+AGGREGATE_DISTS: List[str] | None = None
+AGGREGATE_WEIGHTS: Tuple[float, float] | None = None
 # Allow CLI override: --dist <gaussian|uniform|contaminated|studentt> or --distribution <...>
 _argv = list(_sys.argv[1:])
 for _flag in ('--dist', '--distribution'):
@@ -38,6 +42,28 @@ for _flag in ('--dist', '--distribution'):
                 raise ValueError()
         except Exception:
             raise SystemExit("Provide --dist/--distribution followed by 'gaussian', 'uniform', 'contaminated', or 'studentt'.")
+# Parse aggregation flags
+if '--aggregate-dists' in _argv:
+    try:
+        _raw = _argv[_argv.index('--aggregate-dists') + 1]
+        parts = [p.strip().lower() for p in _raw.split(',') if p.strip()]
+        if len(parts) != 2 or any(p not in {'gaussian','uniform','contaminated','studentt'} for p in parts):
+            raise ValueError()
+        AGGREGATE_DISTS = parts
+    except Exception:
+        raise SystemExit("--aggregate-dists expects exactly two comma-separated values from {gaussian,uniform,contaminated,studentt}.")
+if '--agg-weights' in _argv:
+    try:
+        _raww = _argv[_argv.index('--agg-weights') + 1]
+        w = [float(p.strip()) for p in _raww.split(',') if p.strip()]
+        if len(w) != 2:
+            raise ValueError()
+        s = w[0] + w[1]
+        if s <= 0:
+            raise ValueError()
+        AGGREGATE_WEIGHTS = (w[0]/s, w[1]/s)
+    except Exception:
+        raise SystemExit("--agg-weights expects two comma-separated numbers, e.g., 0.5,0.5 (they will be normalized).")
 if DISTRIBUTION not in {'gaussian', 'uniform', 'contaminated', 'studentt'}:
     DISTRIBUTION = 'gaussian'
 RESULTS_DIR = (
@@ -48,7 +74,7 @@ RESULTS_DIR = (
     )
 )
 print(f"[config] DISTRIBUTION = {DISTRIBUTION} | RESULTS_DIR = {RESULTS_DIR}")
-if not os.path.isdir(RESULTS_DIR):
+if AGGREGATE_DISTS is None and not os.path.isdir(RESULTS_DIR):
     raise FileNotFoundError(
         "Results directory '" + RESULTS_DIR + "' not found. "
         "If you intended to analyze uniform runs, set --dist uniform (or V3_SAMPLE_DISTRIBUTION=uniform) and run v3 in uniform mode first; "
@@ -141,6 +167,20 @@ def load_summary_for_epsilon(eps: float) -> pd.DataFrame:
         return pd.read_csv(stray)
     raise FileNotFoundError(f"Missing summary for epsilon={eps:.2f}: expected {os.path.basename(preferred)} (or legacy {os.path.basename(legacy)})")
 
+# Dir-parameterized variants for aggregation mode
+def _load_summary_for_epsilon_in_dir(results_dir: str, eps: float) -> pd.DataFrame:
+    token = epsilon_token(eps)
+    preferred = os.path.join(results_dir, f"v3_summary_drcc_true_epsilon_{token}.csv")
+    if os.path.exists(preferred):
+        return pd.read_csv(preferred)
+    legacy = os.path.join(results_dir, f"v3_summary_epsilon_{token}.csv")
+    if os.path.exists(legacy):
+        return pd.read_csv(legacy)
+    stray = os.path.join(results_dir, f"v3_summary_drcc_false_epsilon_{token}.csv")
+    if os.path.exists(stray):
+        return pd.read_csv(stray)
+    raise FileNotFoundError(f"[{results_dir}] Missing summary for epsilon={eps:.2f}")
+
 
 def load_meta_for_epsilon(eps: float) -> Dict:
     token = epsilon_token(eps)
@@ -170,6 +210,31 @@ def load_meta_for_epsilon(eps: float) -> Dict:
                 return json.load(f)
         except Exception:
             pass
+    return {}
+
+def _load_meta_for_epsilon_in_dir(results_dir: str, eps: float) -> Dict:
+    token = epsilon_token(eps)
+    preferred = os.path.join(results_dir, f"v3_meta_drcc_true_epsilon_{token}.json")
+    if os.path.exists(preferred):
+        try:
+            with open(preferred, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    legacy = os.path.join(results_dir, f"v3_meta_epsilon_{token}.json")
+    if os.path.exists(legacy):
+        try:
+            with open(legacy, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    stray = os.path.join(results_dir, f"v3_meta_drcc_false_epsilon_{token}.json")
+    if os.path.exists(stray):
+        try:
+            with open(stray, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
     return {}
 
 
@@ -280,6 +345,435 @@ def aggregate_metrics(df: pd.DataFrame, avg_price_eur_mwh: float) -> Dict[str, f
         "line_steps": l_steps,
         "trafo_steps": t_steps,
     }
+
+
+def _results_dir_from_dist(name: str) -> str:
+    name = name.strip().lower()
+    return (
+        "v3_oos" if name == 'gaussian' else (
+            "v3_oos_uniform" if name == 'uniform' else (
+                "v3_oos_contaminated" if name == 'contaminated' else (
+                    "v3_oos_studentt" if name == 'studentt' else name
+                )
+            )
+        )
+    )
+
+
+def _build_bundle_for_dir(results_dir: str) -> Tuple[pd.DataFrame, Dict[str, np.ndarray]]:
+    """Load a minimal case bundle from a results directory.
+
+    Returns:
+      - rt_summary_like: DataFrame with at least columns ['label','epsilon','rt_imbalance_cost_mean','total_rt_cost_mean','trafo_steps','trafo_violation_probability_pct']
+      - dist_by_label: dict label -> np.ndarray of per-(sample,t) max trafo loading (%)
+    """
+    def _build_rt_row_local(df_eps: pd.DataFrame, meta: Dict, eps: float | None, label: str) -> Dict[str, float]:
+        horizon = np.nan
+        v2_csv = meta.get('v2_results_csv') if isinstance(meta, dict) else None
+        if v2_csv and os.path.exists(v2_csv):
+            try:
+                v2_df = pd.read_csv(v2_csv)
+                if 'electricity_price_eur_mwh' in v2_df.columns:
+                    horizon = int(pd.to_numeric(v2_df['electricity_price_eur_mwh'], errors='coerce').dropna().shape[0])
+                else:
+                    horizon = int(v2_df.shape[0])
+            except Exception:
+                horizon = np.nan
+        da_import_cost_mean = float(df_eps.get('da_energy_cost_eur', pd.Series([0.0])).mean())
+        rt_imb_cost_mean = float(df_eps.get('rt_imbalance_cost_eur', pd.Series([0.0])).mean())
+        rt_pv_cost_mean = float(df_eps.get('rt_pv_curtail_cost_eur', pd.Series([0.0])).mean())
+        rt_bess_cost_mean = float(df_eps.get('rt_bess_cycle_cost_eur', pd.Series([0.0])).mean())
+        if 'steps_trafo_over_80pct' in df_eps.columns:
+            trafo_steps = int(df_eps['steps_trafo_over_80pct'].sum())
+        elif 'steps_trafo_over_100pct' in df_eps.columns:
+            trafo_steps = int(df_eps['steps_trafo_over_100pct'].sum())
+        else:
+            trafo_steps = 0
+        n_traj = len(df_eps)
+        if isinstance(horizon, (int, np.integer)) and horizon > 0 and n_traj > 0:
+            trafo_violation_probability_pct = (trafo_steps / (n_traj * horizon)) * 100.0
+        else:
+            trafo_violation_probability_pct = np.nan
+        return {
+            'epsilon': eps if eps is not None else np.nan,
+            'label': label,
+            'da_import_cost_mean': da_import_cost_mean,
+            'rt_imbalance_cost_mean': rt_imb_cost_mean,
+            'rt_pv_cost_mean': rt_pv_cost_mean,
+            'rt_bess_cost_mean': rt_bess_cost_mean,
+            'trafo_steps': trafo_steps,
+            'trafo_violation_probability_pct': trafo_violation_probability_pct,
+            'horizon_timesteps': horizon,
+            'total_rt_cost_mean': rt_imb_cost_mean + rt_pv_cost_mean + rt_bess_cost_mean,
+        }
+
+    # summaries
+    rows: List[Dict[str, float]] = []
+    # deterministic
+    det_path = os.path.join(results_dir, 'v3_summary_drcc_false.csv')
+    if os.path.exists(det_path):
+        try:
+            det_df = pd.read_csv(det_path)
+            det_meta = {}
+            det_meta_path = os.path.join(results_dir, 'v3_meta_drcc_false.json')
+            if os.path.exists(det_meta_path):
+                with open(det_meta_path,'r',encoding='utf-8') as f:
+                    det_meta = json.load(f)
+            rows.append(_build_rt_row_local(det_df, det_meta, None, DETERMINISTIC_LABEL))
+        except Exception:
+            pass
+    # epsilons
+    for e in EPSILONS:
+        try:
+            df_e = _load_summary_for_epsilon_in_dir(results_dir, e)
+        except Exception:
+            continue
+        meta_e = _load_meta_for_epsilon_in_dir(results_dir, e)
+        rows.append(_build_rt_row_local(df_e, meta_e, e, f"{e:.2f}"))
+    rt_df = pd.DataFrame(rows)
+
+    # distributions
+    def _load_flat_distribution_from_meta(meta: Dict) -> np.ndarray:
+        rel = meta.get('trafo_loading_file') if isinstance(meta, dict) else None
+        if not rel:
+            return np.array([])
+        pq = os.path.join(results_dir, rel.replace('/', os.sep))
+        if not os.path.exists(pq):
+            if os.path.exists(rel):
+                pq = rel
+            else:
+                return np.array([])
+        try:
+            pdf = pd.read_parquet(pq)
+        except Exception:
+            return np.array([])
+        must = {'sample_id','t','trafo_index','loading_pct'}
+        if not must <= set(pdf.columns):
+            return np.array([])
+        grp = pdf.groupby(['sample_id','t'])['loading_pct'].max().reset_index()
+        arr = pd.to_numeric(grp['loading_pct'], errors='coerce').to_numpy()
+        return arr[np.isfinite(arr)]
+
+    dist_map: Dict[str, np.ndarray] = {}
+    # det
+    det_meta_p = os.path.join(results_dir, 'v3_meta_drcc_false.json')
+    if os.path.exists(det_meta_p):
+        try:
+            with open(det_meta_p,'r',encoding='utf-8') as f:
+                m = json.load(f)
+            dist_map[DETERMINISTIC_LABEL] = _load_flat_distribution_from_meta(m)
+        except Exception:
+            pass
+    for e in EPSILONS:
+        m = _load_meta_for_epsilon_in_dir(results_dir, e)
+        lab = f"{e:.2f}"
+        dist_map[lab] = _load_flat_distribution_from_meta(m)
+
+    return rt_df, dist_map
+
+
+def _run_dual_aggregation(dist_a: str, dist_b: str, weights: Tuple[float,float] | None) -> None:
+    """Aggregate two distributions and write a compact overview to a new folder.
+
+    The aggregation computes weighted averages of scalar metrics per case label and concatenates
+    transformer loading distributions (simple mixture) for violin visualization.
+    """
+    a_dir = _results_dir_from_dist(dist_a)
+    b_dir = _results_dir_from_dist(dist_b)
+    if not os.path.isdir(a_dir) or not os.path.isdir(b_dir):
+        raise SystemExit(f"Required result directories not found: '{a_dir}' or '{b_dir}'.")
+    w = weights if weights is not None else (0.5, 0.5)
+    out_dir = f"v3_oos_agg_{dist_a}_{dist_b}"
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception:
+        pass
+    print(f"[aggregate] Building dual-distribution aggregation: {dist_a} + {dist_b} -> {out_dir} (weights={w})")
+
+    a_sum, a_dist = _build_bundle_for_dir(a_dir)
+    b_sum, b_dist = _build_bundle_for_dir(b_dir)
+    # unify labels
+    labels = sorted(set(a_sum['label']).union(set(b_sum['label'])), key=lambda s: (0 if s==DETERMINISTIC_LABEL else 1, s))
+    rows = []
+    for lab in labels:
+        a_row = a_sum[a_sum['label']==lab].iloc[0] if (lab in set(a_sum['label'])) else None
+        b_row = b_sum[b_sum['label']==lab].iloc[0] if (lab in set(b_sum['label'])) else None
+        def _get(row, col):
+            try:
+                return float(row[col])
+            except Exception:
+                return float('nan')
+        # Weighted average where available
+        def _wavg(col):
+            va = _get(a_row, col) if a_row is not None else np.nan
+            vb = _get(b_row, col) if b_row is not None else np.nan
+            if np.isfinite(va) and np.isfinite(vb):
+                return w[0]*va + w[1]*vb
+            return va if np.isfinite(va) else (vb if np.isfinite(vb) else np.nan)
+        # epsilon value if available
+        eps_val = None
+        try:
+            eps_val = float(lab) if lab != DETERMINISTIC_LABEL else None
+        except Exception:
+            eps_val = None
+        rows.append({
+            'label': lab,
+            'epsilon': eps_val,
+            'rt_imbalance_cost_mean': _wavg('rt_imbalance_cost_mean'),
+            'total_rt_cost_mean': _wavg('total_rt_cost_mean'),
+            'trafo_steps': _wavg('trafo_steps'),
+            'trafo_violation_probability_pct': _wavg('trafo_violation_probability_pct')
+        })
+    agg_df = pd.DataFrame(rows)
+    agg_csv = os.path.join(out_dir, 'agg_summary.csv')
+    agg_df.to_csv(agg_csv, index=False)
+    print(f"✓ Aggregated summary CSV: {agg_csv}")
+
+    # Build compact 3-panel plot: (1) RT imbalance cost (2) Trafo steps (3) Violin of loading per case (mixture)
+    fig, axes = plt.subplots(1, 3, figsize=(22, 4.5), constrained_layout=True)
+    x = np.arange(len(labels))
+
+    # 1) RT imbalance bars (show A, B, and weighted)
+    def _values_for(col: str, df: pd.DataFrame):
+        vals = []
+        for lab in labels:
+            row = df[df['label']==lab]
+            vals.append(float(row[col].iloc[0]) if not row.empty and np.isfinite(row[col].iloc[0]) else np.nan)
+        return np.array(vals)
+    # augment a_sum/b_sum to ensure necessary columns
+    for df in (a_sum, b_sum):
+        for c in ['rt_imbalance_cost_mean','total_rt_cost_mean','trafo_steps','trafo_violation_probability_pct']:
+            if c not in df.columns:
+                df[c] = np.nan
+    a_vals = _values_for('rt_imbalance_cost_mean', a_sum)
+    b_vals = _values_for('rt_imbalance_cost_mean', b_sum)
+    agg_vals = w[0]*np.nan_to_num(a_vals, nan=0.0) + w[1]*np.nan_to_num(b_vals, nan=0.0)
+    width = 0.25
+    axes[0].bar(x - width, a_vals, width=width, color='#1f77b4', label=dist_a)
+    axes[0].bar(x, agg_vals, width=width, color='#636363', label='aggregated')
+    axes[0].bar(x + width, b_vals, width=width, color='#ff7f0e', label=dist_b)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels([('deterministic' if lab==DETERMINISTIC_LABEL else f"DRCC, ε={lab}") for lab in labels])
+    axes[0].set_ylabel('EUR (mean across samples)')
+    axes[0].set_title('RT imbalance cost (mean)')
+    axes[0].grid(axis='y', alpha=0.3)
+    axes[0].legend(fontsize=8, frameon=False)
+
+    # 2) Trafo steps
+    a_steps = _values_for('trafo_steps', a_sum)
+    b_steps = _values_for('trafo_steps', b_sum)
+    agg_steps = w[0]*np.nan_to_num(a_steps, nan=0.0) + w[1]*np.nan_to_num(b_steps, nan=0.0)
+    axes[1].bar(x - width, a_steps, width=width, color='#1f77b4', label=dist_a)
+    axes[1].bar(x, agg_steps, width=width, color='#636363', label='aggregated')
+    axes[1].bar(x + width, b_steps, width=width, color='#ff7f0e', label=dist_b)
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels([('deterministic' if lab==DETERMINISTIC_LABEL else f"DRCC, ε={lab}") for lab in labels])
+    axes[1].set_ylabel('Steps (sum across trajectories)')
+    axes[1].set_title('Transformer loading violations (> threshold)')
+    axes[1].grid(axis='y', alpha=0.3)
+
+    # 3) Violin of mixture distributions per case
+    violin_data = []
+    violin_pos = []
+    violin_labels = []
+    for i, lab in enumerate(labels, start=1):
+        arr_a = a_dist.get(lab, np.array([]))
+        arr_b = b_dist.get(lab, np.array([]))
+        if arr_a.size == 0 and arr_b.size == 0:
+            continue
+        # Simple mixture: concatenate; if both present, optionally subsample larger set to approx equal weight
+        if arr_a.size > 0 and arr_b.size > 0:
+            na, nb = len(arr_a), len(arr_b)
+            if na > 0 and nb > 0:
+                # equalize counts roughly to avoid dominance
+                k_a = min(na, nb)
+                k_b = min(na, nb)
+                rng = np.random.default_rng(12345)
+                arr_a2 = arr_a if na <= k_a else rng.choice(arr_a, size=k_a, replace=False)
+                arr_b2 = arr_b if nb <= k_b else rng.choice(arr_b, size=k_b, replace=False)
+                mix = np.concatenate([arr_a2, arr_b2])
+            else:
+                mix = np.concatenate([arr_a, arr_b])
+        else:
+            mix = arr_a if arr_a.size else arr_b
+        mix = mix[np.isfinite(mix)]
+        if mix.size == 0:
+            continue
+        violin_data.append(mix)
+        violin_pos.append(i)
+        violin_labels.append(lab)
+    if violin_data:
+        vp = axes[2].violinplot(violin_data, positions=violin_pos, showmeans=False, showmedians=True, showextrema=False)
+        for pc in vp['bodies']:
+            pc.set_facecolor('#b2df8a')
+            pc.set_edgecolor('#1b7837')
+            pc.set_alpha(0.6)
+        if 'cmedians' in vp:
+            vp['cmedians'].set_color('#1b7837')
+        axes[2].set_xticks(violin_pos)
+        axes[2].set_xticklabels([('deterministic' if lab==DETERMINISTIC_LABEL else f"DRCC, ε={lab}") for lab in violin_labels])
+        axes[2].set_ylabel('Transformer loading %')
+        axes[2].set_title('Mixture transformer loading (violin)')
+        axes[2].grid(axis='y', alpha=0.3)
+    else:
+        axes[2].text(0.5, 0.5, 'No transformer loading data', ha='center', va='center', transform=axes[2].transAxes, fontsize=9, color='gray')
+    out_fig = os.path.join(out_dir, f"agg_overview_{dist_a}_{dist_b}.png")
+    fig.savefig(out_fig, dpi=150)
+    print(f"✓ Aggregated overview figure: {out_fig}")
+
+    # Build a complete combined dataset in out_dir so the standard pipeline can generate ALL analyses
+    def _combine_summary(a_path: str, b_path: str, out_path: str):
+        dfs = []
+        for p in (a_path, b_path):
+            if p and os.path.exists(p):
+                try:
+                    dfs.append(pd.read_csv(p))
+                except Exception:
+                    pass
+        if dfs:
+            try:
+                all_df = pd.concat(dfs, ignore_index=True)
+                all_df.to_csv(out_path, index=False)
+                return True
+            except Exception:
+                return False
+        return False
+
+    def _combine_parquet_from_meta(a_meta: Dict, b_meta: Dict, out_rel: str) -> bool:
+        # Returns True if parquet written and meta updated
+        def _extract_parquet(meta: Dict):
+            rel = meta.get('trafo_loading_file') if isinstance(meta, dict) else None
+            if not rel:
+                return None
+            a = os.path.join(a_dir, rel)
+            b = os.path.join(b_dir, rel)
+            # if rel is different between metas, try both absolute constructions
+            return a if os.path.exists(a) else (b if os.path.exists(b) else (rel if os.path.exists(rel) else None))
+
+        paths = []
+        for m in (a_meta, b_meta):
+            p = None
+            if isinstance(m, dict) and 'trafo_loading_file' in m:
+                rel = m['trafo_loading_file']
+                cand = os.path.join(a_dir, rel)
+                if os.path.exists(cand):
+                    p = cand
+                else:
+                    cand2 = os.path.join(b_dir, rel)
+                    if os.path.exists(cand2):
+                        p = cand2
+                    elif os.path.exists(rel):
+                        p = rel
+            if p and os.path.exists(p):
+                paths.append(p)
+        if not paths:
+            return False
+        try:
+            dfs = [pd.read_parquet(p) for p in paths]
+            pdf = pd.concat(dfs, ignore_index=True)
+            out_abs = os.path.join(out_dir, out_rel.replace('/', os.sep))
+            os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+            pdf.to_parquet(out_abs, index=False)
+            return True
+        except Exception as e:
+            print(f"[WARN] Failed to write combined parquet for {out_rel}: {e}")
+            return False
+
+    # Baseline: summaries and meta/parquet
+    det_a_sum = os.path.join(a_dir, 'v3_summary_drcc_false.csv')
+    det_b_sum = os.path.join(b_dir, 'v3_summary_drcc_false.csv')
+    det_out_sum = os.path.join(out_dir, 'v3_summary_drcc_false.csv')
+    _combine_summary(det_a_sum, det_b_sum, det_out_sum)
+    # meta
+    det_a_meta_p = os.path.join(a_dir, 'v3_meta_drcc_false.json')
+    det_b_meta_p = os.path.join(b_dir, 'v3_meta_drcc_false.json')
+    det_meta_a = {}
+    det_meta_b = {}
+    if os.path.exists(det_a_meta_p):
+        try:
+            with open(det_a_meta_p,'r',encoding='utf-8') as f:
+                det_meta_a = json.load(f)
+        except Exception:
+            pass
+    if os.path.exists(det_b_meta_p):
+        try:
+            with open(det_b_meta_p,'r',encoding='utf-8') as f:
+                det_meta_b = json.load(f)
+        except Exception:
+            pass
+    det_parquet_rel = 'v3_loading/trafo_loading_raw_drcc_false_combined.parquet'
+    if _combine_parquet_from_meta(det_meta_a, det_meta_b, det_parquet_rel):
+        # choose a base meta and update parquet ref
+        det_meta_out = det_meta_b if det_meta_b else det_meta_a
+        if isinstance(det_meta_out, dict):
+            det_meta_out['trafo_loading_file'] = det_parquet_rel.replace('\\', '/')
+            with open(os.path.join(out_dir,'v3_meta_drcc_false.json'),'w',encoding='utf-8') as f:
+                json.dump(det_meta_out, f, indent=2)
+
+    # DRCC epsilons
+    for e in EPSILONS:
+        tok = epsilon_token(e)
+        # summaries
+        a_sum_p = os.path.join(a_dir, f'v3_summary_drcc_true_epsilon_{tok}.csv')
+        b_sum_p = os.path.join(b_dir, f'v3_summary_drcc_true_epsilon_{tok}.csv')
+        out_sum_p = os.path.join(out_dir, f'v3_summary_drcc_true_epsilon_{tok}.csv')
+        _combine_summary(a_sum_p, b_sum_p, out_sum_p)
+        # metas
+        a_meta_p = os.path.join(a_dir, f'v3_meta_drcc_true_epsilon_{tok}.json')
+        b_meta_p = os.path.join(b_dir, f'v3_meta_drcc_true_epsilon_{tok}.json')
+        a_meta = {}
+        b_meta = {}
+        if os.path.exists(a_meta_p):
+            try:
+                with open(a_meta_p,'r',encoding='utf-8') as f:
+                    a_meta = json.load(f)
+            except Exception:
+                a_meta = {}
+        if os.path.exists(b_meta_p):
+            try:
+                with open(b_meta_p,'r',encoding='utf-8') as f:
+                    b_meta = json.load(f)
+            except Exception:
+                b_meta = {}
+        pq_rel = f'v3_loading/trafo_loading_raw_epsilon_{tok}_combined.parquet'
+        if _combine_parquet_from_meta(a_meta, b_meta, pq_rel):
+            meta_out = b_meta if b_meta else a_meta
+            if isinstance(meta_out, dict):
+                meta_out['trafo_loading_file'] = pq_rel.replace('\\', '/')
+                with open(os.path.join(out_dir, f'v3_meta_drcc_true_epsilon_{tok}.json'),'w',encoding='utf-8') as f:
+                    json.dump(meta_out, f, indent=2)
+
+    # Copy policy coeffs and SoC envelopes from whichever exists (prefer dist_b then dist_a)
+    def _copy_if_exists(rel_name: str):
+        src = os.path.join(b_dir, rel_name)
+        if not os.path.exists(src):
+            src = os.path.join(a_dir, rel_name)
+        if os.path.exists(src):
+            dst = os.path.join(out_dir, rel_name)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            try:
+                shutil.copy2(src, dst)
+            except Exception:
+                pass
+
+    # baseline policy/soc
+    _copy_if_exists('policy_coeffs_drcc_false.csv')
+    _copy_if_exists('soc_envelope_drcc_false.csv')
+    # per epsilon
+    for e in EPSILONS:
+        tok = epsilon_token(e)
+        _copy_if_exists(f'policy_coeffs_drcc_true_epsilon_{tok}.csv')
+        _copy_if_exists(f'soc_envelope_drcc_true_epsilon_{tok}.csv')
+
+    # Now generate full analyses using the combined dataset by pointing RESULTS_DIR to out_dir
+    global RESULTS_DIR, AGGREGATE_DISTS
+    RESULTS_DIR = out_dir
+    AGGREGATE_DISTS = None  # allow tail overview and standard flow
+    print(f"[aggregate] Running full analyses on combined dataset at {RESULTS_DIR}")
+    try:
+        main()
+    except Exception as e:
+        print(f"[WARN] Combined full analyses failed: {e}")
 
 
 def main() -> None:
@@ -1794,9 +2288,15 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # If dual-aggregation requested, run it and exit; else run standard single-distribution analysis.
+    if AGGREGATE_DISTS is not None:
+        _d1, _d2 = AGGREGATE_DISTS
+        _w = AGGREGATE_WEIGHTS if AGGREGATE_WEIGHTS is not None else (0.5, 0.5)
+        _run_dual_aggregation(_d1, _d2, _w)
+    else:
+        main()
     # --- Tail-focused overview (additional figure) ---
-    if PLOT_TAIL_OVERVIEW:
+    if (AGGREGATE_DISTS is None) and PLOT_TAIL_OVERVIEW:
         try:
             # Helper to load per-(sample,t) max loading arrays for a case via meta parquet
             def _load_case_profile(label: str, eps: float | None) -> tuple[np.ndarray, np.ndarray] | None:

@@ -36,7 +36,7 @@ import pandas as pd
 # ===========================
 # Epsilon used in the v2 filename suffix: dso_model_v2_results_drcc_true_epsilon_{EPSILON_TOKEN}.csv
 # The token uses two decimals with underscore as decimal separator, e.g., 0.05 -> "0_05"
-EPSILON: float = 0.10
+EPSILON: float = 0.20
 # When running the deterministic (no DRCC tightening) case, set RUN_DRCC_FALSE = True.
 # In that mode we ignore EPSILON for locating the v2 results CSV and instead look for
 # files named like: dso_model_v2_results_drcc_false*.csv
@@ -51,7 +51,7 @@ SAMPLES_DIR: str = "samples"
 # Sample distribution selector: "gaussian" (default), "uniform", "contaminated", or "studentt".
 # Controls which sample files to load (expects suffix _gaussian, _uniform, _contaminated, or _studentt written by generate_samples.py)
 # and which output directory to use (v3_oos, v3_oos_uniform, v3_oos_contaminated, or v3_oos_studentt).
-SAMPLE_DISTRIBUTION: str = "studentt"
+SAMPLE_DISTRIBUTION: str = "gaussian"
 
 # Limit number of trajectories (sample_id) for a quick run. None means evaluate all.
 MAX_TRAJ: Optional[int] = None
