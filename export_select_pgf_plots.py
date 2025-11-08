@@ -4,6 +4,7 @@ and fixed sizing. Includes:
 - Thermal storage operation area (recreated from results CSV)
 - OOS Student-t outputs rendered from PNG: overload_energy_compare, soc_envelopes,
   trafo_violation_heatmap, violin_compare, frontier_hybrid_scatter
+- PV & ambient temperature uncertainty bands (mean ±1σ) from Gaussian samples: pv_temp_uncertainty
 
 Default figure width: 10.89 cm; aspect ratio: 0.5
 LaTeX PGF configuration matches export_thermal_storage_pgf.py (sans-serif, xcolor, brand colors).
@@ -14,6 +15,9 @@ Usage examples (PowerShell):
 
     # Export only OOS images
     python ./export_select_pgf_plots.py --overload-energy --soc-envelopes --trafo-violation-heatmap --violin-compare --frontier-hybrid-scatter
+
+    # Export PV & temperature uncertainty only
+    python ./export_select_pgf_plots.py --pv-temp-uncertainty
 
     # Export only thermal storage with aligned market price (defaults)
     python ./export_select_pgf_plots.py --ts
@@ -52,13 +56,93 @@ DEFAULT_ASPECT_SOC = 0.8
 DEFAULT_ASPECT_HEATMAP = DEFAULT_ASPECT
 DEFAULT_ASPECT_VIOLIN = 2.0
 DEFAULT_ASPECT_FRONTIER = 1.0
+DEFAULT_ASPECT_PVTEMP = 0.8
+DEFAULT_ASPECT_LOADS = 0.5
+DEFAULT_ASPECT_BEV = 0.5
+DEFAULT_ASPECT_THERMAL = 0.8  # stacked hotwater / heating profiles
 DEFAULT_MAX_TICKS_X = 6
 DEFAULT_MAX_TICKS_Y = 5
-DEFAULT_MAX_CLOUD_POINTS = 2000
+DEFAULT_MAX_CLOUD_POINTS = 4000
 # Cloud scatter marker sizes (can be overridden via CLI)
 DEFAULT_CLOUD_MARKER_SIZE_DRCC = 30
 DEFAULT_CLOUD_MARKER_SIZE_BASE = 30
-RESULTS_DIR = "v3_oos_studentt"
+BAR_WIDTH = 0.35  # Uniform bar width for all bar plots
+RESULTS_DIR = "v3_oos_agg_gaussian_studentt"  # Updated default OOS results directory
+# Central export directory for PGF outputs
+EXPORT_PGF_DIR = "export pgf"
+PNG_DPI = 300
+
+# ===================== USER CONFIG (edit and Run) =====================
+# Set RUN_WITH_INLINE_CONFIG = True and edit INLINE_CONFIG to run without CLI.
+RUN_WITH_INLINE_CONFIG = True
+INLINE_CONFIG: Dict[str, object] = {
+    # Which plots to export: use ["all"] or any subset of
+    # ["ts", "overload", "soc", "trafo", "violin", "frontier", "pvtemp", "loads", "bev", "thermal"]
+    "selections": ["all"],
+    # Override results directory for OOS plots; None uses module-level RESULTS_DIR
+    "results_dir": None,
+
+    # PGF / sizing
+    "texsystem": "pdflatex",  # or "xelatex", "lualatex"
+    "sfmath": False,
+    "width_cm": DEFAULT_WIDTH_CM,
+    # Global aspect applies if set; per-plot overrides below take precedence
+    "aspect": None,
+    "aspect_ts": None,
+    "aspect_overload": None,
+    "aspect_soc": None,
+    "aspect_heatmap": None,
+    "aspect_violin": None,
+    "aspect_frontier": None,
+    "aspect_pvtemp": None,
+    "aspect_loads": None,
+    "aspect_bev": None,
+    "aspect_thermal": None,
+    # Optional violin width; if None defaults to width_cm/2
+    "width_cm_violin": None,
+    # Ticks
+    "max_ticks_x": DEFAULT_MAX_TICKS_X,
+    "max_ticks_y": DEFAULT_MAX_TICKS_Y,
+    # PNG quality
+    "png_dpi": 300,
+
+    # Thermal storage specific
+    "ts": {
+        "input": "fully_coordinated_model_results.csv",
+        "price_csv": None,
+        "price_col": None,
+        "start_date": "2023-01-10 00:00:00",
+        "duration_hours": 24,
+        "no_market_price": False,
+    },
+}
+
+# When exporting plots we also write a PNG alongside the PGF for quick visual debugging.
+def _save_dual(
+    fig: plt.Figure,
+    pgf_path: str,
+    png_dpi: Optional[int] = None,
+    tight: bool = True,
+    pad_inches: float = 0.02,
+) -> Tuple[str, str]:
+    d = os.path.dirname(pgf_path)
+    if d and d not in ("", "."):
+        os.makedirs(d, exist_ok=True)
+    stem, _ = os.path.splitext(pgf_path)
+    png_path = stem + ".png"
+    # Save PGF first (primary artifact) with tight bounding box to minimize white margins
+    save_kwargs = {}
+    if tight:
+        save_kwargs["bbox_inches"] = "tight"
+        save_kwargs["pad_inches"] = float(pad_inches)
+    fig.savefig(pgf_path, **save_kwargs)
+    # Then PNG for inspection (best effort)
+    try:
+        dpi = int(png_dpi) if png_dpi is not None else int(PNG_DPI)
+        fig.savefig(png_path, dpi=dpi, **save_kwargs)
+    except Exception as e:
+        print(f"Warning: failed to save PNG for {pgf_path}: {e}")
+    return pgf_path, png_path
 
 # --------------------- Helpers ---------------------
 
@@ -108,10 +192,10 @@ def _configure_pgf(
 def _force_sans_ticks(ax: plt.Axes, which: str = "y") -> None:
     from matplotlib.ticker import FuncFormatter
     if which in ("y", "both"):
-        yfmt = FuncFormatter(lambda v, pos: rf"\\textsf{{{v:g}}}")
+        yfmt = FuncFormatter(lambda v, pos: rf"\textsf{{{v:g}}}")
         ax.yaxis.set_major_formatter(yfmt)
     if which in ("x", "both"):
-        xfmt = FuncFormatter(lambda v, pos: rf"\\textsf{{{int(v)}}}")
+        xfmt = FuncFormatter(lambda v, pos: rf"\textsf{{{int(v)}}}")
         ax.xaxis.set_major_formatter(xfmt)
 
 
@@ -200,7 +284,7 @@ def _load_aligned_market_price(time_index: pd.DatetimeIndex) -> Optional[np.ndar
 
 def export_thermal_storage_pgf(
     input_csv: str = "fully_coordinated_model_results.csv",
-    output_path: str = "thermal_storage_operation_area.pgf",
+    output_path: str = os.path.join(EXPORT_PGF_DIR, "thermal_storage_operation_area.pgf"),
     texsystem: str = "pdflatex",
     use_sfmath: bool = False,
     width_cm: float = DEFAULT_WIDTH_CM,
@@ -215,6 +299,7 @@ def export_thermal_storage_pgf(
     if not os.path.exists(input_csv):
         raise FileNotFoundError(f"Results CSV not found: {input_csv}")
 
+    # Load results CSV
     df = pd.read_csv(input_csv)
     if "q_storage_kw" not in df.columns:
         raise KeyError(
@@ -331,8 +416,22 @@ def export_thermal_storage_pgf(
         _force_sans_ticks(ax, which="both")
         _force_sans_ticks(ax2, which="y")
 
-        ax.set_xlabel("time step")
+        ax.set_xlabel("Time Step")
         ax.set_ylabel("Power (kW)")
+        # Fixed time ticks at 0,24,...,96; ensure last label (e.g., 96) is visible by extending x-limits
+        try:
+            from matplotlib.ticker import FixedLocator, FixedFormatter
+            total_steps = int(len(x_ts))
+            # Always include 96 label if series length is >= 96
+            base_ticks = [0, 24, 48, 72, 96]
+            ticks = [t for t in base_ticks if t <= total_steps]
+            if ticks:
+                # Extend axis to include the final step label when it equals the length
+                ax.set_xlim(0, max(total_steps, max(ticks)))
+                ax.xaxis.set_major_locator(FixedLocator(ticks))
+                ax.xaxis.set_major_formatter(FixedFormatter([str(t) for t in ticks]))
+        except Exception:
+            pass
 
         for spine in ax.spines.values():
             spine.set_visible(True)
@@ -347,14 +446,237 @@ def export_thermal_storage_pgf(
         ax.set_axisbelow(True)
         ax.grid(True, axis="y", color="lightgray", alpha=0.6, linewidth=0.6)
 
-        fig.savefig(output_path)
+        pgf_out, png_out = _save_dual(fig, output_path)
         if show:
             plt.show()
         else:
             plt.close(fig)
-    return output_path
+    return pgf_out
 
 
+def export_bev_profile_pgf(
+    output_path: str = os.path.join(EXPORT_PGF_DIR, "bev_car8_profile.pgf"),
+    width_cm: float = DEFAULT_WIDTH_CM,
+    aspect: float = DEFAULT_ASPECT_BEV,
+    texsystem: str = "pdflatex",
+    use_sfmath: bool = False,
+    max_ticks_x: int = DEFAULT_MAX_TICKS_X,
+    max_ticks_y: int = DEFAULT_MAX_TICKS_Y,
+    start_date: str = "2023-01-10 00:00:00",
+    duration_hours: int = 24,
+    bev_csv: str = os.path.join("LadeprofileBEV", "bev_2023_power_first100.csv"),
+    car_cols: Optional[List[str]] = None,
+) -> str:
+    """Export BEV charging power profile(s) for selected car(s) over the aligned time window.
+
+    - Reads 15-min power from bev_csv (columns: datetime, car_1..car_100)
+    - Aligns window to [start_date, start_date+duration_hours)
+    - If multiple cars are provided, plots them as stacked subplots sharing the x-axis
+    - Fixed x-ticks at 0,24,48,72,96; legend inside upper-left per subplot
+    """
+    if not os.path.exists(bev_csv):
+        raise FileNotFoundError(f"BEV CSV not found: {bev_csv}")
+    df = pd.read_csv(bev_csv)
+    if "datetime" not in df.columns:
+        raise KeyError("Column 'datetime' not found in BEV CSV")
+    # Default to one car if not provided
+    if not car_cols or len(car_cols) == 0:
+        car_cols = ["car_8"]
+    # Validate requested columns
+    missing = [c for c in car_cols if c not in df.columns]
+    if missing:
+        raise KeyError(
+            "Requested columns missing in BEV CSV: " + ", ".join(missing) +
+            ". Example available: " + ", ".join([c for c in df.columns if c.startswith('car_')][:10]) + "..."
+        )
+    # Parse time and set index
+    df["datetime"] = pd.to_datetime(df["datetime"])  # expect 15-min steps
+    df.set_index("datetime", inplace=True)
+    # Align window
+    start_dt = pd.to_datetime(start_date)
+    end_dt = start_dt + pd.Timedelta(hours=int(duration_hours)) - pd.Timedelta(minutes=15)
+    window = df.loc[start_dt:end_dt]
+    if window.empty:
+        raise ValueError("No BEV data in requested time window")
+    # Build values per requested car
+    series_list: List[np.ndarray] = []
+    for c in car_cols:
+        series_list.append(pd.to_numeric(window[c], errors="coerce").fillna(0.0).to_numpy())
+    n_steps = len(window)
+    x = np.arange(n_steps)
+    width_in = _cm_to_inch(width_cm)
+    height_in = width_in * aspect
+    with mpl.rc_context():
+        _configure_pgf(enable=True, texsystem=texsystem, use_sfmath=use_sfmath)
+        # Single axes overlay of all requested cars
+        fig, ax = plt.subplots(figsize=(width_in, height_in))
+        palette = ['#3445A0', '#3A9D6C', '#D82E1D', '#9467BD', '#FF7F0E']
+        for idx, (vals, colname) in enumerate(zip(series_list, car_cols)):
+            color = palette[idx % len(palette)]
+            ax.plot(x, vals, color=color, linewidth=1.2, label=colname.replace('_', '\\_'))
+        ax.set_ylabel("Charging Power (kW)")
+        ax.set_xlabel("Time Step")
+        ax.grid(alpha=0.3)
+        _force_plain_ticks(ax, which="y")
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.0)
+        # Remove default data margins so the plot hugs the axes (reduces internal whitespace)
+        try:
+            ax.margins(x=0)
+        except Exception:
+            pass
+        # Fixed time ticks at 0,24,48,72,96 when within range
+        try:
+            from matplotlib.ticker import FixedLocator, FixedFormatter
+            base_ticks = [0, 24, 48, 72, 96]
+            # Include the final label (e.g., 96) by allowing t == n_steps and extending xlim
+            ticks = [t for t in base_ticks if (t < n_steps) or (t == n_steps)]
+            if ticks:
+                max_tick = max(ticks)
+                ax.set_xlim(0, max(n_steps - 1, max_tick))
+                ax.xaxis.set_major_locator(FixedLocator(ticks))
+                ax.xaxis.set_major_formatter(FixedFormatter([str(t) for t in ticks]))
+        except Exception:
+            pass
+        # Tighten layout padding further to minimize surrounding whitespace
+        try:
+            fig.tight_layout(pad=0.1)
+        except Exception:
+            fig.tight_layout()
+        pgf_out, png_out = _save_dual(fig, output_path)
+        plt.close(fig)
+    return pgf_out
+
+
+def export_hotwater_heating_profiles_pgf(
+    output_path: str = os.path.join(EXPORT_PGF_DIR, "hotwater_heating_profiles.pgf"),
+    width_cm: float = DEFAULT_WIDTH_CM,
+    aspect: float = DEFAULT_ASPECT_THERMAL,
+    texsystem: str = "pdflatex",
+    use_sfmath: bool = False,
+    max_ticks_x: int = DEFAULT_MAX_TICKS_X,
+    max_ticks_y: int = DEFAULT_MAX_TICKS_Y,
+    start_date: str = "2023-01-10 00:00:00",
+    duration_hours: int = 24,
+    profiles_csv: str = os.path.join("vdi_profiles", "all_house_profiles.csv"),
+    houses: Optional[List[int]] = None,
+) -> str:
+    """Export stacked hot water (top) and heating (bottom) demand for given houses.
+
+    Each panel overlays the selected houses' profiles over the aligned time window
+    defined by [start_date, start_date + duration_hours). 15-minute resolution assumed.
+
+    Parameters
+    ----------
+    houses : list of integer house/load IDs (e.g. [23,41]). Defaults to [23,41].
+    profiles_csv : CSV containing columns like LV4_101_Load_<id>_hotwater / _heating.
+    aspect : stacked figure height/width ratio (default 0.8 similar to pv/temperature).
+    """
+    if not os.path.exists(profiles_csv):
+        raise FileNotFoundError(f"Profiles CSV not found: {profiles_csv}")
+    df = pd.read_csv(profiles_csv, index_col=0)
+    try:
+        df.index = pd.to_datetime(df.index)
+    except Exception:
+        raise ValueError("Failed to parse datetime index in house profiles CSV for thermal profiles")
+    if not houses:
+        houses = [23, 40]
+    # Determine window
+    start_dt = pd.to_datetime(start_date)
+    end_dt = start_dt + pd.Timedelta(hours=int(duration_hours)) - pd.Timedelta(minutes=15)
+    window = df.loc[start_dt:end_dt]
+    if window.empty:
+        raise ValueError("No data in requested time window for thermal profiles")
+    # Build column lists; silently skip houses without required columns
+    hot_cols: List[str] = []
+    heat_cols: List[str] = []
+    for hid in houses:
+        hot = f"LV4_101_Load_{hid}_hotwater"
+        heat = f"LV4_101_Load_{hid}_heating"
+        if hot in window.columns:
+            hot_cols.append(hot)
+        else:
+            print(f"Warning: missing hotwater column for house {hid} -> {hot}")
+        if heat in window.columns:
+            heat_cols.append(heat)
+        else:
+            print(f"Warning: missing heating column for house {hid} -> {heat}")
+    if not hot_cols and not heat_cols:
+        raise KeyError("No hotwater or heating columns found for requested houses")
+    # Prepare numeric arrays
+    hot_df = window[hot_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0) if hot_cols else pd.DataFrame(index=window.index)
+    heat_df = window[heat_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0) if heat_cols else pd.DataFrame(index=window.index)
+    n_steps = len(window)
+    x = np.arange(n_steps)
+    width_in = _cm_to_inch(width_cm)
+    height_in = width_in * aspect
+    with mpl.rc_context():
+        _configure_pgf(enable=True, texsystem=texsystem, use_sfmath=use_sfmath)
+        fig, axes = plt.subplots(2, 1, figsize=(width_in, height_in), sharex=True)
+        hot_ax, heat_ax = axes
+        palette = ['#3445A0', '#3A9D6C', '#D82E1D', '#9467BD', '#FF7F0E']
+        # Build friendly label map: 23 -> SFH, 41 (or 40) -> MFH; fallback to Load <id>
+        def _label_for_col(col: str) -> str:
+            m = re.search(r"LV4_101_Load_(\d+)_(hotwater|heating)$", col)
+            if not m:
+                return col.replace('_', '\\_')
+            hid = int(m.group(1))
+            if hid == 23:
+                return "SFH"
+            if hid in (40, 41):
+                return "MFH"
+            return f"Load {hid}"
+
+        # Top: hot water
+        if hot_cols:
+            for i, col in enumerate(hot_cols):
+                color = palette[i % len(palette)]
+                label = _label_for_col(col)
+                hot_ax.plot(x, hot_df[col].to_numpy(), color=color, linewidth=1.2, label=label)
+            try:
+                hot_ax.legend(loc='upper left', frameon=False, fontsize=8)
+            except Exception:
+                pass
+        else:
+            hot_ax.text(0.5, 0.5, 'No hotwater columns', ha='center', va='center', transform=hot_ax.transAxes, fontsize=8, color='gray')
+        hot_ax.set_ylabel('Hot Water Demand (kW)')
+        hot_ax.grid(alpha=0.3)
+        _force_plain_ticks(hot_ax, which="y")
+        # Bottom: heating
+        if heat_cols:
+            for i, col in enumerate(heat_cols):
+                color = palette[i % len(palette)]
+                label = _label_for_col(col)
+                heat_ax.plot(x, heat_df[col].to_numpy(), color=color, linewidth=1.2, label=label)
+            try:
+                heat_ax.legend(loc='upper left', frameon=False, fontsize=8)
+            except Exception:
+                pass
+        else:
+            heat_ax.text(0.5, 0.5, 'No heating columns', ha='center', va='center', transform=heat_ax.transAxes, fontsize=8, color='gray')
+        heat_ax.set_ylabel('Heating Demand (kW)')
+        heat_ax.set_xlabel('Time Step')
+        heat_ax.grid(alpha=0.3)
+        _force_plain_ticks(heat_ax, which="both")
+        # Fixed time ticks 0,24,...,96; ensure final label visibility (extend xlim)
+        try:
+            from matplotlib.ticker import FixedLocator, FixedFormatter
+            base_ticks = [0, 24, 48, 72, 96]
+            ticks = [t for t in base_ticks if t <= (n_steps - 1) or t == n_steps]
+            if ticks:
+                max_tick = max(ticks)
+                heat_ax.set_xlim(0, max(n_steps - 1, max_tick))
+                heat_ax.xaxis.set_major_locator(FixedLocator(ticks))
+                heat_ax.xaxis.set_major_formatter(FixedFormatter([str(t) for t in ticks]))
+        except Exception:
+            pass
+        for ax in axes:
+            for spine in ax.spines.values():
+                spine.set_linewidth(1.0)
+        fig.tight_layout()
+        pgf_out, png_out = _save_dual(fig, output_path)
+        plt.close(fig)
+    return pgf_out
 # --------------------- Generic image -> PGF exporter ---------------------
 
 def save_image_as_pgf(
@@ -486,7 +808,7 @@ def _load_flat_loading_distribution(parquet_path: Path) -> np.ndarray:
 # --------------------- OOS plots (native Matplotlib -> PGF) ---------------------
 
 def export_overload_energy_compare_pgf(
-    output_path: str = "overload_energy_compare_det_vs_010.pgf",
+    output_path: str = os.path.join(EXPORT_PGF_DIR, "overload_energy_compare_det_vs_010.pgf"),
     width_cm: float = DEFAULT_WIDTH_CM,
     aspect: float = DEFAULT_ASPECT,
     texsystem: str = "pdflatex",
@@ -506,31 +828,32 @@ def export_overload_energy_compare_pgf(
         det_val = _compute_overload_energy_from_parquet(Path(RESULTS_DIR) / det_pq)
     if eps_pq:
         eps_val = _compute_overload_energy_from_parquet(Path(RESULTS_DIR) / eps_pq)
-    labels = ['Deterministic', 'DRCC, eps=0.10']
+    labels = ['Deterministic', r'DRCC $\varepsilon$=0.10']
     values = [det_val if np.isfinite(det_val) else 0.0,
               eps_val if np.isfinite(eps_val) else 0.0]
     with mpl.rc_context():
         _configure_pgf(enable=True, texsystem=texsystem, use_sfmath=use_sfmath)
         fig, ax = plt.subplots(figsize=(width_in, height_in))
         x = np.arange(len(labels))
-        bars = ax.bar(x, values, color="#1f78b4", alpha=0.9)
+        bars = ax.bar(x, values, width=BAR_WIDTH, color="#3445A0", alpha=1.0)
         ax.set_xticks(x)
         ax.set_xticklabels(labels)
-        ax.set_ylabel('Total overload energy per sample (kWh)')
+        ax.set_ylabel('Total transformer overload energy [kWh]')
         ax.grid(axis='y', alpha=0.3)
         _apply_max_ticks(ax, max_ticks_x=max_ticks_x, max_ticks_y=max_ticks_y, integer_x=True, integer_y=False)
-        _force_plain_ticks(ax, which="both")
+        # Only format y ticks numerically so custom LaTeX x labels remain
+        _force_plain_ticks(ax, which="y")
         for rect, val in zip(bars, values):
             y = rect.get_height()
             ax.text(rect.get_x()+rect.get_width()/2, y + max(0.01*y, 0.01), f"{val:.2f}", ha='center', va='bottom', fontsize=8)
         fig.tight_layout()
-        fig.savefig(output_path)
+        pgf_out, png_out = _save_dual(fig, output_path)
         plt.close(fig)
-    return output_path
+    return pgf_out
 
 
 def export_soc_envelopes_pgf(
-    output_path: str = "soc_envelopes.pgf",
+    output_path: str = os.path.join(EXPORT_PGF_DIR, "soc_envelopes.pgf"),
     width_cm: float = DEFAULT_WIDTH_CM,
     aspect: float = DEFAULT_ASPECT,
     texsystem: str = "pdflatex",
@@ -545,7 +868,7 @@ def export_soc_envelopes_pgf(
     if det_path.exists():
         cases.append(('Deterministic', det_path))
     if eps010_path.exists():
-        cases.append(('DRCC, $\\varepsilon=0.10$', eps010_path))
+        cases.append(('DRCC, $\\varepsilon$=0.10', eps010_path))
     if not cases:
         raise FileNotFoundError("No SoC envelope CSVs found for deterministic or DRCC epsilon 0.10 under v3_oos_studentt")
     width_in = _cm_to_inch(width_cm)
@@ -562,46 +885,64 @@ def export_soc_envelopes_pgf(
                 ax.text(0.5, 0.5, 'Invalid SoC envelope CSV', ha='center', va='center', transform=ax.transAxes, color='red')
                 continue
             t = np.arange(len(df))
-            ax.fill_between(t, df['soc_p05'], df['soc_p95'], color='#c6dbef', alpha=0.6)
-            ax.plot(t, df['soc_p50'], color='#08519c', linewidth=1.4)
+            ax.fill_between(t, df['soc_p05'], df['soc_p95'], color='#3445A0', alpha=0.4)
+            ax.plot(t, df['soc_p50'], color='#3445A0', linewidth=1.4)
             ax.set_ylim(0.2, 0.8)
             ax.set_yticks([0.2, 0.4, 0.6, 0.8])
             ax.set_title(lab)
             if i == nrows - 1:
-                ax.set_xlabel('t step')
+                ax.set_xlabel('Time Step')
             ax.set_ylabel('BESS Capacity')
             ax.grid(alpha=0.3)
             _apply_max_ticks(ax, max_ticks_x=max_ticks_x, max_ticks_y=max_ticks_y, integer_x=True, integer_y=False)
+            # Apply fixed time ticks (0,24,...,96) after generic locator to ensure they stick;
+            # expand x-limits so the final label (e.g., 96) is visible.
+            if i == nrows - 1:
+                try:
+                    from matplotlib.ticker import FixedLocator, FixedFormatter
+                    total_steps = int(len(t))
+                    base_ticks = [0, 24, 48, 72, 96]
+                    ticks = [tt for tt in base_ticks if tt <= total_steps]
+                    if ticks:
+                        ax.set_xlim(0, max(total_steps, max(ticks)))
+                        ax.xaxis.set_major_locator(FixedLocator(ticks))
+                        ax.xaxis.set_major_formatter(FixedFormatter([str(tt) for tt in ticks]))
+                except Exception:
+                    pass
             # Enforce exact y ticks as requested
             ax.set_yticks([0.2, 0.4, 0.6, 0.8])
             _force_plain_ticks(ax, which="both")
         fig.tight_layout()
-        fig.savefig(output_path)
+        pgf_out, png_out = _save_dual(fig, output_path)
         plt.close(fig)
-    return output_path
+    return pgf_out
 
 
 def export_trafo_violation_heatmap_pgf(
-    output_path: str = "trafo_violation_heatmap.pgf",
+    output_path: str = os.path.join(EXPORT_PGF_DIR, "trafo_violation_heatmap.pgf"),
     width_cm: float = DEFAULT_WIDTH_CM,
     aspect: float = DEFAULT_ASPECT,
     texsystem: str = "pdflatex",
     use_sfmath: bool = False,
     max_ticks_x: int = DEFAULT_MAX_TICKS_X,
     max_ticks_y: int = DEFAULT_MAX_TICKS_Y,
+    legend_method: str = "none",
+    cbar_width_cm: Optional[float] = None,
 ) -> str:
     # Build profiles for baseline + epsilons present
     profiles: List[Tuple[str, np.ndarray]] = []
     t_axis: Optional[np.ndarray] = None
+    # Collect available series
+    base_rate: Optional[np.ndarray] = None
+    eps_rates: Dict[float, np.ndarray] = {}
     # Baseline
     base_meta = _load_oos_meta(None)
     rel = base_meta.get('trafo_loading_file')
     if rel:
         res = _load_trafo_profile(Path(RESULTS_DIR) / rel, threshold_pct=80.0)
         if res:
-            t_axis, rate = res
-            profiles.append(('Deterministic', rate))
-    # Eps
+            t_axis, base_rate = res
+    # DRCC eps candidates
     for eps in [0.30, 0.20, 0.10, 0.05]:
         meta = _load_oos_meta(eps)
         rel = meta.get('trafo_loading_file') if isinstance(meta, dict) else None
@@ -613,29 +954,47 @@ def export_trafo_violation_heatmap_pgf(
         t_local, rate = res
         if t_axis is None:
             t_axis = t_local
-        else:
-            if len(t_local) != len(t_axis):
-                min_len = min(len(t_local), len(t_axis))
-                t_axis = t_axis[:min_len]
-                rate = rate[:min_len]
-        profiles.append((f"DRCC, eps={eps:.2f}", rate))
-    if not profiles or t_axis is None:
+        # Align rate length later after ordering
+        eps_rates[eps] = rate
+    if (base_rate is None) and (not eps_rates) or t_axis is None:
         raise RuntimeError("No transformer loading parquet data available to build heatmap")
-    # Align
-    min_len = min(len(r) for _, r in profiles)
-    mat = np.vstack([r[:min_len] for _, r in profiles])
+    # Build ordered list: Deterministic, 0.30, 0.20, 0.10 (only include available)
+    ordered_profiles: List[Tuple[str, np.ndarray]] = []
+    if base_rate is not None:
+        ordered_profiles.append(("Deterministic", base_rate))
+    for eps in [0.30, 0.20, 0.10]:
+        if eps in eps_rates:
+            # Show case name directly on y-axis as requested: "DRCC, $\varepsilon$=0.XX"
+            ordered_profiles.append((rf"DRCC, $\varepsilon$={eps:.2f}", eps_rates[eps]))
+    # Align lengths across all rows
+    min_len = min(len(r) for _, r in ordered_profiles)
+    mat = np.vstack([r[:min_len] for _, r in ordered_profiles])
     mat = np.clip(mat, 0.0, 0.5)
-    labels = [lab for lab, _ in profiles]
-    width_in = _cm_to_inch(width_cm)
-    height_in = width_in * aspect
+    labels = [lab for lab, _ in ordered_profiles]
+    # If using a pgfplots-based smooth colorbar, reserve space for the colorbar by
+    # rendering the core plot narrower. We'll re-assemble in a wrapper PGF.
+    cbar_width_cm_eff = float(cbar_width_cm) if cbar_width_cm is not None else max(0.35, width_cm * 0.12)
+    total_width_cm = float(width_cm)
+    if legend_method == "pgfplots_inline":
+        core_width_cm = max(0.0, total_width_cm - cbar_width_cm_eff)
+    else:
+        core_width_cm = total_width_cm
+    width_in = _cm_to_inch(core_width_cm)
+    height_in = width_in * aspect if core_width_cm > 0 else _cm_to_inch(total_width_cm) * aspect
     with mpl.rc_context():
         _configure_pgf(enable=True, texsystem=texsystem, use_sfmath=use_sfmath)
         fig, ax = plt.subplots(figsize=(width_in, height_in))
-        # Use pcolormesh to avoid external raster image files in PGF
+    # Use pcolormesh to avoid external raster image files in PGF
         ny, nx = mat.shape
         x_edges = np.arange(nx+1)
         y_edges = np.arange(ny+1)
-        cmap = mpl.cm.Blues
+        # Colormap: white at 0, brand blue (#3445A0) at 0.5 and above
+        try:
+            from matplotlib.colors import LinearSegmentedColormap
+            brand_blue = '#3445A0'
+            cmap = LinearSegmentedColormap.from_list('white_to_brandblue', ['#FFFFFF', brand_blue])
+        except Exception:
+            cmap = mpl.cm.Blues
         quad = ax.pcolormesh(x_edges, y_edges, mat, cmap=cmap, vmin=0.0, vmax=0.5, shading='flat')
         # Limit ticks manually: choose evenly spaced columns and cases
         ny, nx = mat.shape
@@ -647,33 +1006,66 @@ def export_trafo_violation_heatmap_pgf(
         yt_pos = np.linspace(0, ny-1, num=yt_count, dtype=int)
         ax.set_yticks(yt_pos + 0.5)
         ax.set_yticklabels([labels[i] for i in yt_pos])
-        ax.set_xlabel('timestep index')
-        ax.set_ylabel('optimization case')
-        _force_plain_ticks(ax, which="x")
-        # Draw a small discrete color legend (vector) instead of a raster colorbar
+        # Ensure visual order has row 0 at the top (Deterministic top, eps=0.10 bottom)
         try:
-            from matplotlib.patches import Rectangle
-            legend_ax = ax.inset_axes([1.02, 0.1, 0.03, 0.8], transform=ax.transAxes)
-            legend_ax.set_axis_off()
-            levels = np.linspace(0.0, 0.5, 6)
-            h = 1.0 / (len(levels)-1)
-            for i in range(len(levels)-1):
-                c = cmap((levels[i] - 0.0) / (0.5 - 0.0))
-                legend_ax.add_patch(Rectangle((0, i*h), 1.0, h, transform=legend_ax.transAxes, color=c, ec='none'))
-            legend_ax.text(1.2, 0.0, '0.0', transform=legend_ax.transAxes, va='center', fontsize=8)
-            legend_ax.text(1.2, 1.0, '0.5', transform=legend_ax.transAxes, va='center', fontsize=8)
-            ax.text(1.06, 0.92, 'violation probability', transform=ax.transAxes, rotation=90, fontsize=8)
+            ax.invert_yaxis()
         except Exception:
             pass
+        ax.set_xlabel('Time Step')
+        # Replace automatic ticks with fixed time ticks at 0,24,...,96 (labels), positioned at cell centers.
+        # Ensure the final label (e.g., 96) is present by clamping its position to the last cell center.
+        try:
+            from matplotlib.ticker import FixedLocator, FixedFormatter
+            total_steps = int(nx)
+            base_ticks = [0, 24, 48, 72, 96]
+            ticks = [t for t in base_ticks if t <= total_steps]
+            if ticks:
+                # Clamp label positions to the last cell center (nx - 0.5)
+                positions = [min(t + 0.5, nx - 0.5) for t in ticks]
+                ax.set_xlim(0, nx)
+                ax.xaxis.set_major_locator(FixedLocator(positions))
+                ax.xaxis.set_major_formatter(FixedFormatter([str(t) for t in ticks]))
+        except Exception:
+            pass
+        ax.set_ylabel('Optimization Case')
+    # Do not override y tick formatter so manual string labels (case names) stay intact
+        # Legend handling
+        # - "discrete": draw manual rectangle stack
+        # - "pgfplots_inline": will be handled after saving (inline pgfplots colorbar)
+        # - "none": no legend/colorbar drawn at all (core heatmap only)
+        if legend_method == "discrete":
+            try:
+                from matplotlib.patches import Rectangle
+                legend_ax = ax.inset_axes([1.02, 0.1, 0.03, 0.8], transform=ax.transAxes)
+                legend_ax.set_axis_off()
+                levels = np.linspace(0.0, 0.5, 6)
+                h = 1.0 / (len(levels)-1)
+                for i in range(len(levels)-1):
+                    c = cmap((levels[i] - 0.0) / (0.5 - 0.0))
+                    legend_ax.add_patch(Rectangle((0, i*h), 1.0, h, transform=legend_ax.transAxes, color=c, ec='none'))
+                legend_ax.text(1.2, 0.0, '0.0', transform=legend_ax.transAxes, va='center', fontsize=8)
+                legend_ax.text(1.2, 1.0, '0.5', transform=legend_ax.transAxes, va='center', fontsize=8)
+                ax.text(1.06, 0.92, 'violation probability', transform=ax.transAxes, rotation=90, fontsize=8)
+            except Exception:
+                pass
         fig.tight_layout()
-        fig.savefig(output_path)
+
+        # Save either directly (discrete legend) or as a core + wrapper (pgfplots colorbar)
+        pgf_out, png_out = _save_dual(fig, output_path)
         plt.close(fig)
-    return output_path
+
+    # legend_method "none": no post-processing
+    if legend_method == "none":
+        return pgf_out
+    return pgf_out
+
+
+# (Removed previous wrapper helper; inline method now used)
 
 
 def export_violin_compare_pgf(
-    output_path: str = "violin_compare_det_vs_010.pgf",
-    width_cm: float = 5.4,
+    output_path: str = os.path.join(EXPORT_PGF_DIR, "violin_compare_det_vs_010.pgf"),
+    width_cm: float = 5.3,
     aspect: float = DEFAULT_ASPECT,
     texsystem: str = "pdflatex",
     use_sfmath: bool = False,
@@ -717,29 +1109,54 @@ def export_violin_compare_pgf(
             right_clip = Rectangle((x0, ymin), width=(xmax - x0), height=(ymax - ymin), transform=ax.transData)
             for body, tag in zip(vp['bodies'], side_tags):
                 if tag == 'left':
-                    body.set_facecolor('#b2df8a'); body.set_edgecolor('#1b7837'); body.set_alpha(0.6); body.set_clip_path(left_clip)
+                    body.set_facecolor('#3A9D6C'); body.set_edgecolor('#3A9D6C'); body.set_alpha(0.4); body.set_clip_path(left_clip); body.set_linewidth(0.8)
                 else:
-                    body.set_facecolor('#a6cee3'); body.set_edgecolor('#1f78b4'); body.set_alpha(0.6); body.set_clip_path(right_clip)
-            # Median ticks
+                    body.set_facecolor('#3445A0'); body.set_edgecolor('#3445A0'); body.set_alpha(0.4); body.set_clip_path(right_clip); body.set_linewidth(0.8)
+            # Median + min/max ticks (min/max: solid, half-length, touching central spine)
+            line_half = 0.075  # half-length for min/max lines
             if left_vals.size:
                 m_left = float(np.nanmedian(left_vals))
-                ax.plot([x0 - 0.21, x0], [m_left, m_left], color='#1b7837', linewidth=2)
+                ax.plot([x0 - 0.21, x0], [m_left, m_left], color='#3A9D6C', linewidth=1.0)
+                min_left = float(np.nanmin(left_vals))
+                max_left = float(np.nanmax(left_vals))
+                ax.plot([x0 - line_half, x0], [min_left, min_left], color='#3A9D6C', linewidth=0.8, alpha=0.9)
+                ax.plot([x0 - line_half, x0], [max_left, max_left], color='#3A9D6C', linewidth=0.8, alpha=0.9)
             if right_vals.size:
                 m_right = float(np.nanmedian(right_vals))
-                ax.plot([x0, x0 + 0.21], [m_right, m_right], color='#1f78b4', linewidth=2)
-            ax.set_xticks([x0]); ax.set_xticklabels(['Deterministic vs DRCC, eps=0.10'])
-            ax.set_ylabel('Transformer loading %'); ax.grid(axis='y', alpha=0.3)
-            _apply_max_ticks(ax, max_ticks_x=max_ticks_x, max_ticks_y=max_ticks_y, integer_x=True, integer_y=False)
+                ax.plot([x0, x0 + 0.21], [m_right, m_right], color='#3445A0', linewidth=1.0)
+                min_right = float(np.nanmin(right_vals))
+                max_right = float(np.nanmax(right_vals))
+                ax.plot([x0, x0 + line_half], [min_right, min_right], color='#3445A0', linewidth=0.8, alpha=0.9)
+                ax.plot([x0, x0 + line_half], [max_right, max_right], color='#3445A0', linewidth=0.8, alpha=0.9)
+            # Add deterministic and DRCC labels left/right of central spine
+            left_x = x0 - 0.21
+            right_x = x0 + 0.21
+            ax.set_xlim(x0 - 0.4, x0 + 0.4)
+            ax.set_xticks([left_x, right_x])
+            ax.set_xticklabels(['Deterministic', r'DRCC $\varepsilon$=0.10'])
+            ax.tick_params(axis='x', which='both', bottom=True, top=False, labelbottom=True)
+            ax.set_ylabel('Transformer loading [%]'); ax.grid(axis='y', alpha=0.3)
+            # Apply only Y tick constraints; leave X to our fixed category labels
+            _apply_max_ticks(ax, max_ticks_x=None, max_ticks_y=max_ticks_y, integer_x=False, integer_y=False)
             ax.axvline(x0, color='black', linewidth=0.9, alpha=0.8, zorder=3)
-        _force_plain_ticks(ax, which="both")
+            # Ensure axis spines are not thicker than 1.0
+            for spine in ax.spines.values():
+                spine.set_linewidth(1.0)
+        # Only format y ticks so LaTeX x-category labels stay intact
+        _force_plain_ticks(ax, which="y")
+        # Ensure grid lines don't exceed 1.0 width
+        try:
+            ax.grid(True, axis='y', alpha=0.3, linewidth=0.8)
+        except Exception:
+            pass
         fig.tight_layout()
-        fig.savefig(output_path)
+        pgf_out, png_out = _save_dual(fig, output_path)
         plt.close(fig)
-    return output_path
+    return pgf_out
 
 
 def export_frontier_hybrid_scatter_pgf(
-    output_path: str = "frontier_hybrid_scatter.pgf",
+    output_path: str = os.path.join(EXPORT_PGF_DIR, "frontier_hybrid_scatter.pgf"),
     width_cm: float = DEFAULT_WIDTH_CM,
     aspect: float = DEFAULT_ASPECT,
     texsystem: str = "pdflatex",
@@ -925,9 +1342,268 @@ def export_frontier_hybrid_scatter_pgf(
             except Exception:
                 pass
 
-        fig.savefig(output_path)
+        d = os.path.dirname(output_path)
+        if d and d not in ("", "."):
+            os.makedirs(d, exist_ok=True)
+        # Save PGF and a PNG sidecar for quick inspection
+        pgf_out, png_out = _save_dual(fig, output_path)
         plt.close(fig)
-    return output_path
+    return pgf_out
+
+
+def export_pv_temperature_uncertainty_pgf(
+    output_path: str = os.path.join(EXPORT_PGF_DIR, "pv_temperature_uncertainty.pgf"),
+    width_cm: float = DEFAULT_WIDTH_CM,
+    aspect: float = DEFAULT_ASPECT,
+    texsystem: str = "pdflatex",
+    use_sfmath: bool = False,
+    max_ticks_x: int = DEFAULT_MAX_TICKS_X,
+    max_ticks_y: int = DEFAULT_MAX_TICKS_Y,
+    pv_samples_csv: str = os.path.join("samples", "samples_pv_gaussian.csv"),
+    temp_samples_csv: str = os.path.join("samples", "samples_temperature_c_gaussian.csv"),
+) -> str:
+    """Export stacked uncertainty bands for PV generation (aggregate MW) and ambient temperature (°C).
+
+    Data expectation:
+        pv_samples_csv: columns => timestamp,sample_id,<pv_bus_*_mw ...>
+        temp_samples_csv: columns => timestamp,sample_id,temperature_c
+
+    For PV: total PV per sample & timestamp is sum over all pv_bus_* columns.
+    For temperature: direct use of temperature_c.
+    We compute mean and standard deviation across sample_id for each timestamp.
+    Plot mean line (solid) and shaded +/-1σ band (semi-transparent) for each series.
+    """
+    if not os.path.exists(pv_samples_csv):
+        raise FileNotFoundError(f"PV samples CSV not found: {pv_samples_csv}")
+    if not os.path.exists(temp_samples_csv):
+        raise FileNotFoundError(f"Temperature samples CSV not found: {temp_samples_csv}")
+
+    # Load PV samples
+    pv_df = pd.read_csv(pv_samples_csv)
+    must_cols = {"timestamp", "sample_id"}
+    if not must_cols <= set(pv_df.columns):
+        raise KeyError(f"PV samples missing required columns {must_cols}. Found: {pv_df.columns.tolist()}")
+    pv_bus_cols = [c for c in pv_df.columns if c.startswith("pv_bus_") and c.endswith("_mw")]
+    if not pv_bus_cols:
+        raise KeyError("No pv_bus_*_mw columns found in PV samples CSV")
+    # Convert timestamp to ordered categorical -> integer time steps
+    pv_df['timestamp'] = pd.to_datetime(pv_df['timestamp'])
+    pv_df.sort_values('timestamp', inplace=True)
+    # Total PV per row (MW)
+    pv_vals = pv_df[pv_bus_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+    pv_df['total_pv_mw'] = pv_vals.sum(axis=1)
+    # Normalization: divide each sample's total PV by the global maximum (capacity proxy)
+    capacity_total = float(pv_df['total_pv_mw'].max())
+    if capacity_total > 0:
+        pv_df['total_pv_pu'] = pv_df['total_pv_mw'] / capacity_total
+        pv_metric_col = 'total_pv_pu'
+        pv_ylabel = 'Normalized Power'
+    else:
+        pv_metric_col = 'total_pv_mw'
+        pv_ylabel = 'Total PV (MW)'
+    # Group by timestamp -> aggregate across samples using normalized metric if available
+    pv_grp = pv_df.groupby('timestamp')[pv_metric_col]
+    pv_mean = pv_grp.mean().to_numpy()
+    pv_std = pv_grp.std(ddof=0).to_numpy()  # population std (consistent for large samples)
+    ts_index = pv_grp.mean().index.to_numpy()
+
+    # Load temperature samples
+    t_df = pd.read_csv(temp_samples_csv)
+    if not must_cols | {"temperature_c"} <= set(t_df.columns):
+        raise KeyError("Temperature samples CSV missing required columns 'timestamp','sample_id','temperature_c'")
+    t_df['timestamp'] = pd.to_datetime(t_df['timestamp'])
+    t_df.sort_values('timestamp', inplace=True)
+    t_grp = t_df.groupby('timestamp')['temperature_c']
+    t_mean = t_grp.mean().to_numpy()
+    t_std = t_grp.std(ddof=0).to_numpy()
+    t_ts_index = t_grp.mean().index.to_numpy()
+
+    # Align lengths if they differ (truncate to shortest to maintain shared x-axis)
+    common_len = min(len(ts_index), len(t_ts_index))
+    ts_index = ts_index[:common_len]
+    pv_mean, pv_std = pv_mean[:common_len], pv_std[:common_len]
+    t_mean, t_std = t_mean[:common_len], t_std[:common_len]
+    x_steps = np.arange(common_len)
+
+    width_in = _cm_to_inch(width_cm)
+    height_in = width_in * aspect
+    with mpl.rc_context():
+        _configure_pgf(enable=True, texsystem=texsystem, use_sfmath=use_sfmath)
+        # Two stacked subplots sharing x-axis
+        fig, axes = plt.subplots(2, 1, figsize=(width_in, height_in), sharex=True)
+        pv_ax, temp_ax = axes
+        # PV plot
+        pv_color = '#FFA500'  # brand blue for PV
+        pv_ax.fill_between(x_steps, pv_mean - pv_std, pv_mean + pv_std, facecolor=pv_color, alpha=0.35, linewidth=0.0)
+        pv_ax.plot(x_steps, pv_mean, color=pv_color, linewidth=1.4)
+        pv_ax.set_ylabel(pv_ylabel)
+        pv_ax.grid(alpha=0.3)
+        _apply_max_ticks(pv_ax, max_ticks_x=max_ticks_x, max_ticks_y=max_ticks_y, integer_x=True, integer_y=False)
+        _force_plain_ticks(pv_ax, which="y")  # x handled globally
+
+        # Temperature plot
+        temp_color = '#D82E1D'  # distinct orange for temperature
+        temp_ax.fill_between(x_steps, t_mean - t_std, t_mean + t_std, facecolor=temp_color, alpha=0.35, linewidth=0.0)
+        temp_ax.plot(x_steps, t_mean, color=temp_color, linewidth=1.4)
+        temp_ax.set_ylabel('Temperature [°C]')
+        temp_ax.set_xlabel('Time Step')
+        temp_ax.grid(alpha=0.3)
+        _apply_max_ticks(temp_ax, max_ticks_x=max_ticks_x, max_ticks_y=max_ticks_y, integer_x=True, integer_y=False)
+        _force_plain_ticks(temp_ax, which="both")
+
+        # Replace automatic x ticks with fixed 0,24,48,72,96 if within range; ensure last tick visible by extending xlim
+        try:
+            from matplotlib.ticker import FixedLocator, FixedFormatter
+            base_ticks = [0, 24, 48, 72, 96]
+            ticks = [t for t in base_ticks if t < common_len or (t == common_len)]
+            if ticks:
+                # if final tick equals common_len add axis extension so label shows
+                max_tick = max(ticks)
+                temp_ax.set_xlim(0, max(common_len - 1, max_tick))
+                temp_ax.xaxis.set_major_locator(FixedLocator(ticks))
+                temp_ax.xaxis.set_major_formatter(FixedFormatter([str(t) for t in ticks]))
+                # hide tick markers but keep labels if desired? (follow prior style) -> keep markers for time series
+        except Exception:
+            pass
+
+        for ax in axes:
+            for spine in ax.spines.values():
+                spine.set_linewidth(1.0)
+        fig.tight_layout()
+        pgf_out, png_out = _save_dual(fig, output_path)
+        plt.close(fig)
+    return pgf_out
+
+
+def export_house_load_profiles_pgf(
+    output_path: str = os.path.join(EXPORT_PGF_DIR, "house_load_profiles.pgf"),
+    width_cm: float = DEFAULT_WIDTH_CM,
+    aspect: float = DEFAULT_ASPECT_LOADS,
+    texsystem: str = "pdflatex",
+    use_sfmath: bool = False,
+    max_ticks_x: int = DEFAULT_MAX_TICKS_X,
+    max_ticks_y: int = DEFAULT_MAX_TICKS_Y,
+    start_date: str = "2023-01-10 00:00:00",
+    duration_hours: int = 24,
+    profiles_csv: str = os.path.join("vdi_profiles", "all_house_profiles.csv"),
+    load_cols: Optional[List[str]] = None,
+) -> str:
+    """Export electric load profiles for selected houses over an aligned time window.
+
+    Parameters
+    ----------
+    load_cols : list of column names to plot. Defaults to ['LV4.101_Load_40','LV4.101_Load_6'] if available.
+    duration_hours : number of hours (15-min resolution assumed) starting at start_date.
+    We reuse alignment logic from _build_time_index_from_vdi.
+    """
+    if not os.path.exists(profiles_csv):
+        raise FileNotFoundError(f"Profiles CSV not found: {profiles_csv}")
+    df = pd.read_csv(profiles_csv, index_col=0)
+    try:
+        df.index = pd.to_datetime(df.index)
+    except Exception:
+        raise ValueError("Failed to parse datetime index in house profiles CSV")
+    # Determine window
+    start_dt = pd.to_datetime(start_date)
+    end_dt = start_dt + pd.Timedelta(hours=int(duration_hours)) - pd.Timedelta(minutes=15)
+    window = df.loc[start_dt:end_dt]
+    if window.empty:
+        raise ValueError("No data in requested time window for load profiles")
+    # Resolve requested columns to actual electricity columns in the CSV
+    def _resolve_load_columns(req: Optional[List[str]], cols: List[str]) -> List[str]:
+        all_cols = list(cols)
+        # Prefer explicit electricity channels
+        elec_cols = [c for c in all_cols if c.lower().endswith('_electricity')]
+        if not req:
+            # Smart default to two example houses if present; else first two electricity cols
+            preferred = ['LV4_101_Load_40_electricity', 'LV4_101_Load_23_electricity']
+            found = [c for c in preferred if c in all_cols]
+            if len(found) < 2 and elec_cols:
+                # Fill with first electricity columns deterministically
+                for c in elec_cols:
+                    if c not in found:
+                        found.append(c)
+                    if len(found) >= 2:
+                        break
+            return found
+        resolved: List[str] = []
+        for r in req:
+            if r in all_cols:
+                resolved.append(r)
+                continue
+            # Build common variations
+            base = r.replace('.', '_')
+            cand1 = base if base.endswith('_electricity') else base + '_electricity'
+            cand2 = base + '_electric'
+            # Try exact matches
+            for c in (cand1, cand2):
+                if c in all_cols:
+                    resolved.append(c)
+                    break
+            else:
+                # Fuzzy: any column containing the load id and electricity
+                tokens = [t for t in base.split('_') if t]
+                def _looks_like(col: str) -> bool:
+                    low = col.lower()
+                    return (tokens[-1].lower() in low) and ('electric' in low)
+                matches = [c for c in all_cols if _looks_like(c)]
+                if matches:
+                    resolved.append(matches[0])
+        return resolved
+
+    candidate_cols = _resolve_load_columns(load_cols, list(window.columns))
+    if not candidate_cols:
+        # As ultimate fallback, take the first two electricity columns if they exist
+        fallback_elec = [c for c in window.columns if c.lower().endswith('_electricity')]
+        candidate_cols = fallback_elec[:2]
+    if not candidate_cols:
+        raise KeyError("No electricity load columns found in profiles CSV (expected *_electricity)")
+    # Build time step axis (0..N-1) for plotting with integer ticks
+    # Use resolved candidate_cols (NOT original load_cols which may be None or unmapped)
+    values = window[candidate_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+    n_steps = len(values)
+    x = np.arange(n_steps)
+    width_in = _cm_to_inch(width_cm)
+    height_in = width_in * aspect
+    with mpl.rc_context():
+        _configure_pgf(enable=True, texsystem=texsystem, use_sfmath=use_sfmath)
+        fig, ax = plt.subplots(figsize=(width_in, height_in))
+        # Plot each load profile
+        palette = ['#3445A0', '#3A9D6C', '#D82E1D', '#9467BD', '#FF7F0E']
+        label_map = {
+            'LV4_101_Load_40_electricity': 'MFH',
+            'LV4_101_Load_23_electricity': 'SFH',
+        }
+        for i, col in enumerate(candidate_cols):
+            color = palette[i % len(palette)]
+            lab = label_map.get(col, col.replace('_', '\\_'))
+            ax.plot(x, values[col].to_numpy(), label=lab, linewidth=1.2, color=color)
+        ax.set_ylabel('Electric Load (kW)')
+        ax.set_xlabel('Time Step')
+        ax.grid(alpha=0.3)
+        # Fixed time ticks at 0,24,48,72,96 if present
+        try:
+            from matplotlib.ticker import FixedLocator, FixedFormatter
+            base_ticks = [0, 24, 48, 72, 96]
+            ticks = [t for t in base_ticks if t <= (n_steps - 1)]
+            if ticks:
+                ax.set_xlim(0, max(n_steps - 1, max(ticks)))
+                ax.xaxis.set_major_locator(FixedLocator(ticks))
+                ax.xaxis.set_major_formatter(FixedFormatter([str(t) for t in ticks]))
+        except Exception:
+            pass
+        _force_plain_ticks(ax, which="y")
+        # Legend inside, upper left
+        try:
+            ax.legend(loc='upper left', frameon=False, fontsize=8)
+        except Exception:
+            pass
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.0)
+        fig.tight_layout()
+        pgf_out, png_out = _save_dual(fig, output_path)
+        plt.close(fig)
+    return pgf_out
 
 
 # --------------------- CLI ---------------------
@@ -944,46 +1620,47 @@ def _export_selected(
     cloud_marker_size_drcc: Optional[int] = None,
     cloud_marker_size_base: Optional[int] = None,
     violin_width_cm: Optional[float] = None,
+    png_dpi: Optional[int] = None,
 ) -> None:
     # common kwargs for OOS exporters (width passed per-plot below)
     common = dict(texsystem=texsystem, use_sfmath=use_sfmath,
                   max_ticks_x=max_ticks_x, max_ticks_y=max_ticks_y)
 
     if "ts" in selections or "all" in selections:
-        if export_ts_ref is not None:
-            export_ts_ref(
-                width_cm=width_cm,
-                aspect=aspects.get("ts", DEFAULT_ASPECT_TS),
-                texsystem=texsystem,
-                use_sfmath=use_sfmath,
-                **ts_args,
-            )
-        else:
-            export_thermal_storage_pgf(
-                width_cm=width_cm,
-                aspect=aspects.get("ts", DEFAULT_ASPECT_TS),
-                texsystem=texsystem,
-                use_sfmath=use_sfmath,
-                **ts_args,
-            )
-        print("Saved: thermal_storage_operation_area.pgf")
+        # Always use local exporter to guarantee PNG alongside PGF
+        export_thermal_storage_pgf(
+            width_cm=width_cm,
+            aspect=aspects.get("ts", DEFAULT_ASPECT_TS),
+            texsystem=texsystem,
+            use_sfmath=use_sfmath,
+            **ts_args,
+        )
+        print(f"Saved: {os.path.join(EXPORT_PGF_DIR, 'thermal_storage_operation_area.pgf')} (+ PNG)")
 
     if "overload" in selections or "all" in selections:
-        out = export_overload_energy_compare_pgf(width_cm=width_cm, aspect=aspects.get("overload", DEFAULT_ASPECT_OVERLOAD), **common)
-        print(f"Saved: {out}")
+        # Use same narrower width and height (aspect) as violin plot so visual style aligns
+        narrow_w = violin_width_cm if violin_width_cm is not None else (width_cm / 2.0)
+        overload_aspect = aspects.get("violin", DEFAULT_ASPECT_VIOLIN)
+        out = export_overload_energy_compare_pgf(width_cm=narrow_w, aspect=overload_aspect, **common)
+        print(f"Saved (narrow overload size): {out} (+ PNG)")
 
     if "soc" in selections or "all" in selections:
         out = export_soc_envelopes_pgf(width_cm=width_cm, aspect=aspects.get("soc", DEFAULT_ASPECT_SOC), **common)
-        print(f"Saved: {out}")
+        print(f"Saved: {out} (+ PNG)")
 
     if "trafo" in selections or "all" in selections:
-        out = export_trafo_violation_heatmap_pgf(width_cm=width_cm, aspect=aspects.get("trafo", DEFAULT_ASPECT_HEATMAP), **common)
-        print(f"Saved: {out}")
+        try:
+            # Make heatmap 1.5 cm narrower than the global/default width (user request)
+            heatmap_width_cm = max(1.0, float(width_cm) - 1.5)
+            out = export_trafo_violation_heatmap_pgf(width_cm=heatmap_width_cm, aspect=aspects.get("trafo", DEFAULT_ASPECT_HEATMAP), **common)
+            print(f"Saved: {out} (+ PNG)")
+        except Exception as e:
+            print(f"Skipping transformer violation heatmap: {e}")
 
     if "violin" in selections or "all" in selections:
         vw = violin_width_cm if violin_width_cm is not None else (width_cm / 2.0)
         out = export_violin_compare_pgf(width_cm=vw, aspect=aspects.get("violin", DEFAULT_ASPECT_VIOLIN), **common)
-        print(f"Saved: {out}")
+        print(f"Saved: {out} (+ PNG)")
 
     if "frontier" in selections or "all" in selections:
         out = export_frontier_hybrid_scatter_pgf(
@@ -993,10 +1670,107 @@ def _export_selected(
             cloud_marker_size_drcc=(cloud_marker_size_drcc if cloud_marker_size_drcc is not None else DEFAULT_CLOUD_MARKER_SIZE_DRCC),
             cloud_marker_size_base=(cloud_marker_size_base if cloud_marker_size_base is not None else DEFAULT_CLOUD_MARKER_SIZE_BASE),
         )
-        print(f"Saved: {out}")
+        print(f"Saved: {out} (+ PNG)")
+
+    if "pvtemp" in selections or "all" in selections:
+        out = export_pv_temperature_uncertainty_pgf(width_cm=width_cm, aspect=aspects.get("pvtemp", DEFAULT_ASPECT), **common)
+        print(f"Saved: {out} (+ PNG)")
+
+    if "loads" in selections or "all" in selections:
+        # Use TS alignment window for consistency
+        start_date = ts_args.get("start_date", "2023-01-10 00:00:00")
+        duration_hours = ts_args.get("duration_hours", 24)
+        out = export_house_load_profiles_pgf(width_cm=width_cm,
+                                             aspect=aspects.get("loads", DEFAULT_ASPECT_LOADS),
+                                             texsystem=texsystem,
+                                             use_sfmath=use_sfmath,
+                                             start_date=start_date,
+                                             duration_hours=int(duration_hours))
+        print(f"Saved: {out} (+ PNG)")
+
+    if "bev" in selections or "all" in selections:
+        # Align to the same TS window
+        start_date = ts_args.get("start_date", "2023-01-10 00:00:00")
+        duration_hours = ts_args.get("duration_hours", 24)
+        out = export_bev_profile_pgf(width_cm=width_cm,
+                                     aspect=aspects.get("bev", DEFAULT_ASPECT_BEV),
+                                     texsystem=texsystem,
+                                     use_sfmath=use_sfmath,
+                                     start_date=start_date,
+                                     duration_hours=int(duration_hours),
+                                     car_cols=["car_2", "car_9"],
+                                     output_path=os.path.join(EXPORT_PGF_DIR, "bev_two_cars_profile.pgf"))
+        print(f"Saved: {out} (+ PNG)")
+
+    if "thermal" in selections or "all" in selections:
+        start_date = ts_args.get("start_date", "2023-01-10 00:00:00")
+        duration_hours = ts_args.get("duration_hours", 24)
+        out = export_hotwater_heating_profiles_pgf(width_cm=width_cm,
+                                                   aspect=aspects.get("thermal", DEFAULT_ASPECT_THERMAL),
+                                                   texsystem=texsystem,
+                                                   use_sfmath=use_sfmath,
+                                                   start_date=start_date,
+                                                   duration_hours=int(duration_hours))
+        print(f"Saved: {out} (+ PNG)")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # If inline config is enabled, bypass CLI parsing entirely
+    if RUN_WITH_INLINE_CONFIG:
+        cfg = INLINE_CONFIG
+        selections = list(cfg.get("selections", [])) or ["all"]
+        custom_dir = cfg.get("results_dir")
+        if custom_dir:
+            global RESULTS_DIR
+            RESULTS_DIR = str(custom_dir)
+        width_cm = float(cfg.get("width_cm", DEFAULT_WIDTH_CM))
+        # Build aspects using helper logic similar to CLI
+        def _pick(per_plot: Optional[float], per_plot_default: float) -> float:
+            global_aspect = cfg.get("aspect", None)
+            if per_plot is not None:
+                return float(per_plot)
+            if global_aspect is not None:
+                return float(global_aspect)
+            return float(per_plot_default)
+        aspects = {
+            "ts": _pick(cfg.get("aspect_ts"), DEFAULT_ASPECT_TS),
+            "overload": _pick(cfg.get("aspect_overload"), DEFAULT_ASPECT_OVERLOAD),
+            "soc": _pick(cfg.get("aspect_soc"), DEFAULT_ASPECT_SOC),
+            "trafo": _pick(cfg.get("aspect_heatmap"), DEFAULT_ASPECT_HEATMAP),
+            "violin": _pick(cfg.get("aspect_violin"), DEFAULT_ASPECT_VIOLIN),
+            "frontier": _pick(cfg.get("aspect_frontier"), DEFAULT_ASPECT_FRONTIER),
+            "pvtemp": _pick(cfg.get("aspect_pvtemp"), DEFAULT_ASPECT_PVTEMP),
+            "loads": _pick(cfg.get("aspect_loads"), DEFAULT_ASPECT_LOADS),
+            "bev": _pick(cfg.get("aspect_bev"), DEFAULT_ASPECT_BEV),
+            "thermal": _pick(cfg.get("aspect_thermal"), DEFAULT_ASPECT_THERMAL),
+        }
+        ts_cfg = cfg.get("ts", {})
+        ts_args = dict(
+            input_csv=ts_cfg.get("input", "fully_coordinated_model_results.csv"),
+            output_path=os.path.join(EXPORT_PGF_DIR, "thermal_storage_operation_area.pgf"),
+            price_csv=ts_cfg.get("price_csv", None),
+            price_col=ts_cfg.get("price_col", None),
+            start_date=ts_cfg.get("start_date", "2023-01-10 00:00:00"),
+            duration_hours=int(ts_cfg.get("duration_hours", 24)),
+            disable_market_price=bool(ts_cfg.get("no_market_price", False)),
+            show=False,
+        )
+        _export_selected(
+            selections=selections,
+            width_cm=width_cm,
+            aspects=aspects,
+            texsystem=str(cfg.get("texsystem", "pdflatex")),
+            use_sfmath=bool(cfg.get("sfmath", False)),
+            ts_args=ts_args,
+            max_ticks_x=int(cfg.get("max_ticks_x", DEFAULT_MAX_TICKS_X)),
+            max_ticks_y=int(cfg.get("max_ticks_y", DEFAULT_MAX_TICKS_Y)),
+            cloud_marker_size_drcc=None,
+            cloud_marker_size_base=None,
+            violin_width_cm=cfg.get("width_cm_violin", None),
+            png_dpi=int(cfg.get("png_dpi", PNG_DPI)),
+        )
+        return 0
+
     p = argparse.ArgumentParser(description="Export selected plots to PGF (TS + OOS Student-t images)")
     # Selection flags
     p.add_argument("--all", action="store_true", help="Export all supported plots")
@@ -1006,6 +1780,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--trafo-violation-heatmap", dest="trafo", action="store_true", help="Export trafo_violation_heatmap (Student-t)")
     p.add_argument("--violin-compare", dest="violin", action="store_true", help="Export violin_compare (Student-t)")
     p.add_argument("--frontier-hybrid-scatter", dest="frontier", action="store_true", help="Export frontier_hybrid_scatter (Student-t)")
+    p.add_argument("--pv-temp-uncertainty", dest="pvtemp", action="store_true", help="Export PV & ambient temperature uncertainty bands")
+    p.add_argument("--load-profiles", dest="loads", action="store_true", help="Export selected house electric load profiles")
+    p.add_argument("--bev", dest="bev", action="store_true", help="Export one BEV charging profile (default car_8)")
+    p.add_argument("--thermal-profiles", dest="thermal", action="store_true", help="Export stacked hotwater + heating demand profiles")
 
     # PGF and sizing
     p.add_argument("--texsystem", default="pdflatex", choices=["pdflatex", "xelatex", "lualatex"], help="LaTeX engine")
@@ -1022,6 +1800,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--aspect-heatmap", type=float, default=None, help="Aspect for transformer violation heatmap")
     p.add_argument("--aspect-violin", type=float, default=None, help="Aspect for violin compare plot")
     p.add_argument("--aspect-frontier", type=float, default=None, help="Aspect for frontier hybrid scatter plot")
+    p.add_argument("--aspect-pvtemp", type=float, default=None, help="Aspect for PV & temperature uncertainty plot")
     # Frontier scatter visual knobs
     p.add_argument("--cloud-s-drcc", type=int, default=None, help="Marker size for DRCC cloud points in frontier plot")
     p.add_argument("--cloud-s-base", type=int, default=None, help="Marker size for baseline cloud points in frontier plot")
@@ -1039,7 +1818,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = p.parse_args(argv)
 
     selections = []
-    if args.all or not any([args.ts, args.overload, args.soc, args.trafo, args.violin, args.frontier]):
+    if args.all or not any([args.ts, args.overload, args.soc, args.trafo, args.violin, args.frontier, args.pvtemp, args.loads, args.bev, args.thermal]):
         selections.append("all")
     else:
         if args.ts: selections.append("ts")
@@ -1048,10 +1827,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.trafo: selections.append("trafo")
         if args.violin: selections.append("violin")
         if args.frontier: selections.append("frontier")
+        if args.pvtemp: selections.append("pvtemp")
+        if args.loads: selections.append("loads")
+        if args.bev: selections.append("bev")
+        if args.thermal: selections.append("thermal")
 
     ts_args = dict(
         input_csv=args.input,
-        output_path="thermal_storage_operation_area.pgf",
+        output_path=os.path.join(EXPORT_PGF_DIR, "thermal_storage_operation_area.pgf"),
         price_csv=args.price_csv,
         price_col=args.price_col,
         start_date=args.start_date,
@@ -1074,6 +1857,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "trafo": _pick(args.aspect_heatmap, DEFAULT_ASPECT_HEATMAP),
         "violin": _pick(args.aspect_violin, DEFAULT_ASPECT_VIOLIN),
         "frontier": _pick(args.aspect_frontier, DEFAULT_ASPECT_FRONTIER),
+        "pvtemp": _pick(args.aspect_pvtemp, DEFAULT_ASPECT_PVTEMP),
+        "loads": _pick(args.aspect, DEFAULT_ASPECT_LOADS),
+        "bev": _pick(args.aspect, DEFAULT_ASPECT_BEV),
+        "thermal": _pick(args.aspect, DEFAULT_ASPECT_THERMAL),
     }
 
     _export_selected(

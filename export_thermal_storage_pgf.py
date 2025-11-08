@@ -5,12 +5,18 @@ This script reads the optimization results CSV (default: fully_coordinated_model
 and recreates the thermal storage operation area plot, exporting it as a .pgf file
 with LaTeX/PGF settings matching sans-serif font preferences.
 
+All PGF output now defaults into the subfolder "export pgf" to keep the project root clean.
+The folder will be created automatically if it does not exist.
+
+Additionally, a PNG is exported by default to the same folder (with .png suffix) for quick debugging.
+You can tighten the figure's surrounding whitespace at export time using bbox_inches='tight' with a configurable pad.
+
 Usage (PowerShell):
     python .\export_thermal_storage_pgf.py
 
 Optional arguments:
     --input <path>         Path to results CSV (default: fully_coordinated_model_results.csv)
-    --output <path>        Output PGF path (default: thermal_storage_operation_area.pgf)
+    --output <path>        Output PGF path (default: export pgf/thermal_storage_operation_area.pgf)
     --texsystem <name>     LaTeX engine (pdflatex|xelatex|lualatex). Default: pdflatex
     --width-cm <num>       Figure width in cm (default: 10.89)
     --aspect <num>         Height as ratio of width (default: 0.5)
@@ -18,6 +24,11 @@ Optional arguments:
     --start-date <str>     Start datetime for alignment (YYYY-MM-DD HH:MM:SS). Default: 2023-01-10 00:00:00
     --duration-hours <int> Duration in hours for alignment window. Default: 24
     --no-market-price      Disable loading market_prices_15min.csv; fall back to CSV columns/--price-csv
+    --no-png               Disable saving a PNG alongside the PGF (default saves PNG)
+    --png-output <path>    Optional PNG output path (default: PGF path with .png extension)
+    --png-dpi <int>        PNG DPI (default: 300)
+    --tight-export         Use bbox_inches='tight' when saving (reduces external margins)
+    --pad-inches <float>   Padding (in inches) used with --tight-export (default: 0.02)
 """
 
 from __future__ import annotations
@@ -25,6 +36,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -207,7 +219,7 @@ def _load_aligned_market_price(time_index: pd.DatetimeIndex) -> Optional[np.ndar
 
 def export_thermal_storage_pgf(
     input_csv: str = "fully_coordinated_model_results.csv",
-    output_path: str = "thermal_storage_operation_area.pgf",
+    output_path: str = os.path.join("export pgf", "thermal_storage_operation_area.pgf"),
     texsystem: str = "pdflatex",
     use_sfmath: bool = False,
     width_cm: float = 10.89,
@@ -218,6 +230,11 @@ def export_thermal_storage_pgf(
     start_date: str = "2023-01-10 00:00:00",
     duration_hours: int = 24,
     disable_market_price: bool = False,
+    save_png: bool = True,
+    png_output: Optional[str] = None,
+    png_dpi: int = 300,
+    tight_export: bool = False,
+    pad_inches: float = 0.02,
 ) -> str:
     if not os.path.exists(input_csv):
         raise FileNotFoundError(f"Results CSV not found: {input_csv}")
@@ -230,7 +247,8 @@ def export_thermal_storage_pgf(
         )
 
     ts_series = df["q_storage_kw"].to_numpy()
-    x_ts = np.arange(len(ts_series))
+    # Use 1-based indexing for presentation so the final step (e.g., 96) is shown explicitly
+    x_ts = np.arange(1, len(ts_series) + 1)
 
     # Prefer market price aligned to the canonical DHN time_index, like the model
     price_series: Optional[np.ndarray] = None
@@ -269,6 +287,11 @@ def export_thermal_storage_pgf(
     width_in = _cm_to_inch(width_cm)
     height_in = width_in * aspect
 
+    # Ensure parent directory exists for output
+    out_dir = Path(output_path).parent
+    if str(out_dir) not in ("", "."):
+        out_dir.mkdir(parents=True, exist_ok=True)
+
     # Apply PGF configuration only within this context so it doesn't affect others
     with mpl.rc_context():
         _configure_pgf(enable=True, texsystem=texsystem, use_sfmath=use_sfmath)
@@ -278,7 +301,8 @@ def export_thermal_storage_pgf(
         ax.set_facecolor("white")
         # Leave room on the right for secondary y-axis label
         try:
-            fig.subplots_adjust(right=0.88)
+            # Leave room on the right for secondary y-axis label and at the bottom for x-label
+            fig.subplots_adjust(right=0.88, bottom=0.22)
         except Exception:
             pass
 
@@ -334,8 +358,27 @@ def export_thermal_storage_pgf(
 
         # No legend
 
-        ax.set_xlabel("time step")
+        # Force desired x ticks at 24-step intervals (e.g., 24, 48, 72, 96)
+        try:
+            import numpy as _np
+            from matplotlib.ticker import FixedLocator
+            # Include 0 on the x-axis and then multiples of 24 up to the final step
+            ticks_24 = _np.arange(0, len(x_ts) + 1, 24)
+            if ticks_24.size > 0:
+                ax.xaxis.set_major_locator(FixedLocator(ticks_24))
+        except Exception:
+            pass
+
+        ax.set_xlabel("Time Step", labelpad=6)
         ax.set_ylabel("Power (kW)")
+
+        # Ensure the full integer range is shown (e.g., 1..96) and no margins hide the last tick
+        try:
+            # Extend left limit to 0 so the 0 tick is visible while keeping last step visible
+            ax.set_xlim(0, x_ts[-1])
+            ax.margins(x=0)
+        except Exception:
+            pass
 
         # Frame spines
         for spine in ax.spines.values():
@@ -354,7 +397,21 @@ def export_thermal_storage_pgf(
         ax.grid(True, axis="y", color="lightgray", alpha=0.6, linewidth=0.6)
 
         # Save without extra tightening to avoid clipping twin axis labels
-        fig.savefig(output_path)
+        # Save PGF with optional tight bbox
+        if tight_export:
+            fig.savefig(output_path, bbox_inches="tight", pad_inches=pad_inches)
+        else:
+            fig.savefig(output_path)
+        # Optionally also export PNG for debugging
+        if save_png:
+            png_path = png_output if png_output else os.path.splitext(output_path)[0] + ".png"
+            try:
+                if tight_export:
+                    fig.savefig(png_path, dpi=png_dpi, format="png", bbox_inches="tight", pad_inches=pad_inches)
+                else:
+                    fig.savefig(png_path, dpi=png_dpi, format="png")
+            except Exception as _e:
+                print(f"Warning: failed to save PNG '{png_path}': {_e}")
         if show:
             plt.show()
         else:
@@ -366,7 +423,7 @@ def export_thermal_storage_pgf(
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Export thermal storage operation area plot to PGF.")
     p.add_argument("--input", default="fully_coordinated_model_results.csv", help="Path to results CSV")
-    p.add_argument("--output", default="thermal_storage_operation_area.pgf", help="Output PGF file path")
+    p.add_argument("--output", default=os.path.join("export pgf", "thermal_storage_operation_area.pgf"), help="Output PGF file path (will auto-create folder if needed)")
     p.add_argument(
         "--texsystem",
         default="pdflatex",
@@ -382,6 +439,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--start-date", default="2023-01-10 00:00:00", help="Start datetime for alignment (YYYY-MM-DD HH:MM:SS)")
     p.add_argument("--duration-hours", type=int, default=24, help="Duration (hours) for alignment window")
     p.add_argument("--no-market-price", action="store_true", dest="no_market_price", help="Disable loading market_prices_15min.csv; use CSV columns/--price-csv only")
+    p.add_argument("--no-png", action="store_true", dest="no_png", help="Disable saving PNG alongside PGF")
+    p.add_argument("--png-output", default=None, help="Explicit PNG output path (default: PGF path with .png)")
+    p.add_argument("--png-dpi", type=int, default=300, help="PNG DPI (default 300)")
+    p.add_argument("--tight-export", action="store_true", dest="tight_export", help="Use bbox_inches='tight' to reduce margins")
+    p.add_argument("--pad-inches", type=float, default=0.02, help="Padding in inches when using --tight-export")
 
     args = p.parse_args(argv)
 
@@ -399,6 +461,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             start_date=args.start_date,
             duration_hours=args.duration_hours,
             disable_market_price=args.no_market_price,
+            save_png=not args.no_png,
+            png_output=args.png_output,
+            png_dpi=args.png_dpi,
+            tight_export=args.tight_export,
+            pad_inches=args.pad_inches,
         )
         print(f"Saved PGF to: {out}")
         return 0

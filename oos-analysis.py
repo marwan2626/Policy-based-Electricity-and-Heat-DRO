@@ -26,6 +26,14 @@ import math
 # === User config ===
 # Distribution toggle: 'gaussian' (default) -> v3_oos; 'uniform' -> v3_oos_uniform; 'contaminated' -> v3_oos_contaminated; 'studentt' -> v3_oos_studentt
 DISTRIBUTION: str = os.getenv('V3_SAMPLE_DISTRIBUTION', 'studentt').strip().lower()
+
+# Editable in-file aggregation toggle (no console needed):
+#   Set ENABLE_AGGREGATE_GAUSSIAN_STUDENTT = True to automatically build a combined dataset
+#   from Gaussian and Student-t results, then run ALL analyses on the combined data.
+#   You can optionally set AGGREGATE_GAUSSIAN_STUDENTT_WEIGHTS = (w_gaussian, w_studentt) for the small
+#   “overview aggregation” figure (full analyses always use concatenated samples for fairness).
+ENABLE_AGGREGATE_GAUSSIAN_STUDENTT: bool = True  # <- set to False to disable combined run
+AGGREGATE_GAUSSIAN_STUDENTT_WEIGHTS: Tuple[float, float] = (0.5, 0.5)  # editable; only affects overview weighted bars
 import sys as _sys
 # New: optional aggregation of two distributions, e.g. --aggregate-dists gaussian,studentt --agg-weights 0.5,0.5
 AGGREGATE_DISTS: List[str] | None = None
@@ -42,6 +50,18 @@ for _flag in ('--dist', '--distribution'):
                 raise ValueError()
         except Exception:
             raise SystemExit("Provide --dist/--distribution followed by 'gaussian', 'uniform', 'contaminated', or 'studentt'.")
+# Convenience short-hand flags for common dual aggregation (Gaussian + Student-t)
+if '--aggregate-gs' in _argv or '--aggregate-gaussian-studentt' in _argv:
+    AGGREGATE_DISTS = ['gaussian','studentt']
+    # Optional: allow a single weight ratio like --gs-ratio 0.6 meaning 0.6 gaussian / 0.4 studentt
+    if '--gs-ratio' in _argv:
+        try:
+            _rval = float(_argv[_argv.index('--gs-ratio') + 1])
+            if _rval <= 0:
+                raise ValueError()
+            AGGREGATE_WEIGHTS = (_rval, 1.0 - _rval if _rval < 1.0 else 0.0)
+        except Exception:
+            raise SystemExit("--gs-ratio expects a positive float (<=1 recommended), e.g. 0.6 for 60% Gaussian / 40% Student-t.")
 # Parse aggregation flags
 if '--aggregate-dists' in _argv:
     try:
@@ -52,6 +72,17 @@ if '--aggregate-dists' in _argv:
         AGGREGATE_DISTS = parts
     except Exception:
         raise SystemExit("--aggregate-dists expects exactly two comma-separated values from {gaussian,uniform,contaminated,studentt}.")
+    
+# Apply in-file aggregation toggle if no CLI aggregation provided
+if AGGREGATE_DISTS is None and ENABLE_AGGREGATE_GAUSSIAN_STUDENTT:
+    AGGREGATE_DISTS = ['gaussian', 'studentt']
+    try:
+        g, s = AGGREGATE_GAUSSIAN_STUDENTT_WEIGHTS
+        total = float(g) + float(s)
+        if total > 0:
+            AGGREGATE_WEIGHTS = (float(g)/total, float(s)/total)
+    except Exception:
+        AGGREGATE_WEIGHTS = (0.5, 0.5)
 if '--agg-weights' in _argv:
     try:
         _raww = _argv[_argv.index('--agg-weights') + 1]
