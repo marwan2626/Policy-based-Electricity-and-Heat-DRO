@@ -36,7 +36,7 @@ import pandas as pd
 # ===========================
 # Epsilon used in the v2 filename suffix: dso_model_v2_results_drcc_true_epsilon_{EPSILON_TOKEN}.csv
 # The token uses two decimals with underscore as decimal separator, e.g., 0.05 -> "0_05"
-EPSILON: float = 0.20
+EPSILON: float = 0.10
 # When running the deterministic (no DRCC tightening) case, set RUN_DRCC_FALSE = True.
 # In that mode we ignore EPSILON for locating the v2 results CSV and instead look for
 # files named like: dso_model_v2_results_drcc_false*.csv
@@ -54,7 +54,7 @@ SAMPLES_DIR: str = "samples"
 SAMPLE_DISTRIBUTION: str = "gaussian"
 
 # Limit number of trajectories (sample_id) for a quick run. None means evaluate all.
-MAX_TRAJ: Optional[int] = None
+MAX_TRAJ: Optional[int] = 100
 
 # Toggle to ignore stochastic HP residuals in OOS (Option A). When True, only temperature-driven HP deviations remain.
 IGNORE_HP_RESIDUAL: bool = False
@@ -68,6 +68,12 @@ OUTDIR: str = "v3_oos"
 # Threshold (in percent) above which a line or transformer loading counts as a violation step
 LOADING_VIOLATION_THRESHOLD_PCT: float = 80.0
 
+# Enforce RT transformer targeting (Option A: BESS-only correction)
+ENFORCE_RT_TRAFO_TARGET: bool = True
+TRAFO_TARGET_INDEX: int = 0              # which transformer (index in net.trafo order / trafo_data)
+TRAFO_TARGET_THRESHOLD_PCT: float = 80.0 # target max loading in %
+TRAFO_TARGET_MARGIN_PCT: float = 0.0     # additional margin below threshold (set >0 for conservatism)
+
 # Voltage evaluation configuration (reintroduced for full flow metrics in OOS)
 VOLTAGE_EVAL_ENABLED: bool = True          # Set False to skip voltage reconstruction
 VOLTAGE_SLACK_PU: float = 1.0              # Slack/reference bus voltage
@@ -78,7 +84,7 @@ VOLTAGE_TIGHT_MAX_PU: float | None = None
 COUNT_VIOLATION_ON_ANY_BUS: bool = True    # If True, a timestep counts as 1 violation if any bus is out-of-band
 
 # Phase 1: Use mean-centered residual for policy activation (instead of schedule-referenced residual)
-USE_MEAN_CENTERED_POLICY: bool = True  # set False to use schedule-based residual directly
+USE_MEAN_CENTERED_POLICY: bool = False  # set False to use schedule-based residual directly (aligns with v2 policy)
 VALIDATE_BASELINE_ONLY: bool = False  # Stage 2b: if True (or CLI flag) run only deterministic baseline accumulation and exit
 
 # Stage 3: Use Option A radial accumulation instead of admittance-based proxy for transformer loading in stochastic loop
@@ -91,7 +97,7 @@ TRAFO_LOADING_BUFFER_SAMPLES: int = 50  # flush every N samples
 TRAFO_LOADING_DIR_NAME: str = "v3_loading"  # subdirectory inside OUTDIR
 TRAFO_LOADING_FILENAME_PREFIX: str = "trafo_loading_raw_epsilon_"  # suffix token + .parquet
 TRAFO_LOADING_FLOAT_DTYPE = "float32"
-TRAFO_LOADING_WRITE_PARQUET: bool = True  # requires pyarrow
+TRAFO_LOADING_WRITE_PARQUET: bool = False  # use CSV by default to avoid pyarrow dependency
 
 # Full per-trajectory series export (heavy). When enabled, writes one CSV per trajectory with
 # bus voltages, line & transformer loading/flows, component powers (HP, flex, base load, PV, BESS),
@@ -608,34 +614,64 @@ def build_electrical_time_series(time_index: pd.DatetimeIndex) -> Dict[str, np.n
     return series_map
 
 
-def apply_recourse_for_step(residual: float, v2_row: pd.Series, pv_sched_mw: float) -> Tuple[float, float]:
-    """Policy commands (open-loop) given the current residual before local actions.
+def apply_recourse_for_step(pv_dev_pol: float, hp_dev_pol: float, residual: float, v2_row: pd.Series, pv_sched_mw: float) -> Tuple[float, float]:
+    """Compute open-loop recourse commands from v2 policy for this timestep.
 
-    residual > 0  => deficit (need supply / discharge)
-    residual < 0  => surplus (need absorption / curtail / charge)
+    Inputs:
+      - pv_dev_pol: PV deviation used by the controller (mean-centered if configured)
+      - hp_dev_pol: HP deviation used by the controller (mean-centered if configured)
+      - residual: aggregate residual (used only for lambda/chi path)
+      - v2_row: row of v2 CSV containing policy coefficients
+      - pv_sched_mw: scheduled PV MW (cap for curtailment)
 
-    Returns (p_bess_cmd_mw, extra_curt_cmd_mw)
+    Returns (p_bess_cmd_mw, extra_curt_cmd_mw) before saturation/energy checks.
 
-    Notes:
-    - We no longer generate u_plus / u_minus here; PCC imbalance is the *post-action* residual.
-    - Extra curtail only acts when residual < 0 (surplus) and is capped by scheduled PV injection (pv_sched_mw).
-    - rho coefficients are not applied in OOS; imbalance settlement is the terminal residual.
+    Behavior:
+      - If K gains are present (any non-NaN), use affine K policy:
+            p_bess_cmd = K_pv_bess*pv_dev_pol + K_hp_bess*hp_dev_pol
+            extra_curt = max(0, K_pv_pvcurt*pv_dev_pol + K_hp_pvcurt*hp_dev_pol)
+        extra_curt is capped by pv_sched_mw.
+      - Else fallback to lambda/chi proxy policy on two-sided residual.
     """
+    # Prefer K-based controller when available
+    k_pv_bess = v2_row.get('K_pv_bess', np.nan)
+    k_hp_bess = v2_row.get('K_hp_bess', np.nan)
+    k_pv_curt = v2_row.get('K_pv_pvcurt', np.nan)
+    k_hp_curt = v2_row.get('K_hp_pvcurt', np.nan)
+    try:
+        k_any = (
+            (pd.notna(k_pv_bess) and np.isfinite(float(k_pv_bess))) or
+            (pd.notna(k_hp_bess) and np.isfinite(float(k_hp_bess))) or
+            (pd.notna(k_pv_curt) and np.isfinite(float(k_pv_curt))) or
+            (pd.notna(k_hp_curt) and np.isfinite(float(k_hp_curt)))
+        )
+    except Exception:
+        k_any = False
+
+    if k_any:
+        try:
+            p_bess_cmd = float(k_pv_bess) * float(pv_dev_pol) + float(k_hp_bess) * float(hp_dev_pol)
+        except Exception:
+            p_bess_cmd = 0.0
+        try:
+            extra_curt_raw = float(k_pv_curt) * float(pv_dev_pol) + float(k_hp_curt) * float(hp_dev_pol)
+        except Exception:
+            extra_curt_raw = 0.0
+        # Curtailment cannot be negative and cannot exceed scheduled PV
+        extra_curt = max(0.0, min(float(extra_curt_raw), float(max(0.0, pv_sched_mw))))
+        return p_bess_cmd, extra_curt
+
+    # Fallback: lambda/chi proxy on two-sided residual
     d_plus = max(0.0, float(residual))
     d_minus = max(0.0, -float(residual))
-
     lam0 = float(v2_row.get('lambda0_mw', 0.0))
     lam_p = float(v2_row.get('lambda_plus', 0.0))
     lam_m = float(v2_row.get('lambda_minus', 0.0))
     chi0 = float(v2_row.get('chi0_mw', 0.0))
     chi_m = float(v2_row.get('chi_minus', 0.0))
-
-    # Unclipped BESS command (+ discharge, - charge)
     p_bess_cmd = lam0 + lam_p * d_plus - lam_m * d_minus
-
     extra_curt = 0.0
     if d_minus > 0.0 and pv_sched_mw > 0.0:
-        # Curtail scheduled PV (cannot exceed scheduled injection)
         extra_curt = max(0.0, min(chi0 + chi_m * d_minus, pv_sched_mw))
     return p_bess_cmd, extra_curt
 
@@ -1453,7 +1489,8 @@ def main() -> None:
             else:
                 k_mu_bess = - lam_m * max(0.0, -mu_shift)
                 k_mu_curt = chi_m * max(0.0, -mu_shift)
-            print(f"[resid-diag] mu_shift={mu_shift:.6f} -> approx ΔBESS={k_mu_bess:.6f} MW, ΔCurtail={k_mu_curt:.6f} MW (heuristic)")
+            # Use ASCII-only to avoid Windows console encoding issues
+            print(f"[resid-diag] mu_shift={mu_shift:.6f} -> approx dBESS={k_mu_bess:.6f} MW, dCurtail={k_mu_curt:.6f} MW (heuristic)")
 
         # Accumulators for metrics and voltages (per trajectory, inside sample loop)
         net_import_rt = np.zeros(len(index))
@@ -1477,47 +1514,58 @@ def main() -> None:
         bess_soc_clip_steps = 0; u_plus_energy = 0.0; u_minus_energy = 0.0
         # Track SoC fraction series for this trajectory
         soc_series = np.zeros(len(index), dtype=float)
+    # --- New BESS clipping diagnostics accumulators (per trajectory) ---
+    horizon = len(index)
+    bess_clip_power_steps = 0          # times command exceeded instantaneous power band before energy limits
+    bess_clip_energy_steps = 0         # times energy (SoC) limits further tightened feasible band
+    bess_clip_both_steps = 0           # times both power and energy constraints were active clipping sources
+    bess_clip_total_energy_mwh = 0.0   # integral of absolute MW clipping * dt_hours (lost recourse volume)
+    bess_clip_sum_abs_mw = 0.0         # sum of |p_cmd - p_real| across steps
+    bess_clip_max_abs_mw = 0.0         # max |p_cmd - p_real|
+    bess_headroom_charge_sum_mw = 0.0  # available further charging headroom (negative direction) at original command
+    bess_headroom_discharge_sum_mw = 0.0  # available further discharging headroom (positive direction)
+    bess_headroom_steps = 0            # count steps considered for headroom averaging
 
-        # Collect policy residual stats if enabled
-        residual_policy_vals = [] if USE_MEAN_CENTERED_POLICY else None
+    # Collect policy residual stats if enabled
+    residual_policy_vals = [] if USE_MEAN_CENTERED_POLICY else None
 
-        # Precompute per-line (parent,child)->(r_pu,x_pu) for voltage drop (once per trajectory)
-        # We treat transformers separately using their series impedance (derived earlier) approximated to (r_pu,x_pu)
-        line_rx_map: dict[tuple[int,int], tuple[float,float]] = {}
-        Sbase_sys = float(net.sn_mva)
-        for line in net.line.itertuples():
-            fb = int(line.from_bus); tb = int(line.to_bus)
-            Vbase_kV = float(net.bus.at[fb, 'vn_kv'])
-            Z_base = (Vbase_kV ** 2) / Sbase_sys
-            r_pu = float(line.r_ohm_per_km) * float(line.length_km) / Z_base
-            x_pu = float(line.x_ohm_per_km) * float(line.length_km) / Z_base
-            line_rx_map[(fb, tb)] = (r_pu, x_pu)
-        # Transformers: derive (r,x) from vk% and vkr% on system base
-        for tr in net.trafo.itertuples():
-            hv = int(tr.hv_bus); lv = int(tr.lv_bus)
-            vk_pu = float(tr.vk_percent) / 100.0 if hasattr(tr, 'vk_percent') else 0.05
-            r_pu = float(tr.vkr_percent) / 100.0 if hasattr(tr, 'vkr_percent') else 0.01
-            x_sq = max(vk_pu**2 - r_pu**2, 1e-8)
-            x_pu = float(np.sqrt(x_sq))
-            # Scale by (Sbase / sn_mva) to put on system base
-            sn_tr = float(tr.sn_mva) if hasattr(tr, 'sn_mva') else Sbase_sys
-            scale = Sbase_sys / max(sn_tr, 1e-6)
-            line_rx_map[(hv, lv)] = (r_pu * scale, x_pu * scale)
+    # Precompute per-line (parent,child)->(r_pu,x_pu) for voltage drop (once per trajectory)
+    # We treat transformers separately using their series impedance (derived earlier) approximated to (r_pu,x_pu)
+    line_rx_map: dict[tuple[int,int], tuple[float,float]] = {}
+    Sbase_sys = float(net.sn_mva)
+    for line in net.line.itertuples():
+        fb = int(line.from_bus); tb = int(line.to_bus)
+        Vbase_kV = float(net.bus.at[fb, 'vn_kv'])
+        Z_base = (Vbase_kV ** 2) / Sbase_sys
+        r_pu = float(line.r_ohm_per_km) * float(line.length_km) / Z_base
+        x_pu = float(line.x_ohm_per_km) * float(line.length_km) / Z_base
+        line_rx_map[(fb, tb)] = (r_pu, x_pu)
+    # Transformers: derive (r,x) from vk% and vkr% on system base
+    for tr in net.trafo.itertuples():
+        hv = int(tr.hv_bus); lv = int(tr.lv_bus)
+        vk_pu = float(tr.vk_percent) / 100.0 if hasattr(tr, 'vk_percent') else 0.05
+        r_pu = float(tr.vkr_percent) / 100.0 if hasattr(tr, 'vkr_percent') else 0.01
+        x_sq = max(vk_pu**2 - r_pu**2, 1e-8)
+        x_pu = float(np.sqrt(x_sq))
+        # Scale by (Sbase / sn_mva) to put on system base
+        sn_tr = float(tr.sn_mva) if hasattr(tr, 'sn_mva') else Sbase_sys
+        scale = Sbase_sys / max(sn_tr, 1e-6)
+        line_rx_map[(hv, lv)] = (r_pu * scale, x_pu * scale)
 
-        # Build outward traversal order from slack for voltage propagation
-        from collections import deque
-        bfs_order: List[int] = []
-        q = deque([slack_bus_index])
-        seen = {slack_bus_index}
-        while q:
-            b = q.popleft()
-            bfs_order.append(b)
-            for ch in downstream_map.get(b, []):
-                if ch not in seen:
-                    seen.add(ch)
-                    q.append(ch)
+    # Build outward traversal order from slack for voltage propagation
+    from collections import deque
+    bfs_order: List[int] = []
+    q = deque([slack_bus_index])
+    seen = {slack_bus_index}
+    while q:
+        b = q.popleft()
+        bfs_order.append(b)
+        for ch in downstream_map.get(b, []):
+            if ch not in seen:
+                seen.add(ch)
+                q.append(ch)
 
-        for t, ts in enumerate(index):
+    for t, ts in enumerate(index):
             row = df.iloc[t]
             pv_sched_t = float(base_pv_da_total[t])
             # Residual used for BOTH policy activation and settlement/constraint evolution:
@@ -1532,8 +1580,18 @@ def main() -> None:
             else:
                 resid_policy_t = resid_t
 
-            # Policy open-loop commands from affine recourse (based on chosen residual)
-            p_bess_cmd, extra_curt_cmd = apply_recourse_for_step(resid_policy_t, row, pv_sched_t)
+            # Build disturbance vector for controller:
+            # If mean-centered policy is enabled: use (pv_mean_total - pv_rt) and (-hp_resid_total)
+            # Else: use schedule-referenced deviations (pv_DA - pv_rt) and (hp_temp_dev + hp_resid)
+            if USE_MEAN_CENTERED_POLICY:
+                pv_dev_pol = float(pv_mean_total[t] - pv_total_rt[t])
+                hp_dev_pol = float(-hp_resid_total[t])
+            else:
+                pv_dev_pol = float(base_pv_da_total[t] - pv_total_rt[t])
+                hp_dev_pol = float(hp_temp_dev_total[t] + hp_resid_total[t])
+
+            # Policy open-loop commands from affine recourse (prefer K-gains when available)
+            p_bess_cmd, extra_curt_cmd = apply_recourse_for_step(pv_dev_pol, hp_dev_pol, resid_policy_t, row, pv_sched_t)
 
             if recourse_energy_delta_mwh is not None and baseline_bess_energy_total_series is not None:
                 # Anchor mode: baseline energy known exactly; only integrate recourse adjustment
@@ -1542,11 +1600,14 @@ def main() -> None:
                 E_available = max(0.0, min(total_bess_capacity_mwh, E_available)) if total_bess_capacity_mwh > 0 else E_available
 
                 # Project affine command onto feasible band given current adjusted energy
-                p_cmd = float(p_bess_cmd)
+                p_cmd_original = float(p_bess_cmd)
+                p_cmd = p_cmd_original
+                # Initial instantaneous power clipping (name: power band)
                 if bess_pmax_total > 0:
-                    p_cmd = max(-bess_pmax_total, min(bess_pmax_total, p_cmd))
+                    p_after_power = max(-bess_pmax_total, min(bess_pmax_total, p_cmd))
                 else:
-                    p_cmd = 0.0
+                    p_after_power = 0.0
+                p_cmd = p_after_power
                 if dt_hours > 0 and bess_eff > 0 and total_bess_capacity_mwh > 0:
                     p_max_energy = (E_available * bess_eff) / dt_hours
                     charge_headroom = max(0.0, total_bess_capacity_mwh - E_available)
@@ -1558,6 +1619,32 @@ def main() -> None:
                     p_real = min(max(p_cmd, p_min_total), p_max_total)
                 else:
                     p_real = p_cmd if bess_pmax_total > 0 else 0.0
+                # --- Clipping diagnostics (anchor branch) ---
+                clip_power = abs(p_cmd_original - p_after_power) > 1e-9
+                # energy clip occurs if further shrunk by energy bounds OR cumulative deviation forced into feasible energy after update
+                clip_energy = abs(p_after_power - p_real) > 1e-9
+                if clip_power:
+                    bess_clip_power_steps += 1
+                if clip_energy:
+                    bess_clip_energy_steps += 1
+                if clip_power and clip_energy:
+                    bess_clip_both_steps += 1
+                clip_abs = abs(p_cmd_original - p_real)
+                if clip_abs > 1e-9:
+                    bess_clip_sum_abs_mw += clip_abs
+                    if dt_hours > 0:
+                        bess_clip_total_energy_mwh += clip_abs * dt_hours
+                    if clip_abs > bess_clip_max_abs_mw:
+                        bess_clip_max_abs_mw = clip_abs
+                # Headroom metrics based on original command vs feasible energy-constrained band
+                if 'p_min_total' in locals() and 'p_max_total' in locals():
+                    # Charge headroom (how much more negative we could have gone)
+                    if p_cmd_original > p_min_total:
+                        bess_headroom_charge_sum_mw += (p_cmd_original - p_min_total)
+                    # Discharge headroom (how much more positive we could have gone)
+                    if p_cmd_original < p_max_total:
+                        bess_headroom_discharge_sum_mw += (p_max_total - p_cmd_original)
+                    bess_headroom_steps += 1
                 # Update cumulative recourse energy delta (baseline untouched)
                 if dt_hours > 0 and bess_eff > 0 and total_bess_capacity_mwh > 0:
                     recourse_energy_delta_mwh = recourse_energy_delta_mwh + max(0.0, -p_real) * bess_eff * dt_hours - max(0.0, p_real) / bess_eff * dt_hours
@@ -1574,7 +1661,8 @@ def main() -> None:
                 soc_series[t] = ((E_base_t + recourse_energy_delta_mwh) / total_bess_capacity_mwh) if total_bess_capacity_mwh > 0 else 0.0
                 bess_delta = p_real
                 resid_t -= bess_delta
-                if abs(p_real - p_bess_cmd) > 1e-9:
+                if abs(p_real - p_bess_cmd) > 1e-9 and not (clip_power or clip_energy):
+                    # Legacy counting path; avoid double counting when already categorized above
                     bess_soc_clip_steps += 1
             else:
                 # Legacy fallback branch (no baseline energy path available): integrate full schedule + recourse as before
@@ -1589,11 +1677,13 @@ def main() -> None:
                     E_mwh_legacy = E_mwh_legacy + max(0.0, -p_base_bess_total) * bess_eff * dt_hours - max(0.0, p_base_bess_total) / bess_eff * dt_hours
                     E_mwh_legacy = max(0.0, min(total_bess_capacity_mwh, E_mwh_legacy))
                 # Recourse projection
-                p_cmd = float(p_bess_cmd)
+                p_cmd_original = float(p_bess_cmd)
+                p_cmd = p_cmd_original
                 if bess_pmax_total > 0:
-                    p_cmd = max(-bess_pmax_total, min(bess_pmax_total, p_cmd))
+                    p_after_power = max(-bess_pmax_total, min(bess_pmax_total, p_cmd))
                 else:
-                    p_cmd = 0.0
+                    p_after_power = 0.0
+                p_cmd = p_after_power
                 if dt_hours > 0 and bess_eff > 0 and total_bess_capacity_mwh > 0:
                     p_max_energy = (E_mwh_legacy * bess_eff) / dt_hours
                     charge_headroom = max(0.0, total_bess_capacity_mwh - E_mwh_legacy)
@@ -1607,10 +1697,32 @@ def main() -> None:
                     E_mwh_legacy = max(0.0, min(total_bess_capacity_mwh, E_mwh_legacy))
                 else:
                     p_real = p_cmd if bess_pmax_total > 0 else 0.0
+                # --- Clipping diagnostics (legacy branch) ---
+                clip_power = abs(p_cmd_original - p_after_power) > 1e-9
+                clip_energy = abs(p_after_power - p_real) > 1e-9
+                if clip_power:
+                    bess_clip_power_steps += 1
+                if clip_energy:
+                    bess_clip_energy_steps += 1
+                if clip_power and clip_energy:
+                    bess_clip_both_steps += 1
+                clip_abs = abs(p_cmd_original - p_real)
+                if clip_abs > 1e-9:
+                    bess_clip_sum_abs_mw += clip_abs
+                    if dt_hours > 0:
+                        bess_clip_total_energy_mwh += clip_abs * dt_hours
+                    if clip_abs > bess_clip_max_abs_mw:
+                        bess_clip_max_abs_mw = clip_abs
+                if 'p_min_total' in locals() and 'p_max_total' in locals():
+                    if p_cmd_original > p_min_total:
+                        bess_headroom_charge_sum_mw += (p_cmd_original - p_min_total)
+                    if p_cmd_original < p_max_total:
+                        bess_headroom_discharge_sum_mw += (p_max_total - p_cmd_original)
+                    bess_headroom_steps += 1
                 soc_series[t] = (E_mwh_legacy / total_bess_capacity_mwh) if total_bess_capacity_mwh > 0 else 0.0
                 bess_delta = p_real
                 resid_t -= bess_delta
-                if abs(p_real - p_bess_cmd) > 1e-9:
+                if abs(p_real - p_bess_cmd) > 1e-9 and not (clip_power or clip_energy):
                     bess_soc_clip_steps += 1
 
             # --- PV curtailment after battery action (only for remaining surplus) ---
@@ -1619,6 +1731,139 @@ def main() -> None:
                 pv_avail_t = float(pv_total_rt[t])  # real-time available PV (aggregate)
                 extra_curt_used = min(extra_curt_cmd, pv_avail_t)
                 resid_t += extra_curt_used  # curtail reduces injection (moves residual toward zero)
+
+            # --- Optional: RT transformer targeting via BESS-only correction (Option A) ---
+            if ENFORCE_RT_TRAFO_TARGET and trafo_data:
+                try:
+                    # Build a quick preview of injections with current decisions (baseline + recourse) to assess loading
+                    P_inj_prev = {b: 0.0 for b in net.bus.index}
+                    Q_inj_prev = {b: 0.0 for b in net.bus.index}
+                    # Baseline BESS schedule
+                    if REPLAY_V2_BESS_SCHEDULE and baseline_bess_p_by_bus:
+                        for b, series in baseline_bess_p_by_bus.items():
+                            if t < len(series):
+                                p_base_bess = float(series[t])
+                                if abs(p_base_bess) > 0.0:
+                                    P_inj_prev[b] += p_base_bess
+                    # Nonflex & flex loads
+                    if LOAD_LOAD_VALUES_FROM_V2:
+                        for b, series in nonflex_p_by_bus.items():
+                            p_mw = float(series[t]) if t < len(series) else 0.0
+                            q_mvar = float(nonflex_q_by_bus.get(b, np.zeros(0))[t]) if t < len(nonflex_q_by_bus.get(b, [])) else 0.0
+                            if abs(p_mw) > 0.0:
+                                P_inj_prev[b] -= p_mw
+                                Q_inj_prev[b] -= q_mvar
+                        for b, series in flex_p_by_bus.items():
+                            p_mw = float(series[t]) if t < len(series) else 0.0
+                            q_mvar = float(flex_q_by_bus.get(b, np.zeros(0))[t]) if t < len(flex_q_by_bus.get(b, [])) else 0.0
+                            if abs(p_mw) > 0.0:
+                                P_inj_prev[b] -= p_mw
+                                Q_inj_prev[b] -= q_mvar
+                    else:
+                        # Fallback uses constant PF estimate
+                        for load in net.load.itertuples():
+                            name = getattr(load, 'name', '')
+                            p_kw = float(elec_ts_map.get(name, np.zeros(len(index)))[t]) if name in elec_ts_map else 0.0
+                            p_mw = p_kw / 1000.0
+                            P_inj_prev[load.bus] -= p_mw
+                            Q_inj_prev[load.bus] -= p_mw * qfactor_household_const
+                        if flex_realized_by_bus:
+                            for b, series in flex_realized_by_bus.items():
+                                if t < len(series):
+                                    p_flex = float(series[t])
+                                    P_inj_prev[b] -= p_flex
+                                    Q_inj_prev[b] -= p_flex * qfactor_household_const
+                    # Heat pumps
+                    if base_hp_by_bus:
+                        total_dev_t = float(hp_temp_dev_total[t] + hp_resid_total[t])
+                        per_bus_dev = total_dev_t / max(1, len(base_hp_by_bus))
+                        for b in base_hp_by_bus.keys():
+                            p_da = float(base_hp_by_bus.get(b, np.zeros(len(index)))[t])
+                            adj_p = p_da + per_bus_dev
+                            P_inj_prev[b] -= adj_p
+                            Q_inj_prev[b] -= adj_p * qfactor_hp_const
+                    # PV realized after extra curtail used above
+                    if pv_bus_ids:
+                        total_cap = sum(pv_caps_by_bus.get(b, 0.0) for b in pv_bus_ids)
+                        pv_effective = max(0.0, pv_total_rt[t] - extra_curt_used)
+                        for b in pv_bus_ids:
+                            share = (pv_caps_by_bus.get(b, 0.0) / total_cap) if total_cap > 0 else 0.0
+                            P_inj_prev[b] += pv_effective * share
+                    # BESS: include current recourse delta (already decided)
+                    if bess_pmax_total > 0 and bess_caps_by_bus:
+                        for b, cap in bess_caps_by_bus.items():
+                            share = cap / bess_pmax_total if bess_pmax_total > 0 else 0.0
+                            P_inj_prev[b] += bess_delta * share
+                    # Accumulate flows
+                    P_vec_prev = np.array([P_inj_prev[b] for b in net.bus.index], dtype=float)
+                    Q_vec_prev = np.array([Q_inj_prev[b] for b in net.bus.index], dtype=float)
+                    P_acc_prev, Q_acc_prev = accumulate_flows(P_vec_prev, Q_vec_prev)
+                    # Target transformer (index bounds check)
+                    idx_tr = min(max(0, TRAFO_TARGET_INDEX), len(trafo_data) - 1)
+                    hv, lv, _y, sn_tr = trafo_data[idx_tr]
+                    if sn_tr > 0:
+                        P_lv = float(P_acc_prev[lv]); Q_lv = float(Q_acc_prev[lv])
+                        S_lv = float(np.sqrt(P_lv**2 + Q_lv**2))
+                        loading_pct = (S_lv / sn_tr) * 100.0 if sn_tr > 0 else 0.0
+                        target_pct = max(0.0, TRAFO_TARGET_THRESHOLD_PCT - TRAFO_TARGET_MARGIN_PCT)
+                        if loading_pct > target_pct and S_lv > 1e-9 and abs(P_lv) > 1e-9:
+                            # Linearized derivative dL/dP ≈ 100 * P_lv / (sn_tr * S_lv)
+                            dL_dP = 100.0 * P_lv / (sn_tr * S_lv)
+                            # Required ΔP to reach target: ΔP = -(L - target)/dL_dP
+                            deltaP_req = - (loading_pct - target_pct) / dL_dP
+                            # Map to BESS-only correction (same sign convention as BESS power)
+                            # Compute available additional BESS corridor (post-initial action)
+                            # Anchor branch
+                            if recourse_energy_delta_mwh is not None and baseline_bess_energy_total_series is not None:
+                                E_base_t = float(baseline_bess_energy_total_series[t]) if t < len(baseline_bess_energy_total_series) else 0.0
+                                E_available = E_base_t + recourse_energy_delta_mwh
+                                E_available = max(0.0, min(total_bess_capacity_mwh, E_available)) if total_bess_capacity_mwh > 0 else E_available
+                                if dt_hours > 0 and bess_eff > 0 and total_bess_capacity_mwh > 0:
+                                    p_max_energy = (E_available * bess_eff) / dt_hours
+                                    charge_headroom = max(0.0, total_bess_capacity_mwh - E_available)
+                                    p_min_energy = - (charge_headroom / (bess_eff * dt_hours))
+                                    p_min_total = max(-bess_pmax_total, p_min_energy)
+                                    p_max_total = min(bess_pmax_total, p_max_energy)
+                                else:
+                                    p_min_total, p_max_total = -bess_pmax_total, bess_pmax_total
+                            else:
+                                # Legacy energy tracking branch
+                                E_available = E_mwh_legacy
+                                if dt_hours > 0 and bess_eff > 0 and total_bess_capacity_mwh > 0:
+                                    p_max_energy = (E_available * bess_eff) / dt_hours
+                                    charge_headroom = max(0.0, total_bess_capacity_mwh - E_available)
+                                    p_min_energy = - (charge_headroom / (bess_eff * dt_hours))
+                                    p_min_total = max(-bess_pmax_total, p_min_energy)
+                                    p_max_total = min(bess_pmax_total, p_max_energy)
+                                else:
+                                    p_min_total, p_max_total = -bess_pmax_total, bess_pmax_total
+                            # Allowable additional correction around current p_real: [p_min_total - p_real, p_max_total - p_real]
+                            # p_real is the already applied BESS power this step
+                            corr_min = (p_min_total - p_real)
+                            corr_max = (p_max_total - p_real)
+                            p_corr = max(corr_min, min(corr_max, float(deltaP_req)))
+                            if abs(p_corr) > 1e-9:
+                                # Apply correction: update energy state and residual
+                                if recourse_energy_delta_mwh is not None and baseline_bess_energy_total_series is not None:
+                                    if dt_hours > 0 and bess_eff > 0:
+                                        recourse_energy_delta_mwh = recourse_energy_delta_mwh + max(0.0, -p_corr) * bess_eff * dt_hours - max(0.0, p_corr) / bess_eff * dt_hours
+                                        # Re-clip to feasible [0, cap]
+                                        E_post = E_base_t + recourse_energy_delta_mwh
+                                        E_post = max(0.0, min(total_bess_capacity_mwh, E_post))
+                                        recourse_energy_delta_mwh = E_post - E_base_t
+                                else:
+                                    if dt_hours > 0 and bess_eff > 0 and total_bess_capacity_mwh > 0:
+                                        E_mwh_legacy = E_mwh_legacy + max(0.0, -p_corr) * bess_eff * dt_hours - max(0.0, p_corr) / bess_eff * dt_hours
+                                        E_mwh_legacy = max(0.0, min(total_bess_capacity_mwh, E_mwh_legacy))
+                                bess_delta += p_corr
+                                p_real += p_corr
+                                resid_t -= p_corr
+                                # Throughput & cost for correction
+                                bess_rt_energy_throughput += float(abs(p_corr)) * dt_hours
+                                # Note: imbalance cost uses resid_t later; DA energy unaffected here
+                except Exception as _e:
+                    # Fail-safe: do nothing if targeting computation fails
+                    pass
 
             # Final PCC imbalance after local actions (signed residual -> two-sided imbalance)
             u_plus = max(0.0, resid_t)
@@ -1791,8 +2036,14 @@ def main() -> None:
                     'u_minus_mw': u_minus,
                     'residual_policy_mw': resid_policy_t,
                     'residual_post_actions_mw': resid_t,
+                    # BESS recourse diagnostics (command vs realized)
                     'bess_power_cmd_mw': p_bess_cmd,
                     'bess_power_real_mw': p_real,
+                    'bess_power_clip_reason_code': (3 if (clip_power and clip_energy) else (1 if clip_power else (2 if clip_energy else 0))),
+                    'bess_power_clip_abs_mw': abs(p_cmd_original - p_real),
+                    'bess_power_after_power_clip_mw': p_after_power,
+                    'bess_power_band_min_mw': p_min_total if 'p_min_total' in locals() else np.nan,
+                    'bess_power_band_max_mw': p_max_total if 'p_max_total' in locals() else np.nan,
                     'pv_extra_curtail_mw': extra_curt_used,
                     'soc_frac': soc_series[t]
                 }
@@ -1853,8 +2104,8 @@ def main() -> None:
                     step_record[f'bess_bus_{b}_p_mw'] = val
                 series_rows.append(step_record)
 
-        # Flush buffer periodically
-        if LOG_TRAFO_LOADING and trafo_loading_buffer and (i % TRAFO_LOADING_BUFFER_SAMPLES == 0 or i == total):
+    # Flush buffer periodically
+    if LOG_TRAFO_LOADING and trafo_loading_buffer and (i % TRAFO_LOADING_BUFFER_SAMPLES == 0 or i == total):
             try:
                 import pandas as _pd
                 buf_df = _pd.DataFrame(trafo_loading_buffer, columns=['sample_id', 't', 'trafo_index', 'loading_pct'])
@@ -1878,62 +2129,71 @@ def main() -> None:
             except Exception as e:
                 print(f"[WARN] Failed to write transformer loading buffer: {e}")
 
-        # Summarize metrics including voltage & thermal bounds
-        summ = _summarize_trajectory(index, price, net_import_rt, dt_hours, pv_total_rt, hp_resid_total, temp_sid['temperature_c'].to_numpy(dtype=float))
-        summ['v_min_pu'] = float(v_min) if np.isfinite(v_min) else np.nan
-        summ['v_max_pu'] = float(v_max) if np.isfinite(v_max) else np.nan
-        summ['max_line_loading_pct'] = max_line_loading
-        summ['max_trafo_loading_pct'] = max_trafo_loading
-        summ['max_trafo_loading_pct_optionA'] = max_trafo_loading_optionA
-        summ['steps_line_over_80pct'] = int(steps_line_over_thresh)
-        summ['steps_trafo_over_80pct'] = int(steps_trafo_over_thresh)
-        summ['loading_violation_threshold_pct'] = float(LOADING_VIOLATION_THRESHOLD_PCT)
-        summ['steps_voltage_violation'] = int(steps_voltage_violation)
-        summ['pv_curtail_mwh'] = pv_curtail_energy
-        summ['bess_rt_energy_throughput_mwh'] = bess_rt_energy_throughput
-        summ['imbalance_mwh'] = float(u_plus_energy + u_minus_energy)
-        summ['bess_soc_clip_steps'] = int(bess_soc_clip_steps)
-        if USE_MEAN_CENTERED_POLICY and residual_policy_vals:
-            rp_arr = np.array(residual_policy_vals, dtype=float)
-            summ['residual_policy_std'] = float(np.std(rp_arr))
-            summ['residual_policy_frac_negative'] = float(np.mean(rp_arr < 0))
-        else:
-            summ['residual_policy_std'] = np.nan
-            summ['residual_policy_frac_negative'] = np.nan
-        # Cost components (DA energy cost constant; store for clarity)
-        summ['da_energy_cost_eur'] = float(da_energy_cost_eur_const)
-        summ['rt_pv_curtail_cost_eur'] = float(pv_rt_curt_cost_eur)
-        summ['rt_imbalance_cost_eur'] = float(imbalance_cost_eur)
-        summ['rt_bess_cycle_cost_eur'] = float(bess_cycle_cost_eur)
-        summ['total_cost_eur'] = float(da_energy_cost_eur_const + pv_rt_curt_cost_eur + imbalance_cost_eur + bess_cycle_cost_eur)
-        summ['sample_id'] = sid
-        # Store trajectory length and append (inside loop; previously mis-indented causing only last trajectory retained)
-        summ['n_steps'] = int(len(index))
-        # Attach static flexible load metrics (same for all trajectories)
-        summ.update(flex_metrics_static)
-        per_traj_summary.append(summ)
-        collect_soc_frac.append(soc_series)
+    # Summarize metrics including voltage & thermal bounds
+    summ = _summarize_trajectory(index, price, net_import_rt, dt_hours, pv_total_rt, hp_resid_total, temp_sid['temperature_c'].to_numpy(dtype=float))
+    summ['v_min_pu'] = float(v_min) if np.isfinite(v_min) else np.nan
+    summ['v_max_pu'] = float(v_max) if np.isfinite(v_max) else np.nan
+    summ['max_line_loading_pct'] = max_line_loading
+    summ['max_trafo_loading_pct'] = max_trafo_loading
+    summ['max_trafo_loading_pct_optionA'] = max_trafo_loading_optionA
+    summ['steps_line_over_80pct'] = int(steps_line_over_thresh)
+    summ['steps_trafo_over_80pct'] = int(steps_trafo_over_thresh)
+    summ['loading_violation_threshold_pct'] = float(LOADING_VIOLATION_THRESHOLD_PCT)
+    summ['steps_voltage_violation'] = int(steps_voltage_violation)
+    summ['pv_curtail_mwh'] = pv_curtail_energy
+    summ['bess_rt_energy_throughput_mwh'] = bess_rt_energy_throughput
+    summ['imbalance_mwh'] = float(u_plus_energy + u_minus_energy)
+    summ['bess_soc_clip_steps'] = int(bess_soc_clip_steps)
+    # --- Aggregated BESS clipping diagnostics ---
+    summ['bess_clip_power_steps'] = int(bess_clip_power_steps)
+    summ['bess_clip_energy_steps'] = int(bess_clip_energy_steps)
+    summ['bess_clip_both_steps'] = int(bess_clip_both_steps)
+    summ['bess_clip_total_energy_mwh'] = float(bess_clip_total_energy_mwh)
+    summ['bess_clip_max_abs_mw'] = float(bess_clip_max_abs_mw)
+    summ['bess_clip_avg_abs_mw'] = float(bess_clip_sum_abs_mw / horizon) if horizon > 0 else 0.0
+    summ['bess_headroom_charge_avg_mw'] = float(bess_headroom_charge_sum_mw / bess_headroom_steps) if bess_headroom_steps > 0 else np.nan
+    summ['bess_headroom_discharge_avg_mw'] = float(bess_headroom_discharge_sum_mw / bess_headroom_steps) if bess_headroom_steps > 0 else np.nan
+    if USE_MEAN_CENTERED_POLICY and residual_policy_vals:
+        rp_arr = np.array(residual_policy_vals, dtype=float)
+        summ['residual_policy_std'] = float(np.std(rp_arr))
+        summ['residual_policy_frac_negative'] = float(np.mean(rp_arr < 0))
+    else:
+        summ['residual_policy_std'] = np.nan
+        summ['residual_policy_frac_negative'] = np.nan
+    # Cost components (DA energy cost constant; store for clarity)
+    summ['da_energy_cost_eur'] = float(da_energy_cost_eur_const)
+    summ['rt_pv_curtail_cost_eur'] = float(pv_rt_curt_cost_eur)
+    summ['rt_imbalance_cost_eur'] = float(imbalance_cost_eur)
+    summ['rt_bess_cycle_cost_eur'] = float(bess_cycle_cost_eur)
+    summ['total_cost_eur'] = float(da_energy_cost_eur_const + pv_rt_curt_cost_eur + imbalance_cost_eur + bess_cycle_cost_eur)
+    summ['sample_id'] = sid
+    # Store trajectory length and append (inside loop; previously mis-indented causing only last trajectory retained)
+    summ['n_steps'] = int(len(index))
+    # Attach static flexible load metrics (same for all trajectories)
+    summ.update(flex_metrics_static)
+    per_traj_summary.append(summ)
+    collect_soc_frac.append(soc_series)
 
         # Write full series for this trajectory (after loop) to avoid holding all trajectories in memory
     # Only persist heavy per-trajectory series CSV when exactly one trajectory is simulated
     if EXPORT_FULL_SERIES and total == 1 and 'series_rows' in locals() and series_rows:
-            os.makedirs(os.path.join(OUTDIR, FULL_SERIES_DIR), exist_ok=True)
-            try:
-                import pandas as _pd
-                series_df = _pd.DataFrame(series_rows)
-                # Order columns: timestamp, sample_id, then rest sorted for reproducibility
-                fixed_cols = ['timestamp','sample_id','t_index']
-                ordered = fixed_cols + [c for c in series_df.columns if c not in fixed_cols]
-                series_df = series_df[ordered]
-                token = _epsilon_token(EPSILON)
-                series_fname = f"trajectory_{drcc_mode}_epsilon_{token}_sample_{sid}.csv" if drcc_mode != 'drcc_false' else f"trajectory_{drcc_mode}_sample_{sid}.csv"
-                series_path = os.path.join(OUTDIR, FULL_SERIES_DIR, series_fname)
-                series_df.to_csv(series_path, index=False)
-                print(f"[series] Wrote full series for sample {sid} -> {series_path}")
-            except Exception as e:
-                print(f"[WARN] Failed to write full series for sample {sid}: {e}")
-            finally:
-                del series_rows
+        os.makedirs(os.path.join(OUTDIR, FULL_SERIES_DIR), exist_ok=True)
+        try:
+            import pandas as _pd
+            series_df = _pd.DataFrame(series_rows)
+            # Order columns: timestamp, sample_id, then rest sorted for reproducibility
+            fixed_cols = ['timestamp','sample_id','t_index']
+            ordered = fixed_cols + [c for c in series_df.columns if c not in fixed_cols]
+            series_df = series_df[ordered]
+            token = _epsilon_token(EPSILON)
+            series_fname = f"trajectory_{drcc_mode}_epsilon_{token}_sample_{sid}.csv" if drcc_mode != 'drcc_false' else f"trajectory_{drcc_mode}_sample_{sid}.csv"
+            series_path = os.path.join(OUTDIR, FULL_SERIES_DIR, series_fname)
+            series_df.to_csv(series_path, index=False)
+            print(f"[series] Wrote full series for sample {sid} -> {series_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to write full series for sample {sid}: {e}")
+        finally:
+            del series_rows
 
     token = _epsilon_token(EPSILON)
 
@@ -2125,7 +2385,7 @@ def main() -> None:
                 soc_env_filename = f"soc_envelope_{drcc_mode}_epsilon_{token}.csv"
             soc_env_path = os.path.join(OUTDIR, soc_env_filename)
             soc_env_df.to_csv(soc_env_path, index=False)
-            print(f"✓ SoC envelope written: {soc_env_path}")
+            print(f"[ok] SoC envelope written: {soc_env_path}")
         except Exception as e:
             print(f"[WARN] Failed to write SoC envelope: {e}")
 
@@ -2175,7 +2435,7 @@ def main() -> None:
                 policy_coeffs_filename = f"policy_coeffs_{drcc_mode}_epsilon_{token}.csv"
             policy_coeffs_path = os.path.join(OUTDIR, policy_coeffs_filename)
             policy_df.to_csv(policy_coeffs_path, index=False)
-            print(f"✓ Policy coefficients written: {policy_coeffs_path}")
+            print(f"[ok] Policy coefficients written: {policy_coeffs_path}")
             meta['policy_coeffs_file'] = os.path.basename(policy_coeffs_path)
         except Exception as e:
             print(f"[WARN] Failed to export policy coefficients: {e}")
@@ -2197,8 +2457,8 @@ def main() -> None:
     with open(os.path.join(OUTDIR, meta_filename), 'w', encoding='utf-8') as f:
         json.dump(meta, f, indent=2)
 
-    print(f"✓ v3 summary written: {summary_path}")
-    print(f"✓ v3 meta written: {os.path.join(OUTDIR, meta_filename)}")
+    print(f"[ok] v3 summary written: {summary_path}")
+    print(f"[ok] v3 meta written: {os.path.join(OUTDIR, meta_filename)}")
 
 
 if __name__ == "__main__":

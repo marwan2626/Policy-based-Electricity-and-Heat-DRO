@@ -1,0 +1,5 @@
+file,mode,epsilon,mean_cost_eur,var95_cost_eur,cvar95_cost_eur,trafo_violation_rate_mean,trafo_violation_rate_max,n_trajectories,n_steps
+v4_summary_drcc_true_epsilon_0_05_rt_on.csv,drcc_true,0.05,878.0311938411578,905.0027217826203,909.2765911080136,0.0021875,,200,96
+v4_summary_drcc_true_epsilon_0_10_rt_off.csv,drcc_true,0.1,952.0655480975366,1002.985832732395,1007.6098647578394,0.03874999999999999,,200,96
+v4_summary_drcc_true_epsilon_0_10_rt_on.csv,drcc_true,0.1,882.5238320719961,909.5975257940172,913.7994281789099,0.012291666666666666,,200,96
+v4_summary_drcc_true_epsilon_0_15_rt_on.csv,drcc_true,0.15,882.0351996876292,908.788532421501,913.0474155637023,0.03578125,,200,96

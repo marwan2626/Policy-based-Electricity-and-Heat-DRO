@@ -1,11 +1,11 @@
 {
   "v2_results_csv": "C:\\Users\\ckw5258\\Desktop\\Github\\Policy-based-Electricity-and-Heat-DRO\\dso_model_v2_results_drcc_false.csv",
-  "epsilon": 0.3,
+  "epsilon": 0.1,
   "drcc_mode": "drcc_false",
   "samples_dir": "C:\\Users\\ckw5258\\Desktop\\Github\\Policy-based-Electricity-and-Heat-DRO\\samples",
   "sample_distribution": "gaussian",
   "dt_hours": 0.25,
-  "n_trajectories": 1000,
+  "n_trajectories": 100,
   "metrics": [
     "import_mwh",
     "energy_cost_eur",

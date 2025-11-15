@@ -5,7 +5,7 @@
   "samples_dir": "C:\\Users\\ckw5258\\Desktop\\Github\\Policy-based-Electricity-and-Heat-DRO\\samples",
   "sample_distribution": "studentt",
   "dt_hours": 0.25,
-  "n_trajectories": 1000,
+  "n_trajectories": 100,
   "metrics": [
     "import_mwh",
     "energy_cost_eur",

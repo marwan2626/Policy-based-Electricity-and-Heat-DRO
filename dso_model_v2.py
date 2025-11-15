@@ -1,4 +1,6 @@
 """
+NOTE: Use Conda environment 'CMESnew' to run this script (reminder).
+
 DHN Heat Pump Multi-Period Optimization using Gurobi
 
 This script extends the single-period optimization to handle multiple time periods
@@ -84,7 +86,9 @@ bug). That prevented isolation debugging of numeric issues. This patch fixes
 that and also introduces an environment/CLI hook for DRCC tightening.
 """
 # Real-time (second-stage) policy coefficients in day-ahead model (robust affine policy proxies)
-ENABLE_RT_POLICIES = True  # <--- EDIT ME (base default)
+# K-only architecture: keep affine K gains active; legacy λ/χ/ρ removed.
+ENABLE_RT_POLICIES = True   # True => allow K gains & baseline BESS intercept variables
+ENABLE_LEGACY_BUDGET_POLICY = False  # λ/χ/ρ off (archival path only if set True)
 
 # Residual basis for RT policy semantics (to match v3 OOS by default):
 # True  -> use mean-centered residual (Chebyshev-consistent; zero-mean shocks drive affine policy)
@@ -95,14 +99,64 @@ USE_MEAN_CENTERED_POLICY = True  # <--- EDIT ME (base default to match v3)
 # Set to False to lock the above value regardless of CLI/env.
 ALLOW_RT_FLAG_RUNTIME_OVERRIDE = True
 ENABLE_DRCC_RT_BUDGETS = True  # <--- EDIT ME (uses PV/temperature std to size D+ / D-)
-DRCC_EPSILON = 0.10            # chance violation level; k = sqrt((1-eps)/eps)
+DRCC_EPSILON = 0.05            # chance violation level; k = sqrt((1-eps)/eps)
+## RT budget sizing and cost switches
+# If True, size RT deviation budgets with k_epsilon*σ; if False, use 1*σ even when DRCC tightening is on.
+RT_BUDGETS_USE_K_EPSILON = False
+# If False, zero out all RT proxy cost factors (imbalance, PV-curt, BESS throughput) to study pure tightening effects
+ENABLE_RT_PROXY_COSTS = True
+# If True, charge RT proxy costs on expected volumes (≈ phi * sigma) instead of worst-case budgets (D_max)
+RT_PROXY_COST_EXPECTATION_MODE = True
+# Expected positive deviation multiplier phi: Gaussian E[d+] = sigma/sqrt(2π) ≈ 0.399
+RT_EXPECTATION_PHI = 0.399
 
 # DRCC-based network tightening (transformers, lines, voltages)
-ENABLE_DRCC_NETWORK_TIGHTENING = True  # <--- EDIT ME (base default)
+# Sane defaults: enable DRCC master with transformer+line tightening; keep voltage tightening off by default
+ENABLE_DRCC_NETWORK_TIGHTENING = True   # default ON; use CLI --disable-drcc-tightening to turn off
 # You can selectively toggle sub-components when master is ON
 DRCC_TIGHTEN_TRAFO = True
 DRCC_TIGHTEN_LINES = True
-DRCC_TIGHTEN_VOLTAGES = True
+DRCC_TIGHTEN_VOLTAGES = False
+# Policy-aware DRCC (closed-loop tightening using affine recourse gains)
+# When True, replace open-loop k*σ guard bands with SOC: ||flow||_2 + k*σ_cl <= capacity.
+# σ_cl is attenuated by selected real-time policy coefficients (lambda/rho terms, BESS z terms).
+ENABLE_POLICY_AWARE_DRCC = False  # Disabled when exact affine DRCC is active to avoid bilinear attenuation
+# Attenuation scaling factor (0..1). Higher => stronger reduction in effective uncertainty when RT policy is active.
+POLICY_ATTENUATION_SCALE = 0.30  # heuristic; keep modest to avoid overstating hedging
+
+# Exact affine DRCC (AARO-equivalent) using aggregate PV/HP disturbances and SOC tightening
+ENABLE_AFFINE_DRCC_EXACT = True   # When True, use exact closed-loop sigma with new K gains (overrides heuristic attenuation)
+# Optional: use affine DRCC tightening specifically for voltages. If False, voltages use
+# the non-affine per-bus sigma composition (equicorrelation-aware) even when other
+# components (lines/trafo) use affine DRCC. This helps avoid over-conservative voltage bands.
+ENABLE_AFFINE_VOLTAGE_DRCC_EXACT = True  # activated for affine voltage tightening instrumentation
+VOLTAGE_TIGHTEN_SCALE = 0.2  # scale factor applied to k_epsilon for affine voltage tightening to preserve feasibility
+AFFINE_DRCC_USE_GAUSSIAN = False  # If True, use Gaussian quantile; else Chebyshev (current k-epsilon already computed accordingly)
+# Disallow using PV curtailment as a free hedge in DRCC tightening unless explicitly enabled.
+# When False, K_pv_pvcurt and K_hp_pvcurt are fixed to 0 in the DRCC tightening logic (still allowing DA curtailment vars).
+ALLOW_PV_CURT_DRCC_HEDGE = False
+# DRCC actuator feasibility for BESS under affine recourse (power and energy)
+# When enabled, we ensure the closed-loop BESS action K·δ is feasible with high probability.
+# Power: |p_bess_net| + k * ||[K_pv_bess σ_pv, K_hp_bess σ_hp]||_2 ≤ Pmax
+# Energy: robust SoC headroom using cumulative deviation radius across time (RSS or L1).
+ENABLE_DRCC_BESS_ACTUATOR_FEAS = True
+# Enforce PV curtailment recourse feasibility (aggregate) under affine policy
+# Ensures additional curtailment under shocks (k * ||[K_pv_pvcurt σ_pv, K_hp_pvcurt σ_hp]||) does not exceed nominal PV generation
+ENABLE_DRCC_PV_CURT_FEAS = True
+# Method for energy envelope aggregation of recourse deviations across time:
+#   'rss' (default) uses root-sum-of-squares of per-step energy deviations (SOCP/QC)
+#   'l1'  uses conservative sum of absolute per-step deviations (linear, more conservative)
+#   'per_step' uses only per-step margin (least conservative; legacy behavior)
+# Prefer per-step headroom first to keep model convex and lighter; 'rss' can be re-enabled after runtime check
+BESS_ENERGY_ENVELOPE_METHOD = 'rss'  # Hybrid RSS/L1 cumulative energy deviation (RSS at block checkpoints, L1 intra-block)
+# When using 'rss', apply the full root-sum-of-squares (quadratic) cumulative envelope only
+# every BESS_RSS_STRIDE timesteps (and at the final horizon index). Within a block between
+# checkpoints, approximate the cumulative deviation with an L1 (linear) sum for tractability.
+# This drastically reduces the number of quadratic constraints from O(T) to O(T/stride).
+try:
+    BESS_RSS_STRIDE = int(globals().get('BESS_RSS_STRIDE', 12))  # can be overridden externally before import
+except Exception:
+    BESS_RSS_STRIDE = 12
 # Deterministic baseline semantics when DRCC tightening is OFF:
 # True  -> k_epsilon = 0.0 (fully deterministic design: no nominal sigma allowance)
 # False -> k_epsilon = 1.0 (legacy neutral baseline retaining a 1σ allowance without amplification)
@@ -159,7 +213,7 @@ HP_DRCC_BHDD = HP_COEFF_BHDD
 
 # Residual uncertainty for HP predictor (normalized units, multiply by HP_PRED_PMAX to get MW)
 HP_INCLUDE_RESIDUAL = True
-HP_RESIDUAL_SIGMA_NORM = 0.0435 # std of predictor residual in normalized y_dev units
+HP_RESIDUAL_SIGMA_NORM = 0.0430 # std of predictor residual in normalized y_dev units
 HP_RESIDUAL_CORRELATION = 0.0     # 0=independent across HP buses, 1=fully correlated (not used in current RSS)
 
 # Allow runtime override of START_DATE/DURATION_HOURS via CLI args or environment
@@ -172,6 +226,10 @@ try:
     parser.add_argument('--disable-rt-policies', dest='disable_rt_policies', action='store_true', help='Force-disable RT policies regardless of defaults')
     parser.add_argument('--enable-drcc-tightening', dest='enable_drcc_tight', action='store_true', help='Enable DRCC network tightening')
     parser.add_argument('--disable-drcc-tightening', dest='disable_drcc_tight', action='store_true', help='Disable DRCC network tightening')
+    # Convenience master toggle: --drcc on|off (overrides the above if provided)
+    parser.add_argument('--drcc', dest='drcc_mode', choices=['on','off'], help='Master DRCC tightening toggle (on/off)')
+    # Risk level override
+    parser.add_argument('--epsilon', dest='epsilon', type=float, help='Override DRCC epsilon (0<epsilon<1), e.g., 0.10')
     # Residual basis override flags (match v3 semantics by default)
     parser.add_argument('--mean-centered-policy', dest='use_mean_centered_policy', action='store_true', help='Use mean-centered residual basis for RT policy (recommended; matches v3)')
     parser.add_argument('--schedule-policy', dest='use_schedule_policy', action='store_true', help='Use schedule-based residual semantics (legacy)')
@@ -204,7 +262,9 @@ try:
                 ENABLE_RT_POLICIES = str(env_rt).strip().lower() in ('1','true','yes','on')
 
     # DRCC tightening overrides via CLI / env (independent of ALLOW_RT_FLAG_RUNTIME_OVERRIDE)
-    if args.disable_drcc_tight:
+    if getattr(args, 'drcc_mode', None) is not None:
+        ENABLE_DRCC_NETWORK_TIGHTENING = (args.drcc_mode == 'on')
+    elif args.disable_drcc_tight:
         ENABLE_DRCC_NETWORK_TIGHTENING = False
     elif args.enable_drcc_tight:
         ENABLE_DRCC_NETWORK_TIGHTENING = True
@@ -212,6 +272,23 @@ try:
         env_drcc = os.environ.get('CMES_ENABLE_DRCC_TIGHTENING')
         if env_drcc is not None:
             ENABLE_DRCC_NETWORK_TIGHTENING = str(env_drcc).strip().lower() in ('1','true','yes','on')
+
+    # Epsilon override
+    if args.epsilon is not None:
+        try:
+            if 0.0 < float(args.epsilon) < 1.0:
+                DRCC_EPSILON = float(args.epsilon)
+        except Exception:
+            pass
+    else:
+        env_eps = os.environ.get('CMES_DRCC_EPSILON')
+        if env_eps is not None:
+            try:
+                val = float(env_eps)
+                if 0.0 < val < 1.0:
+                    DRCC_EPSILON = val
+            except Exception:
+                pass
 
     # Residual basis override via CLI / env
     if args.use_schedule_policy:
@@ -222,14 +299,121 @@ try:
         env_resid = os.environ.get('CMES_USE_MEAN_CENTERED_POLICY')
         if env_resid is not None:
             USE_MEAN_CENTERED_POLICY = str(env_resid).strip().lower() in ('1','true','yes','on')
+
+    # Optional env overrides for DRCC policy-aware tightening and RT budget/cost switches
+    env_pol = os.environ.get('CMES_ENABLE_POLICY_AWARE_DRCC')
+    if env_pol is not None:
+        ENABLE_POLICY_AWARE_DRCC = str(env_pol).strip().lower() in ('1','true','yes','on')
+    env_budk = os.environ.get('CMES_RT_BUDGETS_USE_KE')
+    if env_budk is not None:
+        RT_BUDGETS_USE_K_EPSILON = str(env_budk).strip().lower() in ('1','true','yes','on')
+    env_rtpc = os.environ.get('CMES_ENABLE_RT_PROXY_COSTS')
+    if env_rtpc is not None:
+        ENABLE_RT_PROXY_COSTS = str(env_rtpc).strip().lower() in ('1','true','yes','on')
+    env_rtpexp = os.environ.get('CMES_RT_PROXY_COST_EXPECTATION')
+    if env_rtpexp is not None:
+        RT_PROXY_COST_EXPECTATION_MODE = str(env_rtpexp).strip().lower() in ('1','true','yes','on')
+    env_rtphi = os.environ.get('CMES_RT_EXPECTATION_PHI')
+    if env_rtphi is not None:
+        try:
+            RT_EXPECTATION_PHI = float(env_rtphi)
+        except Exception:
+            pass
+    # DRCC subcomponent toggles (trafo/lines/voltages)
+    env_t_tr = os.environ.get('CMES_DRCC_TIGHTEN_TRAFO')
+    if env_t_tr is not None:
+        DRCC_TIGHTEN_TRAFO = str(env_t_tr).strip().lower() in ('1','true','yes','on')
+    env_t_ln = os.environ.get('CMES_DRCC_TIGHTEN_LINES')
+    if env_t_ln is not None:
+        DRCC_TIGHTEN_LINES = str(env_t_ln).strip().lower() in ('1','true','yes','on')
+    env_t_v = os.environ.get('CMES_DRCC_TIGHTEN_VOLTAGES')
+    if env_t_v is not None:
+        DRCC_TIGHTEN_VOLTAGES = str(env_t_v).strip().lower() in ('1','true','yes','on')
+    # Affine exact toggles
+    # Affine exact safeguard: only allow enabling via CMES_ENABLE_AFFINE_DRCC_EXACT; disabling requires FORCE var
+    env_aff = os.environ.get('CMES_ENABLE_AFFINE_DRCC_EXACT')
+    env_aff_force_off = os.environ.get('CMES_FORCE_DISABLE_AFFINE_DRCC_EXACT')
+    if env_aff is not None:
+        if str(env_aff).strip().lower() in ('1','true','yes','on'):
+            ENABLE_AFFINE_DRCC_EXACT = True
+        else:
+            # Ignore passive attempt to turn off unless explicit force flag provided
+            if env_aff_force_off and str(env_aff_force_off).strip().lower() in ('1','true','yes','on'):
+                ENABLE_AFFINE_DRCC_EXACT = False
+                print('[config] affine_exact disabled via FORCE flag (CMES_FORCE_DISABLE_AFFINE_DRCC_EXACT)')
+            else:
+                print('[config] Ignored request to disable affine_exact (needs CMES_FORCE_DISABLE_AFFINE_DRCC_EXACT=1)')
+    env_aff_v = os.environ.get('CMES_ENABLE_AFFINE_VOLTAGE_DRCC_EXACT')
+    if env_aff_v is not None:
+        ENABLE_AFFINE_VOLTAGE_DRCC_EXACT = str(env_aff_v).strip().lower() in ('1','true','yes','on')
 except Exception as _e:
     print(f"[WARN] Runtime override parsing failed: {_e}. Using file defaults.")
+
+# ------------------------------------------------------------------
+# Post-override conflict resolution & diagnostics
+# ------------------------------------------------------------------
+try:
+    _flag_forced = {}
+
+    # Affine exact implies real-time policies must be present (to create K gains)
+    if ENABLE_AFFINE_DRCC_EXACT and not ENABLE_RT_POLICIES:
+        _flag_forced['ENABLE_RT_POLICIES'] = 'forced True because ENABLE_AFFINE_DRCC_EXACT requires K gains'
+        ENABLE_RT_POLICIES = True
+
+    # Mutually exclusive: policy-aware heuristic attenuation vs exact affine formulation
+    if ENABLE_AFFINE_DRCC_EXACT and ENABLE_POLICY_AWARE_DRCC:
+        _flag_forced['ENABLE_POLICY_AWARE_DRCC'] = 'forced False because ENABLE_AFFINE_DRCC_EXACT is True (mutually exclusive)'
+        ENABLE_POLICY_AWARE_DRCC = False
+
+    # Voltage exact only meaningful if global affine exact is on; if user requested voltage exact alone, downgrade politely
+    if ENABLE_AFFINE_VOLTAGE_DRCC_EXACT and not ENABLE_AFFINE_DRCC_EXACT:
+        _flag_forced['ENABLE_AFFINE_VOLTAGE_DRCC_EXACT'] = 'disabled because global ENABLE_AFFINE_DRCC_EXACT is False'
+        ENABLE_AFFINE_VOLTAGE_DRCC_EXACT = False
+
+    # DRCC subcomponent toggles only active if master tightening enabled
+    if not ENABLE_DRCC_NETWORK_TIGHTENING:
+        for _sub, _name in [(DRCC_TIGHTEN_TRAFO,'DRCC_TIGHTEN_TRAFO'), (DRCC_TIGHTEN_LINES,'DRCC_TIGHTEN_LINES'), (DRCC_TIGHTEN_VOLTAGES,'DRCC_TIGHTEN_VOLTAGES')]:
+            # Only record message if any were True
+            pass
+        if DRCC_TIGHTEN_TRAFO or DRCC_TIGHTEN_LINES or DRCC_TIGHTEN_VOLTAGES:
+            _flag_forced['DRCC_TIGHTEN_TRAFO/LINES/VOLTAGES'] = 'all disabled because ENABLE_DRCC_NETWORK_TIGHTENING is False'
+        DRCC_TIGHTEN_TRAFO = False
+        DRCC_TIGHTEN_LINES = False
+        DRCC_TIGHTEN_VOLTAGES = False
+
+    # Print forced changes (if any) for transparency
+    if _flag_forced:
+        print('[config] Flag conflict resolution applied:')
+        for k,v in _flag_forced.items():
+            print(f'          - {k}: {v}')
+except Exception as _conf_e:
+    print(f'[WARN] Conflict resolution block failed: {_conf_e}')
 
 # Announce residual basis to keep DA/OOS semantics transparent
 try:
     print(f"[config] USE_MEAN_CENTERED_POLICY = {bool(USE_MEAN_CENTERED_POLICY)} | rt_residual_basis = {'mean_centered' if USE_MEAN_CENTERED_POLICY else 'schedule'}")
 except Exception:
     pass
+
+# Compact run configuration summary (effective flags)
+try:
+    _cfg = {
+        'RT_policies': bool(ENABLE_RT_POLICIES),
+        'RT_budgets_on': bool(ENABLE_DRCC_RT_BUDGETS),
+        'RT_budgets_use_k': bool(globals().get('RT_BUDGETS_USE_K_EPSILON', False)),
+        'RT_proxy_costs': bool(globals().get('ENABLE_RT_PROXY_COSTS', True)),
+        'DRCC_tighten_on': bool(ENABLE_DRCC_NETWORK_TIGHTENING),
+        'tighten_trafo': bool(globals().get('DRCC_TIGHTEN_TRAFO', False)),
+        'tighten_lines': bool(globals().get('DRCC_TIGHTEN_LINES', False)),
+        'tighten_voltages': bool(globals().get('DRCC_TIGHTEN_VOLTAGES', False)),
+        'affine_exact': bool(globals().get('ENABLE_AFFINE_DRCC_EXACT', False)),
+        'affine_voltage_exact': bool(globals().get('ENABLE_AFFINE_VOLTAGE_DRCC_EXACT', False)),
+        'policy_aware_drcc': bool(globals().get('ENABLE_POLICY_AWARE_DRCC', False)),
+        'epsilon': float(globals().get('DRCC_EPSILON', 0.0)),
+    }
+    print("[config] RT/DRCC flags:", _cfg)
+except Exception as _e_cfg:
+    print(f"[config] Flag summary unavailable: {_e_cfg}")
 
 # Load the VDI profiles with heating and hot water loads
 print("Loading VDI profiles from 'vdi_profiles/all_house_profiles.csv'...")
@@ -1540,7 +1724,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
 
     bess_eff = 0.95  # Round-trip efficiency
     bess_initial_soc = 0.5  # Initial state of charge as a percentage of capacity
-    bess_capacity_mwh = 0.40  # BESS capacity in MWh
+    bess_capacity_mwh = 0.125  # BESS capacity in MWh
     bess_cost_per_mwh = 5000.0 # Cost per MWh of BESS capacity
     # Baseline (intercept) BESS throughput cost (EUR/MWh) for p0 channel
     c_base_bess = 1.5
@@ -1594,6 +1778,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     bess_charge_results = {}
     bess_discharge_results = {}
     bess_energy_results = {}
+    # New: robust net power results (post affine DRCC tightening)
+    bess_net_power_results = {}
     flexible_load_P_results = {}
     flexible_load_Q_results = {}
     non_flexible_load_P_results = {}
@@ -1615,6 +1801,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     # Robust recourse summaries (initialized early)
     D_plus_max = {}
     D_minus_max = {}
+    sigma_tot_by_t = {}
     pv_avail_sum_by_t = {}
     hp_pred_nominal = {}
     sum_nonflex_by_t = {}
@@ -1641,6 +1828,11 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     E_down_vars = {}
     E_up_vars = {}
     # (Deprecated) single ycap_var removed; using per-period ycap_vars
+
+    # New containers for robust affine DRCC actuator envelopes
+    net_bess_power_vars = {}       # net (discharge - charge) per bus, per t
+    s_bess_rec_vars = {}           # SOC radius for real-time recourse power (per t)
+    s_bess_energy_vars = {}        # SOC radius for cumulative energy deviation (per t)
 
 
     # Temporary dictionary to store updated load values per time step
@@ -1774,7 +1966,24 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     base_pv_bus_limits = {bus: float(net.sgen.loc[(net.sgen['bus'] == bus) & pv_mask_static, 'p_mw'].sum()) for bus in pv_buses}
     base_bess_bus_limits = {bus: float(net.sgen.loc[(net.sgen['bus'] == bus) & bess_mask_static, 'p_mw'].sum()) for bus in bess_buses}
 
+    # Shares for aggregate disturbance and actuator mapping (sum to 1 across respective sets)
+    pv_installed_mw = float(sum(base_pv_bus_limits.get(b, 0.0) for b in pv_buses)) if len(pv_buses) > 0 else 0.0
+    total_bess_pmax = float(sum(base_bess_bus_limits.get(b, 0.0) for b in bess_buses)) if len(bess_buses) > 0 else 0.0
+    pv_share_by_bus = {b: (base_pv_bus_limits.get(b, 0.0) / pv_installed_mw) if pv_installed_mw > 0 else 0.0 for b in net.bus.index}
+    # HP buses share equal weight among HP buses (if any)
+    hp_share_by_bus = {b: (1.0 / max(1, len(hp_load_buses))) if b in hp_load_buses and len(hp_load_buses) > 0 else 0.0 for b in net.bus.index}
+    bess_share_by_bus = {b: (base_bess_bus_limits.get(b, 0.0) / total_bess_pmax) if total_bess_pmax > 0 else 0.0 for b in net.bus.index}
+
     # net.load details suppressed to avoid verbose output
+    # Track tightened transformer capacity per (t, trafo) for diagnostics
+    trafo_tight_cap = {}
+    # Instrumentation: detailed per-timestep transformer tightening decision logs
+    transformer_cap_debug = []  # rows of dict: t, trafo_idx, branch, base_cap, sigmaS_trafo, stdPV, sigma_HP_temp, sigma_hp_resid, k_epsilon, candidate_cap, final_cap, fallback_flag, note
+    # Instrumentation: line thermal capacity tightening decisions
+    line_cap_debug = []  # rows: t, line_idx, branch, S_rated_line, base_cap, stdPV, stdHP_P, stdHP_Q, sigmaS_branch, k_epsilon, candidate_cap, final_cap_var, final_cap_numeric, fallback_flag, note
+    # Instrumentation: voltage band tightening decisions
+    voltage_band_debug = []  # rows: t, bus, branch, base_v_min, base_v_max, tight_v_min, tight_v_max, k_epsilon, delta_v, sig_pv_t, sig_hp_t, s_volt_var, s_volt_val, note
+
     for t in time_steps:
         dt = time_index[t]                  # pandas Timestamp for this slot
         P_base = baseline_lookup(dt)
@@ -1858,9 +2067,43 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             sigma_pv = float(const_pv_std[t]) * pv_installed_mw
             sigma_hp = hp_temp_sens * float(T_amb_std[t])
             sigma_net[t] = float(np.sqrt(sigma_pv**2 + sigma_hp**2))
+        # Sanity check: if all sigmas are ~0, emit a warning to avoid misleadingly tiny tightening
+        try:
+            sig_vals = np.array(list(sigma_net.values()), dtype=float)
+            if not np.any(sig_vals > 1e-9):
+                print("[WARN] DRCC tightening enabled but PV/T ambient std arrays are near zero across horizon. Tightening may be negligible.")
+        except Exception:
+            pass
     else:
         # DRCC tightening disabled: k_epsilon already set (0 strict or 1 neutral). No sigma aggregation needed.
         print(f"[INFO] DRCC tightening disabled -> baseline mode: {k_source} (k_epsilon={k_epsilon})")
+
+    # ------------------------------------------------------------------
+    # Exact affine DRCC recourse gains (aggregate PV and HP disturbances)
+    # Create before constraints that reference them (voltages/lines/trafo)
+    # ------------------------------------------------------------------
+    K_pv_bess = {}
+    K_hp_bess = {}
+    K_pv_slack = {}
+    K_hp_slack = {}
+    K_pv_pvcurt = {}
+    K_hp_pvcurt = {}
+    # Unconditional creation when RT policies enabled (legacy lambda/chi removed). If affine exact off, K still exist
+    # so policy-aware attenuation and future exact upgrades can reference them uniformly.
+    if ENABLE_RT_POLICIES:
+        for t in time_steps:
+            K_pv_bess[t] = model.addVar(lb=-1.0, ub=1.0, name=f'K_pv_bess_{t}')
+            K_hp_bess[t] = model.addVar(lb=-1.0, ub=1.0, name=f'K_hp_bess_{t}')
+            K_pv_slack[t] = model.addVar(lb=-1.0, ub=1.0, name=f'K_pv_slack_{t}')
+            K_hp_slack[t] = model.addVar(lb=-1.0, ub=1.0, name=f'K_hp_slack_{t}')
+            K_pv_pvcurt[t] = model.addVar(lb=0.0, ub=0.0 if not bool(globals().get('ALLOW_PV_CURT_DRCC_HEDGE', False)) else 1.0, name=f'K_pv_pvcurt_{t}')
+            K_hp_pvcurt[t] = model.addVar(lb=0.0, ub=0.0 if not bool(globals().get('ALLOW_PV_CURT_DRCC_HEDGE', False)) else 1.0, name=f'K_hp_pvcurt_{t}')
+        if not ENABLE_AFFINE_DRCC_EXACT:
+            print('[config] RT policies active with affine_exact disabled -> K gains created (open-loop attenuation only)')
+    else:
+        print('[config] RT policies disabled -> no K gains created')
+
+    # Downstream logic now can rely on presence of K dicts; when affine exact disabled their values may default ~0.
 
     # Add variables for each time step
     for t in time_steps:
@@ -1944,7 +2187,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                     # electrical_time_series keys are original names (string), match exactly
                     if load_name in electrical_time_series:
                         # series is in kW per timestep -> convert to MW
-                        mapped_series = np.array(electrical_time_series[load_name])* 7 / 1000.0 #scaling factor of 6 applied here
+                        mapped_series = np.array(electrical_time_series[load_name])* 8 / 1000.0 #scaling factor of 6 applied here
 
                 if mapped_series is None:
                     # Fallback: assign zero-series for unmatched electrical load
@@ -2029,6 +2272,8 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             bess_charge_vars[t] = model.addVars(bess_buses, lb=0, ub=base_bess_bus_limits, name=f'bess_charge_{t}')
             bess_discharge_vars[t] = model.addVars(bess_buses, lb=0, ub=base_bess_bus_limits, name=f'bess_discharge_{t}')
             bess_energy_vars[t] = model.addVars(bess_buses, lb=0, ub=bess_capacity_mwh, name=f'bess_energy_{t}')
+            # Net power variable per bus (discharge - charge) for robust bounds
+            net_bess_power_vars[t] = model.addVars(bess_buses, lb=-GRB.INFINITY, name=f'bess_net_power_{t}')
             if t == time_steps[0]:
                 for bus in bess_buses:
                     model.addConstr(bess_energy_vars[t][bus] == bess_initial_soc * bess_capacity_mwh, name=f'bess_energy_initial_{t}_{bus}')
@@ -2050,6 +2295,130 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                     for bus in bess_buses:
                         # Enforce cyclical SOC
                         model.addConstr(bess_energy_vars[t][bus] == bess_energy_vars[time_steps[0]][bus], name=f'bess_energy_cyclical_{t}_{bus}')
+
+            # Link net power variable to charge/discharge vars
+            for bus in bess_buses:
+                model.addConstr(net_bess_power_vars[t][bus] == bess_discharge_vars[t][bus] - bess_charge_vars[t][bus], name=f'bess_net_def_{t}_{bus}')
+
+            # Robust affine DRCC actuator tightening (only when exact affine DRCC enabled)
+            if ENABLE_AFFINE_DRCC_EXACT and ENABLE_DRCC_BESS_ACTUATOR_FEAS:
+                # Aggregate disturbance sigmas (PV / HP) same style as voltage/line constraints
+                const_pv_std_arr = globals().get('const_pv_std', np.zeros(len(time_steps)))
+                T_amb_std_arr = globals().get('T_amb_std', np.zeros(len(time_steps)))
+                try:
+                    sigma_Tavg_by_day = globals().get('sigma_Tavg_by_day', {})
+                    Var_HDD_by_t = globals().get('Var_HDD_by_t', {})
+                except Exception:
+                    sigma_Tavg_by_day = {}
+                    Var_HDD_by_t = {}
+                # PV aggregate sigma (MW)
+                sig_pv_t = float(const_pv_std_arr[t]) * float(sum(base_pv_bus_limits.get(b, 0.0) for b in pv_buses)) if len(pv_buses) > 0 else 0.0
+                # HP aggregate sigma (MW) reusing predictor sensitivities
+                try:
+                    dt_local = time_index[t]
+                    sigma_Tavg_d = float(sigma_Tavg_by_day.get(dt_local.date(), 0.0))
+                    var_HDD_t = float(Var_HDD_by_t.get(t, 0.0))
+                    sigma_HP_temp = float(np.sqrt(max(0.0, (HP_DRCC_PMAX*HP_DRCC_BTAV*sigma_Tavg_d)**2 + (HP_DRCC_PMAX*HP_DRCC_BHDD)**2 * var_HDD_t)))
+                except Exception:
+                    sigma_HP_temp = abs(HP_DRCC_PMAX * HP_DRCC_BTAV) * float(T_amb_std_arr[t])
+                sigma_hp_resid = float(HP_PRED_PMAX * HP_RESIDUAL_SIGMA_NORM) if bool(HP_INCLUDE_RESIDUAL) else 0.0
+                sig_hp_t = float(np.sqrt(max(0.0, sigma_HP_temp**2 + sigma_hp_resid**2)))
+
+                # Recourse norm: || [K_pv_bess * sig_pv_t, K_hp_bess * sig_hp_t] ||_2 captured by s_bess_rec_t
+                s_bess_rec = model.addVar(lb=0.0, name=f's_bess_rec_t{t}')
+                model.addQConstr((K_pv_bess[t]*sig_pv_t)*(K_pv_bess[t]*sig_pv_t) + (K_hp_bess[t]*sig_hp_t)*(K_hp_bess[t]*sig_hp_t) <= s_bess_rec*s_bess_rec, name=f'soc_bess_recourse_t{t}')
+                s_bess_rec_vars[t] = s_bess_rec
+
+                # PV curtailment recourse feasibility: additional curtailment cannot exceed nominal PV generation
+                if ENABLE_DRCC_PV_CURT_FEAS:
+                    s_pvcurt_rec = model.addVar(lb=0.0, name=f's_pvcurt_rec_t{t}')
+                    # || [K_pv_pvcurt * σ_pv, K_hp_pvcurt * σ_hp] ||_2 ≤ s_pvcurt_rec
+                    model.addQConstr((K_pv_pvcurt[t]*sig_pv_t)*(K_pv_pvcurt[t]*sig_pv_t) + (K_hp_pvcurt[t]*sig_hp_t)*(K_hp_pvcurt[t]*sig_hp_t) <= s_pvcurt_rec*s_pvcurt_rec,
+                                     name=f'soc_pvcurt_recourse_t{t}')
+                    # Aggregate nominal PV generation at t (sum over PV buses)
+                    if len(pv_buses) > 0:
+                        pv_gen_sum_t = gp.quicksum(pv_gen_vars[t][bus] for bus in pv_buses)
+                        model.addConstr(pv_gen_sum_t >= k_epsilon * s_pvcurt_rec, name=f'rob_pvcurt_feas_t{t}')
+
+                # Robust instantaneous power bounds per bus:
+                # |net_bess_power| + k_epsilon * s_bess_rec <= Pmax_bus
+                for bus in bess_buses:
+                    Pmax_bus = float(base_bess_bus_limits.get(bus, 0.0))
+                    if Pmax_bus <= 0:  # skip degenerate
+                        continue
+                    model.addConstr(net_bess_power_vars[t][bus] + k_epsilon * s_bess_rec <= Pmax_bus, name=f'rob_bess_up_{t}_{bus}')
+                    model.addConstr(-net_bess_power_vars[t][bus] + k_epsilon * s_bess_rec <= Pmax_bus, name=f'rob_bess_down_{t}_{bus}')
+
+                # Robust energy envelope tightening:
+                # Build per-step energy deviation radius and optionally accumulate across time.
+                try:
+                    dt_hours_local = max(1/60.0, (time_index[1] - time_index[0]).total_seconds() / 3600.0)
+                except Exception:
+                    dt_hours_local = 0.25
+                # Single scalar deviation applied uniformly to each BESS bus (conservative)
+                s_bess_energy = model.addVar(lb=0.0, name=f's_bess_energy_t{t}')
+                model.addConstr(s_bess_energy == s_bess_rec * dt_hours_local, name=f's_bess_energy_def_t{t}')
+                s_bess_energy_vars[t] = s_bess_energy
+
+                # Choose aggregation method for cumulative SoC headroom
+                if str(BESS_ENERGY_ENVELOPE_METHOD).lower() == 'rss':
+                    # Hybrid checkpointed RSS: use RSS only at block end (every stride) & final horizon; L1 intra-block.
+                    stride = max(1, int(BESS_RSS_STRIDE))
+                    block_start = (t // stride) * stride
+                    is_checkpoint = ((t - block_start) == (stride - 1)) or (t == time_steps[-1])
+                    R_cum = model.addVar(lb=0.0, name=f'R_bess_energy_cum_t{t}')
+                    if is_checkpoint:
+                        # Root-sum-of-squares over current block: sum_{tau in block} s_tau^2 <= R_cum^2
+                        lhs = gp.QuadExpr()
+                        for tau in time_steps:
+                            if tau < block_start:
+                                continue
+                            if tau > t:
+                                break
+                            if tau in s_bess_energy_vars:
+                                lhs.add(s_bess_energy_vars[tau] * s_bess_energy_vars[tau])
+                        model.addQConstr(lhs <= R_cum * R_cum, name=f'soc_bess_energy_block_rss_t{t}')
+                    else:
+                        # Linear (L1) accumulation inside block for tractability: R_cum >= sum_{tau in block_start..t} s_tau
+                        model.addConstr(
+                            R_cum >= gp.quicksum(s_bess_energy_vars[tau] for tau in time_steps if (tau >= block_start and tau <= t and tau in s_bess_energy_vars)),
+                            name=f'l1_bess_energy_block_t{t}'
+                        )
+                    # Enforce SoC headroom using block cumulative radius R_cum
+                    for bus in bess_buses:
+                        cap_mwh_bus = float(bess_capacity_mwh.get(bus, 0.0)) if isinstance(bess_capacity_mwh, dict) else float(bess_capacity_mwh)
+                        if cap_mwh_bus <= 0:
+                            continue
+                        model.addConstr(bess_energy_vars[t][bus] >= k_epsilon * R_cum, name=f'rob_bess_energy_min_{t}_{bus}')
+                        model.addConstr(bess_energy_vars[t][bus] <= cap_mwh_bus - k_epsilon * R_cum, name=f'rob_bess_energy_max_{t}_{bus}')
+                    # Export reference
+                    try:
+                        globals().setdefault('R_bess_energy_cum_vars', {})[t] = R_cum
+                    except Exception:
+                        pass
+                elif str(BESS_ENERGY_ENVELOPE_METHOD).lower() == 'l1':
+                    # L1 cumulative radius (linear, more conservative): R_cum >= sum_{tau<=t} s_bess_energy_tau
+                    R_cum = model.addVar(lb=0.0, name=f'R_bess_energy_cum_t{t}')
+                    model.addConstr(R_cum >= gp.quicksum(s_bess_energy_vars[tau] for tau in time_steps if tau <= t and tau in s_bess_energy_vars),
+                                    name=f'l1_bess_energy_cum_t{t}')
+                    for bus in bess_buses:
+                        cap_mwh_bus = float(bess_capacity_mwh.get(bus, 0.0)) if isinstance(bess_capacity_mwh, dict) else float(bess_capacity_mwh)
+                        if cap_mwh_bus <= 0:
+                            continue
+                        model.addConstr(bess_energy_vars[t][bus] >= k_epsilon * R_cum, name=f'rob_bess_energy_min_{t}_{bus}')
+                        model.addConstr(bess_energy_vars[t][bus] <= cap_mwh_bus - k_epsilon * R_cum, name=f'rob_bess_energy_max_{t}_{bus}')
+                    try:
+                        globals().setdefault('R_bess_energy_cum_vars', {})[t] = R_cum
+                    except Exception:
+                        pass
+                else:
+                    # Legacy per-step headroom only (least conservative)
+                    for bus in bess_buses:
+                        cap_mwh_bus = float(bess_capacity_mwh.get(bus, 0.0)) if isinstance(bess_capacity_mwh, dict) else float(bess_capacity_mwh)
+                        if cap_mwh_bus <= 0:
+                            continue
+                        model.addConstr(bess_energy_vars[t][bus] >= k_epsilon * s_bess_energy, name=f'rob_bess_energy_min_{t}_{bus}')
+                        model.addConstr(bess_energy_vars[t][bus] <= cap_mwh_bus - k_epsilon * s_bess_energy, name=f'rob_bess_energy_max_{t}_{bus}')
 
         # External grid (import/export) per timestep
         ext_grid_import_P_vars[t] = model.addVar(lb=0, name=f'ext_grid_import_P_{t}')
@@ -2271,7 +2640,79 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 base_v_max = 1.50**2
 
                 # Compute tightened voltage band if DRCC tightening enabled; else fall back to base
-                if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_VOLTAGES and (k_epsilon is not None) and (sigmaP_pu_vec is not None):
+                # Note: ensure affine DRCC voltage tightening is gated by the master flag, consistent with lines/trafo
+                # Affine voltage tightening: require master tightening and voltage flag. K gains may be absent if
+                # ENABLE_AFFINE_DRCC_EXACT is False; in that case treat all K terms as zero (open-loop tightening).
+                if ENABLE_DRCC_NETWORK_TIGHTENING and ENABLE_AFFINE_VOLTAGE_DRCC_EXACT and DRCC_TIGHTEN_VOLTAGES and (k_epsilon is not None):
+                    # Exact affine DRCC for voltage using aggregate PV/HP disturbances
+                    # Rows R_i and X_i already extracted
+                    R_row = np.array([R[i, j] for j in range(len(non_slack_buses))], dtype=float)
+                    X_row = np.array([X[i, j] for j in range(len(non_slack_buses))], dtype=float)
+                    # Map full bus set to reduced (non_slack) indices
+                    # Build per-unit shares over reduced index order
+                    pv_share_pu = np.array([pv_share_by_bus.get(non_slack_buses[j], 0.0) for j in range(len(non_slack_buses))], dtype=float)
+                    hp_share_pu = np.array([hp_share_by_bus.get(non_slack_buses[j], 0.0) for j in range(len(non_slack_buses))], dtype=float)
+                    bess_share_pu = np.array([bess_share_by_bus.get(non_slack_buses[j], 0.0) for j in range(len(non_slack_buses))], dtype=float)
+
+                    sig_pv_t = float(globals().get('const_pv_std', np.zeros(len(time_steps)))[t]) * float(sum(base_pv_bus_limits.get(b, 0.0) for b in pv_buses)) if len(pv_buses) > 0 else 0.0
+                    # Recompute HP sigma similarly as in line section
+                    try:
+                        dt_local = time_index[t]
+                        sigma_Tavg_d = float(globals().get('sigma_Tavg_by_day', {}).get(dt_local.date(), 0.0))
+                        var_HDD_t = float(globals().get('Var_HDD_by_t', {}).get(t, 0.0))
+                        sigma_HP_temp_loc = float(np.sqrt(max(0.0, (HP_DRCC_PMAX*HP_DRCC_BTAV*sigma_Tavg_d)**2 + (HP_DRCC_PMAX*HP_DRCC_BHDD)**2 * var_HDD_t)))
+                    except Exception:
+                        sigma_HP_temp_loc = abs(HP_DRCC_PMAX * HP_DRCC_BTAV) * float(globals().get('T_amb_std', np.zeros(len(time_steps)))[t])
+                    sigma_hp_resid = float(HP_PRED_PMAX * HP_RESIDUAL_SIGMA_NORM) if bool(HP_INCLUDE_RESIDUAL) else 0.0
+                    sig_hp_t = float(np.sqrt(max(0.0, sigma_HP_temp_loc**2 + sigma_hp_resid**2)))
+
+                    # Affine coefficients for V: ΔV ≈ 2(R ΔP_pu + X ΔQ_pu)
+                    # Build sums (affine in K via sums of shares)
+                    sum_R_pv = float(np.dot(R_row, pv_share_pu))
+                    sum_R_bess = float(np.dot(R_row, bess_share_pu))
+                    sum_R_hp = float(np.dot(R_row, hp_share_pu))
+                    sum_X_hpQ = float(np.dot(X_row, hp_share_pu)) * qfactor_heatpump
+
+                    # Safe access to K dictionaries (may be empty if ENABLE_AFFINE_DRCC_EXACT=False)
+                    k_pv_bess_val = K_pv_bess.get(t, 0.0)
+                    k_hp_bess_val = K_hp_bess.get(t, 0.0)
+                    k_pv_pvcurt_val = K_pv_pvcurt.get(t, 0.0)
+                    k_hp_pvcurt_val = K_hp_pvcurt.get(t, 0.0)
+
+                    alpha_pv_V = 2.0 * (sum_R_pv + sum_R_bess * k_pv_bess_val - sum_R_pv * k_pv_pvcurt_val)
+                    alpha_hp_V = 2.0 * ((-sum_R_hp) + sum_R_bess * k_hp_bess_val - sum_R_pv * k_hp_pvcurt_val + (-sum_X_hpQ))
+
+                    s_volt = model.addVar(lb=0.0, name=f's_volt_t{t}_b{bus}')
+                    v1 = alpha_pv_V * sig_pv_t
+                    v2 = alpha_hp_V * sig_hp_t
+                    model.addQConstr(v1*v1 + v2*v2 <= s_volt*s_volt, name=f'soc_sigma_volt_t{t}_b{bus}')
+                    # Enforce DRCC-tightened band using scaled k to preserve feasibility
+                    k_volt = k_epsilon * VOLTAGE_TIGHTEN_SCALE
+                    if ENFORCE_BASE_VOLT_LIMITS:
+                        model.addConstr(V_vars[t, bus] >= base_v_min + k_volt * s_volt, name=f'voltage_min_affine_{t}_{bus}')
+                        model.addConstr(V_vars[t, bus] <= base_v_max - k_volt * s_volt, name=f'voltage_max_affine_{t}_{bus}')
+                    # Instrumentation for affine voltage tightening (was previously skipped due to continue)
+                    try:
+                        voltage_band_debug.append({
+                            't': t,
+                            'bus': bus,
+                            'branch': 'affine_voltage_exact',
+                            'base_v_min': base_v_min,
+                            'base_v_max': base_v_max,
+                            'tight_v_min': None,  # will be filled post-solve
+                            'tight_v_max': None,  # will be filled post-solve
+                            'k_epsilon': float(k_epsilon),
+                            'delta_v': None,
+                            'sig_pv_t': sig_pv_t,
+                            'sig_hp_t': sig_hp_t,
+                            's_volt_var': f's_volt_t{t}_b{bus}',
+                            's_volt_val': None,
+                            'note': 'affine voltage tightening'
+                        })
+                    except Exception:
+                        pass
+                    continue
+                elif ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_VOLTAGES and (k_epsilon is not None) and (sigmaP_pu_vec is not None):
                     R_row = np.array([R[i, j] for j in range(len(non_slack_buses))], dtype=float)
                     X_row = np.array([X[i, j] for j in range(len(non_slack_buses))], dtype=float)
                     # Split into PV P and HP P/Q contributions using earlier sigma maps if present
@@ -2335,8 +2776,31 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                     tight_v_min = base_v_min
                     tight_v_max = base_v_max
 
+                # Voltage band instrumentation (record after band determined)
+                try:
+                    _volt_branch = 'affine_voltage_exact' if (ENABLE_DRCC_NETWORK_TIGHTENING and ENABLE_AFFINE_VOLTAGE_DRCC_EXACT and DRCC_TIGHTEN_VOLTAGES and (k_epsilon is not None)) else (
+                        'open_loop_voltage' if (ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_VOLTAGES and (k_epsilon is not None)) else 'base_voltage')
+                    voltage_band_debug.append({
+                        't': t,
+                        'bus': bus,
+                        'branch': _volt_branch,
+                        'base_v_min': base_v_min,
+                        'base_v_max': base_v_max,
+                        'tight_v_min': tight_v_min,
+                        'tight_v_max': tight_v_max,
+                        'k_epsilon': float(k_epsilon) if 'k_epsilon' in locals() else None,
+                        'delta_v': delta_v if 'delta_v' in locals() else None,
+                        'sig_pv_t': sig_pv_t if 'sig_pv_t' in locals() else None,
+                        'sig_hp_t': sig_hp_t if 'sig_hp_t' in locals() else None,
+                        's_volt_var': f's_volt_t{t}_b{bus}' if _volt_branch == 'affine_voltage_exact' else None,
+                        's_volt_val': None,
+                        'note': 'voltage band tightening' if _volt_branch != 'base_voltage' else 'base band enforced'
+                    })
+                except Exception:
+                    pass
+
                 # Always enforce base band (unless explicitly disabled); apply tightening only to the limit values
-                if ENFORCE_BASE_VOLT_LIMITS:
+                if ENFORCE_BASE_VOLT_LIMITS and not ENABLE_AFFINE_VOLTAGE_DRCC_EXACT:
                     vmin_enf = tight_v_min if (ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_VOLTAGES) else base_v_min
                     vmax_enf = tight_v_max if (ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_VOLTAGES) else base_v_max
                     model.addConstr(V_vars[t, bus] >= vmin_enf, name=f"voltage_min_{t}_{bus}")
@@ -2366,6 +2830,24 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                     name=f"Q_accumulated_{t}_{bus}"
                 )
 
+
+    # --- Policy proxy variables for DRCC tightening ---
+    # Only create when policy-aware tightening is enabled (to avoid extra variables otherwise)
+    policy_lambda_plus_proxy = {}
+    policy_lambda_minus_proxy = {}
+    policy_rho_plus1_proxy = {}
+    policy_rho_minus1_proxy = {}
+    policy_z_dis_proxy = {}
+    policy_z_ch_proxy = {}
+    if ENABLE_POLICY_AWARE_DRCC:
+        for t in time_steps:
+            # Nonnegative proxies; linked to RT vars below when ENABLE_RT_POLICIES, else set to 0 later
+            policy_lambda_plus_proxy[t] = model.addVar(lb=0.0, name=f'pol_lambda_plus_proxy_{t}')
+            policy_lambda_minus_proxy[t] = model.addVar(lb=0.0, name=f'pol_lambda_minus_proxy_{t}')
+            policy_rho_plus1_proxy[t] = model.addVar(lb=0.0, name=f'pol_rho_plus1_proxy_{t}')
+            policy_rho_minus1_proxy[t] = model.addVar(lb=0.0, name=f'pol_rho_minus1_proxy_{t}')
+            policy_z_dis_proxy[t] = model.addVar(lb=0.0, name=f'pol_z_dis_proxy_{t}')
+            policy_z_ch_proxy[t] = model.addVar(lb=0.0, name=f'pol_z_ch_proxy_{t}')
 
     #Line power flow and loading constraints (with the corrected expression)
     for t in time_steps:
@@ -2427,18 +2909,173 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 sigmaP_branch = float(np.sqrt(stdPV**2 + stdHP_P**2))
                 sigmaQ_branch = float(stdHP_Q)
                 sigmaS_branch = float(np.sqrt(sigmaP_branch**2 + sigmaQ_branch**2))
+
+                if ENABLE_DRCC_NETWORK_TIGHTENING and ENABLE_RT_POLICIES and ENABLE_AFFINE_DRCC_EXACT:
+                    # Exact affine DRCC with aggregate PV/HP disturbances
+                    # Build aggregate sigmas
+                    sig_pv_t = float(const_pv_std_arr[t]) * float(sum(base_pv_bus_limits.get(b, 0.0) for b in pv_buses)) if len(pv_buses) > 0 else 0.0
+                    # HP sigma as computed above (stdHP_P corresponds to aggregate P component); reuse sigma_HP_t
+                    sig_hp_t = sigma_HP_t if 'sigma_HP_t' in locals() else 0.0
+                    # Downstream set
+                    ds = set(downstream_map[to_bus]) | {to_bus}
+                    # Coefficients for P channel (affine in K)
+                    # PV contribution on P
+                    sum_pv_share_ds = float(sum(pv_share_by_bus.get(b, 0.0) for b in ds))
+                    sum_bess_share_ds = float(sum(bess_share_by_bus.get(b, 0.0) for b in ds))
+                    alpha_pv_P = (sum_pv_share_ds) + (sum_bess_share_ds) * K_pv_bess[t] - (sum_pv_share_ds) * K_pv_pvcurt[t]
+                    # HP contribution on P
+                    sum_hp_share_ds = float(sum(hp_share_by_bus.get(b, 0.0) for b in ds))
+                    alpha_hp_P = (-sum_hp_share_ds) + (sum_bess_share_ds) * K_hp_bess[t] - (sum_pv_share_ds) * K_hp_pvcurt[t]
+                    # Q channel: only HP via PF (no PV Q, no BESS Q)
+                    alpha_hp_Q = (-sum_hp_share_ds) * qfactor_heatpump
+
+                    # s_line variable for DRCC margin
+                    s_line = model.addVar(lb=0.0, name=f's_line_t{t}_l{line_idx}')
+                    # SOC: t1^2 + t2^2 + t3^2 <= s_line^2, with t1/t2/t3 affine in K
+                    t1 = (alpha_pv_P) * sig_pv_t
+                    t2 = (alpha_hp_P) * sig_hp_t
+                    t3 = (alpha_hp_Q) * sig_hp_t
+                    model.addQConstr(t1*t1 + t2*t2 + t3*t3 <= s_line*s_line, name=f'soc_sigma_line_t{t}_l{line_idx}')
+
+                    # Capacity slack variable and SOC capacity
+                    w_line_cap = model.addVar(lb=0.0, name=f'w_line_cap_affine_t{t}_l{line_idx}')
+                    model.addConstr(w_line_cap == 0.8 * S_rated_line - k_epsilon * s_line, name=f'w_line_cap_affine_def_t{t}_l{line_idx}')
+                    if ENFORCE_BASE_LINE_LIMITS:
+                        model.addQConstr(
+                            P_branch_vars[t, line_idx]*P_branch_vars[t, line_idx] +
+                            Q_branch_vars[t, line_idx]*Q_branch_vars[t, line_idx] <= w_line_cap*w_line_cap,
+                            name=f'S_branch_affine_limit_{t}_{line_idx}'
+                        )
+                    # Instrument affine line tightening
+                    try:
+                        line_cap_debug.append({
+                            't': t,
+                            'line_idx': line_idx,
+                            'branch': 'affine_exact',
+                            'S_rated_line': S_rated_line,
+                            'base_cap': 0.8 * S_rated_line,
+                            'stdPV': stdPV,
+                            'stdHP_P': stdHP_P,
+                            'stdHP_Q': stdHP_Q,
+                            'sigmaS_branch': sigmaS_branch,
+                            'k_epsilon': float(k_epsilon) if 'k_epsilon' in locals() else None,
+                            'candidate_cap': None,
+                            'final_cap_var': f'w_line_cap_affine_t{t}_l{line_idx}',
+                            'final_cap_numeric': None,
+                            'fallback_flag': False,
+                            'note': 'affine line tightening path'
+                        })
+                    except Exception:
+                        pass
+                    continue
+                elif ENABLE_DRCC_NETWORK_TIGHTENING and ENABLE_POLICY_AWARE_DRCC:
+                    # Build policy activity (closed-loop attenuation) expression (dimensionless)
+                    policy_activity = gp.LinExpr()
+                    # BESS response (deficit/surplus proxy capacity usage)
+                    if 'total_bess_pmax' in locals() and total_bess_pmax > 0 and t in policy_lambda_plus_proxy and t in policy_lambda_minus_proxy:
+                        policy_activity += (policy_lambda_plus_proxy[t] + policy_lambda_minus_proxy[t]) / (1.0 + total_bess_pmax)
+                    # PV curtailment recourse coefficients (surplus/deficit)
+                    if pv_avail_sum_by_t.get(t, 0.0) > 0 and t in policy_rho_plus1_proxy and t in policy_rho_minus1_proxy:
+                        policy_activity += (policy_rho_plus1_proxy[t] + policy_rho_minus1_proxy[t]) / (1.0 + pv_avail_sum_by_t.get(t, 0.0))
+                    # Explicit BESS deviation channels z_dis/z_ch (additional fast hedge capability)
+                    if 'total_bess_pmax' in locals() and total_bess_pmax > 0 and t in policy_z_dis_proxy and t in policy_z_ch_proxy:
+                        policy_activity += (policy_z_dis_proxy[t] + policy_z_ch_proxy[t]) / (1.0 + total_bess_pmax)
+
+                    # Effective (closed-loop) sigma as affine attenuation of open-loop sigma
+                    sigma_line_policy = model.addVar(lb=0.0, name=f'sigma_line_policy_t{t}_l{line_idx}')
+                    model.addConstr(
+                        sigma_line_policy == sigmaS_branch * (1.0 - POLICY_ATTENUATION_SCALE * policy_activity),
+                        name=f'sigma_line_policy_def_t{t}_l{line_idx}'
+                    )
+                    # Capacity slack variable for SOC form
+                    w_line_cap = model.addVar(lb=0.0, name=f'w_line_cap_t{t}_l{line_idx}')
+                    model.addConstr(
+                        w_line_cap == 0.8 * S_rated_line - k_epsilon * sigma_line_policy,
+                        name=f'w_line_cap_def_t{t}_l{line_idx}'
+                    )
+                    # Enforce SOC: ||(P,Q)||_2 <= w_line_cap
+                    if ENFORCE_BASE_LINE_LIMITS:
+                        model.addQConstr(
+                            P_branch_vars[t, line_idx]*P_branch_vars[t, line_idx] +
+                            Q_branch_vars[t, line_idx]*Q_branch_vars[t, line_idx] <= w_line_cap*w_line_cap,
+                            name=f'S_branch_soc_limit_{t}_{line_idx}'
+                        )
+                    # Instrument policy-aware line tightening
+                    try:
+                        line_cap_debug.append({
+                            't': t,
+                            'line_idx': line_idx,
+                            'branch': 'policy_aware',
+                            'S_rated_line': S_rated_line,
+                            'base_cap': 0.8 * S_rated_line,
+                            'stdPV': stdPV,
+                            'stdHP_P': stdHP_P,
+                            'stdHP_Q': stdHP_Q,
+                            'sigmaS_branch': sigmaS_branch,
+                            'k_epsilon': float(k_epsilon) if 'k_epsilon' in locals() else None,
+                            'candidate_cap': None,
+                            'final_cap_var': f'w_line_cap_t{t}_l{line_idx}',
+                            'final_cap_numeric': None,
+                            'fallback_flag': False,
+                            'note': 'policy-aware line tightening path'
+                        })
+                    except Exception:
+                        pass
+                    continue  # Skip legacy tightening path
+                # Legacy (open-loop) tightening path
                 S_branch_limit = 0.8 * S_rated_line - k_epsilon * sigmaS_branch
                 S_branch_limit = max(0.0, S_branch_limit)
+                # Instrument open-loop line tightening
+                try:
+                    line_cap_debug.append({
+                        't': t,
+                        'line_idx': line_idx,
+                        'branch': 'open_loop',
+                        'S_rated_line': S_rated_line,
+                        'base_cap': 0.8 * S_rated_line,
+                        'stdPV': stdPV,
+                        'stdHP_P': stdHP_P,
+                        'stdHP_Q': stdHP_Q,
+                        'sigmaS_branch': sigmaS_branch,
+                        'k_epsilon': float(k_epsilon) if 'k_epsilon' in locals() else None,
+                        'candidate_cap': S_branch_limit,
+                        'final_cap_var': None,
+                        'final_cap_numeric': S_branch_limit,
+                        'fallback_flag': bool(abs(S_branch_limit - 0.8 * S_rated_line) < 1e-9),
+                        'note': 'open-loop line tightening'
+                    })
+                except Exception:
+                    pass
             else:
                 S_branch_limit = 0.8 * S_rated_line
+                # Instrument base (no tightening) line path
+                try:
+                    line_cap_debug.append({
+                        't': t,
+                        'line_idx': line_idx,
+                        'branch': 'base',
+                        'S_rated_line': S_rated_line,
+                        'base_cap': 0.8 * S_rated_line,
+                        'stdPV': None,
+                        'stdHP_P': None,
+                        'stdHP_Q': None,
+                        'sigmaS_branch': None,
+                        'k_epsilon': float(k_epsilon) if 'k_epsilon' in locals() else None,
+                        'candidate_cap': None,
+                        'final_cap_var': None,
+                        'final_cap_numeric': 0.8 * S_rated_line,
+                        'fallback_flag': True,
+                        'note': 'base line limit'
+                    })
+                except Exception:
+                    pass
 
             # Always enforce base thermal limit unless debugging flag disables it
             if ENFORCE_BASE_LINE_LIMITS:
-                # If tightening inactive, S_branch_limit already equals base; if active, it's tightened.
+                # If policy-aware path used we already continued; only legacy path reaches here.
                 model.addQConstr(
                     P_branch_vars[t, line_idx]*P_branch_vars[t, line_idx] +
-                    Q_branch_vars[t, line_idx]*Q_branch_vars[t, line_idx]
-                    <= (S_branch_limit**2),
+                    Q_branch_vars[t, line_idx]*Q_branch_vars[t, line_idx] <= (S_branch_limit**2),
                     name=f"S_branch_limit_{t}_{line_idx}"
                 )
 
@@ -2501,8 +3138,132 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 sigmaP_trafo = float(np.sqrt(stdPV**2 + stdHP_P**2))
                 sigmaQ_trafo = float(stdHP_Q)
                 sigmaS_trafo = float(np.sqrt(sigmaP_trafo**2 + sigmaQ_trafo**2))
+                if ENABLE_DRCC_NETWORK_TIGHTENING and ENABLE_RT_POLICIES and ENABLE_AFFINE_DRCC_EXACT:
+                    # Exact affine DRCC for transformer (use downstream LV set)
+                    print(f"[instrument-branch] affine_exact transformer tightening t={t} trafo={trafo_idx}")
+                    try:
+                        print(f"[instrument-debug] affine_before_append t={t} current_rows={len(transformer_cap_debug)}")
+                    except Exception as _e_dbg_aff_len:
+                        print(f"[instrument-debug] len access failed t={t}: {_e_dbg_aff_len}")
+                    sig_pv_t = float(const_pv_std_arr[t]) * float(sum(base_pv_bus_limits.get(b, 0.0) for b in pv_buses)) if len(pv_buses) > 0 else 0.0
+                    sig_hp_t = sigma_HP_t if 'sigma_HP_t' in locals() else 0.0
+                    ds = set(downstream_map[lv_bus]) | {lv_bus}
+                    sum_pv_share_ds = float(sum(pv_share_by_bus.get(b, 0.0) for b in ds))
+                    sum_bess_share_ds = float(sum(bess_share_by_bus.get(b, 0.0) for b in ds))
+                    sum_hp_share_ds = float(sum(hp_share_by_bus.get(b, 0.0) for b in ds))
+                    alpha_pv_P = (sum_pv_share_ds) + (sum_bess_share_ds) * K_pv_bess[t] - (sum_pv_share_ds) * K_pv_pvcurt[t]
+                    alpha_hp_P = (-sum_hp_share_ds) + (sum_bess_share_ds) * K_hp_bess[t] - (sum_pv_share_ds) * K_hp_pvcurt[t]
+                    alpha_hp_Q = (-sum_hp_share_ds) * qfactor_heatpump
+                    s_tr = model.addVar(lb=0.0, name=f's_trafo_t{t}_tr{trafo_idx}')
+                    u1 = (alpha_pv_P) * sig_pv_t
+                    u2 = (alpha_hp_P) * sig_hp_t
+                    u3 = (alpha_hp_Q) * sig_hp_t
+                    model.addQConstr(u1*u1 + u2*u2 + u3*u3 <= s_tr*s_tr, name=f'soc_sigma_trafo_t{t}_tr{trafo_idx}')
+                    w_tr_cap = model.addVar(lb=0.0, name=f'w_tr_cap_affine_t{t}_tr{trafo_idx}')
+                    model.addConstr(w_tr_cap == 0.8*S_rated - k_epsilon * s_tr, name=f'w_tr_cap_affine_def_t{t}_tr{trafo_idx}')
+                    # Record tightened cap variable for diagnostics
+                    trafo_tight_cap[(t, trafo_idx)] = w_tr_cap
+                    # Instrumentation (use expected variable name string to avoid VarName access before model update)
+                    base_cap = 0.8 * S_rated
+                    transformer_cap_debug.append({
+                        't': t,
+                        'trafo_idx': trafo_idx,
+                        'branch': 'affine_exact',
+                        'base_cap': base_cap,
+                        'sigmaS_trafo': sigmaS_trafo,
+                        'stdPV': stdPV,
+                        'sigma_HP_temp': sigma_HP_temp if 'sigma_HP_temp' in locals() else None,
+                        'sigma_hp_resid': sigma_hp_resid if 'sigma_hp_resid' in locals() else None,
+                        'k_epsilon': k_epsilon,
+                        'candidate_cap': None,
+                        'final_cap_var': f'w_tr_cap_affine_t{t}_tr{trafo_idx}',
+                        'final_cap_numeric': None,
+                        'fallback_flag': False,
+                        'note': 'affine tightening path'
+                    })
+                    print(f"[instrument-debug] affine_recorded t={t} rows={len(transformer_cap_debug)}")
+                    if ENFORCE_BASE_TRAFO_LIMITS:
+                        model.addQConstr(
+                            P_trafo_vars[t, trafo_idx]*P_trafo_vars[t, trafo_idx] +
+                            Q_trafo_vars[t, trafo_idx]*Q_trafo_vars[t, trafo_idx] <= w_tr_cap*w_tr_cap,
+                            name=f'S_trafo_affine_limit_{t}_{trafo_idx}'
+                        )
+                    continue
+                elif ENABLE_DRCC_NETWORK_TIGHTENING and ENABLE_POLICY_AWARE_DRCC:
+                    policy_activity = gp.LinExpr()
+                    print(f"[instrument-branch] policy_aware transformer tightening t={t} trafo={trafo_idx}")
+                    if 'total_bess_pmax' in locals() and total_bess_pmax > 0 and t in policy_lambda_plus_proxy and t in policy_lambda_minus_proxy:
+                        policy_activity += (policy_lambda_plus_proxy[t] + policy_lambda_minus_proxy[t]) / (1.0 + total_bess_pmax)
+                    if pv_avail_sum_by_t.get(t, 0.0) > 0 and t in policy_rho_plus1_proxy and t in policy_rho_minus1_proxy:
+                        policy_activity += (policy_rho_plus1_proxy[t] + policy_rho_minus1_proxy[t]) / (1.0 + pv_avail_sum_by_t.get(t, 0.0))
+                    if 'total_bess_pmax' in locals() and total_bess_pmax > 0 and t in policy_z_dis_proxy and t in policy_z_ch_proxy:
+                        policy_activity += (policy_z_dis_proxy[t] + policy_z_ch_proxy[t]) / (1.0 + total_bess_pmax)
+                    sigma_trafo_policy = model.addVar(lb=0.0, name=f'sigma_trafo_policy_t{t}_tr{trafo_idx}')
+                    model.addConstr(
+                        sigma_trafo_policy == sigmaS_trafo * (1.0 - POLICY_ATTENUATION_SCALE * policy_activity),
+                        name=f'sigma_trafo_policy_def_t{t}_tr{trafo_idx}'
+                    )
+                    w_trafo_cap = model.addVar(lb=0.0, name=f'w_trafo_cap_t{t}_tr{trafo_idx}')
+                    model.addConstr(
+                        w_trafo_cap == 0.8 * S_rated - k_epsilon * sigma_trafo_policy,
+                        name=f'w_trafo_cap_def_t{t}_tr{trafo_idx}'
+                    )
+                    # Record tightened cap variable for diagnostics
+                    trafo_tight_cap[(t, trafo_idx)] = w_trafo_cap
+                    try:
+                        base_cap = 0.8 * S_rated
+                        # Symbolic candidate uses sigma_trafo_policy var
+                        transformer_cap_debug.append({
+                            't': t,
+                            'trafo_idx': trafo_idx,
+                            'branch': 'policy_aware',
+                            'base_cap': base_cap,
+                            'sigmaS_trafo': sigmaS_trafo,
+                            'stdPV': stdPV,
+                            'sigma_HP_temp': sigma_HP_temp if 'sigma_HP_temp' in locals() else None,
+                            'sigma_hp_resid': sigma_hp_resid if 'sigma_hp_resid' in locals() else None,
+                            'k_epsilon': k_epsilon,
+                            'candidate_cap': None,  # depends on attenuation & sigma variable
+                            'final_cap_var': w_trafo_cap.VarName,
+                            'final_cap_numeric': None,
+                            'fallback_flag': False,
+                            'note': 'policy aware attenuation'
+                        })
+                    except Exception:
+                        pass
+                    if ENFORCE_BASE_TRAFO_LIMITS:
+                        model.addQConstr(
+                            P_trafo_vars[t, trafo_idx]*P_trafo_vars[t, trafo_idx] +
+                            Q_trafo_vars[t, trafo_idx]*Q_trafo_vars[t, trafo_idx] <= w_trafo_cap*w_trafo_cap,
+                            name=f'S_trafo_soc_limit_{t}_{trafo_idx}'
+                        )
+                    continue  # Skip legacy tightening path
                 S_limit = 0.8*S_rated - k_epsilon * sigmaS_trafo
                 S_limit = max(0.0, S_limit)
+                # Record numeric tightened cap for diagnostics
+                trafo_tight_cap[(t, trafo_idx)] = S_limit
+                print(f"[instrument-branch] open_loop transformer tightening t={t} trafo={trafo_idx} S_limit={S_limit:.5f}")
+                try:
+                    base_cap = 0.8 * S_rated
+                    fallback_flag = bool(abs(S_limit - base_cap) < 1e-9)  # cap stayed at base (no tightening)
+                    transformer_cap_debug.append({
+                        't': t,
+                        'trafo_idx': trafo_idx,
+                        'branch': 'open_loop',
+                        'base_cap': base_cap,
+                        'sigmaS_trafo': sigmaS_trafo,
+                        'stdPV': stdPV,
+                        'sigma_HP_temp': sigma_HP_temp if 'sigma_HP_temp' in locals() else None,
+                        'sigma_hp_resid': sigma_hp_resid if 'sigma_hp_resid' in locals() else None,
+                        'k_epsilon': k_epsilon,
+                        'candidate_cap': base_cap - k_epsilon * sigmaS_trafo,
+                        'final_cap_var': None,
+                        'final_cap_numeric': S_limit,
+                        'fallback_flag': fallback_flag,
+                        'note': 'legacy open-loop tightening'
+                    })
+                except Exception:
+                    pass
             else:
                 S_limit = 0.8*S_rated
 
@@ -2510,8 +3271,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             if ENFORCE_BASE_TRAFO_LIMITS:
                 model.addQConstr(
                     P_trafo_vars[t, trafo_idx]*P_trafo_vars[t, trafo_idx] +
-                    Q_trafo_vars[t, trafo_idx]*Q_trafo_vars[t, trafo_idx]
-                    <= (S_limit**2),
+                    Q_trafo_vars[t, trafo_idx]*Q_trafo_vars[t, trafo_idx] <= (S_limit**2),
                     name=f"S_trafo_limit_{t}_{trafo_idx}"
                 )
 
@@ -2602,6 +3362,12 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         imb_dn_factor = 1.3
         pv_curt_price_factor = 1.3
         bess_rt_price_per_mw = 5.1
+        # Allow disabling proxy costs to inspect pure DRCC tightening behavior
+        if not bool(ENABLE_RT_PROXY_COSTS):
+            imb_up_factor = 0.0
+            imb_dn_factor = 0.0
+            pv_curt_price_factor = 0.0
+            bess_rt_price_per_mw = 0.0
 
         try:
             if len(time_index) >= 2:
@@ -2629,11 +3395,14 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                     k_e = np.sqrt((1.0 - 0.05) / 0.05)
             else:
                 k_e = 1.0  # Neutral scaling in deterministic (no tightening) mode
+            # Optionally decouple budgets from k_epsilon inflation
+            k_e_budgets = k_e if bool(RT_BUDGETS_USE_K_EPSILON) else 1.0
             # Retrieve aligned std arrays prepared in the calling scope
             const_pv_std = globals().get('const_pv_std', np.zeros(len(time_steps)))
             T_amb_std = globals().get('T_amb_std', np.zeros(len(time_steps)))
             try:
-                print(f"[INFO] RT budget mode={'quantile_drcc' if ENABLE_DRCC_NETWORK_TIGHTENING else 'std_only_k1'} | k_e={k_e:.4f}")
+                mode = 'quantile_drcc' if ENABLE_DRCC_NETWORK_TIGHTENING else 'std_only_k1'
+                print(f"[INFO] RT budget mode={mode} | k_e={k_e:.4f} | budgets_use_k={'yes' if RT_BUDGETS_USE_K_EPSILON else 'no (k=1)'}")
             except Exception:
                 pass
 
@@ -2664,78 +3433,53 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                     sigma_hp = sigma_hp_temp
                 # Aggregate std assuming independence
                 sigma_tot = np.sqrt(max(0.0, sigma_pv**2 + sigma_hp**2))
-                # Set symmetric budgets as k * sigma
-                D_plus_max[t] = k_e * sigma_tot
-                D_minus_max[t] = k_e * sigma_tot
+                sigma_tot_by_t[t] = float(sigma_tot)
+                # Set symmetric budgets as (k_e_budgets) * sigma (k_e_budgets may be 1.0 when decoupled)
+                D_plus_max[t] = k_e_budgets * sigma_tot
+                D_minus_max[t] = k_e_budgets * sigma_tot
             else:
                 D_plus_max[t] = alpha_plus * (base_demand_t + base_pv_t)
                 D_minus_max[t] = alpha_minus * (base_demand_t + base_pv_t)
 
-            # Buy-back activation disabled: remove y_cap and gamma variables
-            chi0_vars[t] = model.addVar(lb=0.0, name=f'chi0_{t}')
-            chi_minus_vars[t] = model.addVar(lb=0.0, name=f'chi_minus_{t}')
-            # Baseline intercept BESS power decomposition (discharge / charge) non-negative
-            p0_dis_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'p0_dis_{t}')
-            p0_ch_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'p0_ch_{t}')
-            # Keep lambda0 for continuity in downstream usage but link to p0_dis - p0_ch
-            lambda0_vars[t] = model.addVar(lb=- (total_bess_pmax if 'total_bess_pmax' in locals() else 0.0), ub=(total_bess_pmax if 'total_bess_pmax' in locals() else 0.0), name=f'lambda0_{t}')
-            lambda_plus_vars[t] = model.addVar(lb=0.0, name=f'lambda_plus_{t}')
-            lambda_minus_vars[t] = model.addVar(lb=0.0, name=f'lambda_minus_{t}')
-            rho_plus0_vars[t] = model.addVar(lb=0.0, name=f'rho_plus0_{t}')
-            rho_plus1_vars[t] = model.addVar(lb=0.0, name=f'rho_plus1_{t}')
-            rho_minus0_vars[t] = model.addVar(lb=0.0, name=f'rho_minus0_{t}')
-            rho_minus1_vars[t] = model.addVar(lb=0.0, name=f'rho_minus1_{t}')
-            z_dis_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'z_dis_{t}')
-            z_ch_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'z_ch_{t}')
-
-            # Link intercept variable to decomposition
-            model.addConstr(p0_dis_vars[t] - p0_ch_vars[t] == lambda0_vars[t], name=f'lambda0_link_t{t}')
-            # Instantaneous power caps (baseline + deviation cannot exceed physical rating)
+            if ENABLE_LEGACY_BUDGET_POLICY:
+                # (Dead path retained for archival; will not execute with flag False)
+                chi0_vars[t] = model.addVar(lb=0.0, name=f'chi0_{t}')
+                chi_minus_vars[t] = model.addVar(lb=0.0, name=f'chi_minus_{t}')
+                p0_dis_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'p0_dis_{t}')
+                p0_ch_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'p0_ch_{t}')
+                lambda0_vars[t] = model.addVar(lb=-(total_bess_pmax if 'total_bess_pmax' in locals() else 0.0), ub=(total_bess_pmax if 'total_bess_pmax' in locals() else 0.0), name=f'lambda0_{t}')
+                lambda_plus_vars[t] = model.addVar(lb=0.0, name=f'lambda_plus_{t}')
+                lambda_minus_vars[t] = model.addVar(lb=0.0, name=f'lambda_minus_{t}')
+                rho_plus0_vars[t] = model.addVar(lb=0.0, name=f'rho_plus0_{t}')
+                rho_plus1_vars[t] = model.addVar(lb=0.0, name=f'rho_plus1_{t}')
+                rho_minus0_vars[t] = model.addVar(lb=0.0, name=f'rho_minus0_{t}')
+                rho_minus1_vars[t] = model.addVar(lb=0.0, name=f'rho_minus1_{t}')
+                z_dis_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'z_dis_{t}')
+                z_ch_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'z_ch_{t}')
+                model.addConstr(p0_dis_vars[t] - p0_ch_vars[t] == lambda0_vars[t], name=f'lambda0_link_t{t}')
+            else:
+                # K-only simplified: keep only baseline and deviation BESS power components.
+                p0_dis_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'p0_dis_{t}')
+                p0_ch_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'p0_ch_{t}')
+                z_dis_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'z_dis_{t}')
+                z_ch_vars[t] = model.addVar(lb=0.0, ub=total_bess_pmax if 'total_bess_pmax' in locals() else 0.0, name=f'z_ch_{t}')
+            # Instantaneous power caps
             if 'total_bess_pmax' in locals() and total_bess_pmax > 0.0:
                 model.addConstr(p0_dis_vars[t] + z_dis_vars[t] <= total_bess_pmax, name=f'bess_cap_dis_t{t}')
                 model.addConstr(p0_ch_vars[t] + z_ch_vars[t] <= total_bess_pmax, name=f'bess_cap_ch_t{t}')
-
-            # Robust SoC extreme trajectories (simple affine envelope) only if energy known
+            # Robust SoC envelopes (unchanged)
             if 'bess_capacity_mwh' in locals() and 'bess_initial_soc' in locals():
                 total_bess_energy = float(bess_capacity_mwh) * (len(bess_buses) if 'bess_buses' in locals() else 1)
                 if total_bess_energy > 0.0:
                     E_down_vars[t] = model.addVar(lb=0.0, ub=total_bess_energy, name=f'E_down_{t}')
                     E_up_vars[t] = model.addVar(lb=0.0, ub=total_bess_energy, name=f'E_up_{t}')
                     if t == time_steps[0]:
-                        model.addConstr(E_down_vars[t] == bess_initial_soc * total_bess_energy, name=f'Edown_init')
-                        model.addConstr(E_up_vars[t] == bess_initial_soc * total_bess_energy, name=f'Eup_init')
+                        model.addConstr(E_down_vars[t] == bess_initial_soc * total_bess_energy, name='Edown_init')
+                        model.addConstr(E_up_vars[t] == bess_initial_soc * total_bess_energy, name='Eup_init')
                     else:
-                        # Down path: assume worst-case discharge deviation realized
-                        model.addConstr(
-                            E_down_vars[t] == E_down_vars[t-1] + (p0_ch_vars[t]*bess_eff - p0_dis_vars[t]/bess_eff - z_dis_vars[t]/bess_eff)*dt_hours,
-                            name=f'Edown_dyn_t{t}'
-                        )
-                        # Up path: assume worst-case charge deviation realized
-                        model.addConstr(
-                            E_up_vars[t] == E_up_vars[t-1] + (p0_ch_vars[t]*bess_eff - p0_dis_vars[t]/bess_eff + z_ch_vars[t]*bess_eff)*dt_hours,
-                            name=f'Eup_dyn_t{t}'
-                        )
-                    # Feasibility relationship
+                        model.addConstr(E_down_vars[t] == E_down_vars[t-1] + (p0_ch_vars[t]*bess_eff - p0_dis_vars[t]/bess_eff - z_dis_vars[t]/bess_eff)*dt_hours, name=f'Edown_dyn_t{t}')
+                        model.addConstr(E_up_vars[t] == E_up_vars[t-1] + (p0_ch_vars[t]*bess_eff - p0_dis_vars[t]/bess_eff + z_ch_vars[t]*bess_eff)*dt_hours, name=f'Eup_dyn_t{t}')
                     model.addConstr(E_down_vars[t] <= E_up_vars[t], name=f'Eenv_order_t{t}')
-
-            model.addConstr(
-                # No buy-back activation: cover deficit with BESS proxies and imbalance proxies only
-                lambda_plus_vars[t] * D_plus_max[t]
-                + rho_plus0_vars[t] + rho_plus1_vars[t] * D_plus_max[t]
-                >= D_plus_max[t],
-                name=f'coverage_deficit_t{t}'
-            )
-
-            model.addConstr(
-                chi0_vars[t] + chi_minus_vars[t] * D_minus_max[t]
-                + lambda_minus_vars[t] * D_minus_max[t]
-                + rho_minus0_vars[t] + rho_minus1_vars[t] * D_minus_max[t]
-                >= D_minus_max[t],
-                name=f'coverage_surplus_t{t}'
-            )
-            model.addConstr(chi0_vars[t] + chi_minus_vars[t] * D_minus_max[t] <= pv_avail_sum_by_t.get(t, 0.0), name=f'pv_curt_leq_avail_t{t}')
-            model.addConstr(lambda_plus_vars[t] * D_plus_max[t] <= z_dis_vars[t], name=f'bess_deficit_proxy_t{t}')
-            model.addConstr(lambda_minus_vars[t] * D_minus_max[t] <= z_ch_vars[t], name=f'bess_surplus_proxy_t{t}')
 
         if 'total_bess_pmax' in locals() and total_bess_pmax > 0.0:
             try:
@@ -2745,6 +3489,24 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             if total_bess_energy > 0.0:
                 model.addConstr(gp.quicksum(z_dis_vars[t] * dt_hours for t in time_steps) <= total_bess_energy, name='rt_bess_dis_energy_cap')
                 model.addConstr(gp.quicksum(z_ch_vars[t] * dt_hours for t in time_steps) <= total_bess_energy, name='rt_bess_ch_energy_cap')
+
+    
+
+    # If RT policies are disabled, force policy proxies to zero so DRCC uses open-loop sigma (heuristic path)
+    if ENABLE_POLICY_AWARE_DRCC and not ENABLE_RT_POLICIES and not ENABLE_AFFINE_DRCC_EXACT:
+        for t in time_steps:
+            if 'policy_lambda_plus_proxy' in locals() and t in policy_lambda_plus_proxy:
+                model.addConstr(policy_lambda_plus_proxy[t] == 0.0, name=f'pol_zero_lplus_t{t}')
+            if 'policy_lambda_minus_proxy' in locals() and t in policy_lambda_minus_proxy:
+                model.addConstr(policy_lambda_minus_proxy[t] == 0.0, name=f'pol_zero_lminus_t{t}')
+            if 'policy_rho_plus1_proxy' in locals() and t in policy_rho_plus1_proxy:
+                model.addConstr(policy_rho_plus1_proxy[t] == 0.0, name=f'pol_zero_rplus1_t{t}')
+            if 'policy_rho_minus1_proxy' in locals() and t in policy_rho_minus1_proxy:
+                model.addConstr(policy_rho_minus1_proxy[t] == 0.0, name=f'pol_zero_rminus1_t{t}')
+            if 'policy_z_dis_proxy' in locals() and t in policy_z_dis_proxy:
+                model.addConstr(policy_z_dis_proxy[t] == 0.0, name=f'pol_zero_zdis_t{t}')
+            if 'policy_z_ch_proxy' in locals() and t in policy_z_ch_proxy:
+                model.addConstr(policy_z_ch_proxy[t] == 0.0, name=f'pol_zero_zch_t{t}')
 
     # Determine timestep duration in hours for energy-based costs
     try:
@@ -2762,10 +3524,7 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     electricity_cost =  gp.quicksum(electricity_price[t] * (ext_grid_import_P_vars[t] + ext_grid_export_P_vars[t]) * dt_hours for t in time_steps)
     bess_cost = gp.quicksum(bess_cost_per_mwh * (bess_charge_vars[t][bus] + bess_discharge_vars[t][bus]) * dt_hours for bus in bess_buses for t in time_steps) if len(bess_buses) > 0 else 0
     # Baseline intercept throughput cost (only if RT policies active and baseline vars exist)
-    if ENABLE_RT_POLICIES:
-        baseline_bess_cost = gp.quicksum(c_base_bess * (p0_dis_vars[t] + p0_ch_vars[t]) * dt_hours for t in time_steps if t in p0_dis_vars)
-    else:
-        baseline_bess_cost = 0
+    baseline_bess_cost = gp.quicksum(c_base_bess * (p0_dis_vars[t] + p0_ch_vars[t]) * dt_hours for t in time_steps if t in p0_dis_vars)
     pv_curtail_cost = gp.quicksum(electricity_price[t] * curtailment_vars[t][bus] * dt_hours for bus in pv_buses for t in time_steps) if len(pv_buses) > 0 else 0
     # (Removed old single-variable capacity cost)
     # Per-period capacity cost (interpret C_CAP_EUR_PER_MW as EUR per MW-hour): multiply by dt_hours
@@ -2784,21 +3543,19 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
     shed_cost = 0
 
     # New: first-stage capacity and RT proxy costs for robust policies (only if enabled)
-    if ENABLE_RT_POLICIES:
-        # No RT capacity activation cost
+    # K-only proxy costs: legacy imbalance & curtailment proxies removed.
+    if bool(ENABLE_RT_PROXY_COSTS):
         cap_cost = 0
-        imb_proxy_cost = gp.quicksum(
-            (imb_up_factor * electricity_price[t]) * (rho_plus0_vars[t] + rho_plus1_vars[t] * D_plus_max[t]) * dt_hours
-            + (imb_dn_factor * electricity_price[t]) * (rho_minus0_vars[t] + rho_minus1_vars[t] * D_minus_max[t]) * dt_hours
-            for t in time_steps
-        )
-        pv_curt_proxy_cost = gp.quicksum((pv_curt_price_factor * electricity_price[t]) * (chi0_vars[t] + chi_minus_vars[t] * D_minus_max[t]) * dt_hours for t in time_steps)
+        # Simple throughput proxy: penalize deviation magnitudes (z_dis + z_ch)
         bess_rt_proxy_cost = gp.quicksum(bess_rt_price_per_mw * (z_dis_vars[t] + z_ch_vars[t]) * dt_hours for t in time_steps)
-    else:
-        cap_cost = 0
+        # Imbalance & PV curtailment RT proxies disabled in K-only path
         imb_proxy_cost = 0
         pv_curt_proxy_cost = 0
+    else:
+        cap_cost = 0
         bess_rt_proxy_cost = 0
+        imb_proxy_cost = 0
+        pv_curt_proxy_cost = 0
 
     # Objective: Minimize total cost (import, export, and curtailment costs)
     # Utility (negative cost) for serving flexible load: sum_t VALUE_OF_SERVED_LOAD * served_energy_t
@@ -3009,7 +3766,51 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             trafo_text = f"max_trafo_loading={max_trafo_loading_pct}%" if max_trafo_loading_pct is not None else "max_trafo_loading=N/A"
             line_text = f"max_line_loading={max_line_loading_pct}%" if max_line_loading_pct is not None else "max_line_loading=N/A"
 
-        print(f"{eps_text} | {kap_text} | mode={mode_tag} | {trafo_text} | {line_text}")
+        # If tightening was applied, compute the tightest cap as % of rated (first transformer)
+        cap_text = "tight_cap=N/A"
+        try:
+            if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_TRAFO and len(net.trafo.index) > 0:
+                trafo_idx0 = net.trafo.index[0]
+                caps = []
+                for t in time_steps:
+                    cap_entry = trafo_tight_cap.get((t, trafo_idx0), None)
+                    if cap_entry is None:
+                        continue
+                    try:
+                        caps.append(float(cap_entry.X))  # var
+                    except Exception:
+                        try:
+                            caps.append(float(cap_entry))  # numeric
+                        except Exception:
+                            pass
+                if caps:
+                    rated0 = float(net.trafo.at[trafo_idx0, 'sn_mva'])
+                    min_cap_pct = (min(caps) / max(1e-9, rated0)) * 100.0
+                    cap_text = f"min_tight_cap={min_cap_pct:.2f}%rated"
+        except Exception:
+            pass
+
+        print(f"{eps_text} | {kap_text} | mode={mode_tag} | {trafo_text} | {line_text} | {cap_text}")
+
+        # DRCC transformer tightening diagnostics (only prints, no model changes)
+        try:
+            if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_TRAFO and ENABLE_AFFINE_DRCC_EXACT and ENFORCE_BASE_TRAFO_LIMITS:
+                print("\n[DIAG TRAFO] DRCC tightening components (first 5 timesteps):")
+                base_cap = 0.8 * float(net.trafo.sn_mva.iloc[0]) if len(net.trafo.index) > 0 else 0.0
+                for t in list(time_steps)[:5]:
+                    s_var = model.getVarByName(f"s_trafo_t{t}_tr0")
+                    w_var = model.getVarByName(f"w_tr_cap_affine_t{t}_tr0")
+                    if s_var is None or w_var is None:
+                        print(f"  t={t}: s/w variables not found (s_trafo_t{t}_tr0, w_tr_cap_affine_t{t}_tr0)")
+                        continue
+                    s_val = float(s_var.X)
+                    w_val = float(w_var.X)
+                    tightening = base_cap - w_val
+                    expected = (float(np.sqrt((1.0 - float(DRCC_EPSILON)) / float(DRCC_EPSILON))) if 0.0 < float(DRCC_EPSILON) < 1.0 else 0.0) * s_val
+                    pct_red = (tightening / base_cap * 100.0) if base_cap > 0 else 0.0
+                    print(f"  t={t}: base_cap={base_cap:.4f} | s_tr={s_val:.6f} | w_tr_cap={w_val:.4f} | tightening={tightening:.6f} | k*s={expected:.6f} | pct_reduction={pct_red:.3f}%")
+        except Exception as _diag_err:
+            print(f"[DIAG TRAFO] Diagnostics unavailable: {_diag_err}")
 
         # Extract optimized values for PV generation, external grid power, loads, and theta
         for t in time_steps:
@@ -3070,7 +3871,257 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                 for line_idx in net.line.index
             }
 
-            
+        # Extended transformer power debug (post-solution, does not affect model):
+        try:
+            if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_TRAFO and ENFORCE_BASE_TRAFO_LIMITS:
+                print("\n[DEBUG TRAFO POWER SERIES] (first 10 timesteps)")
+                if len(net.trafo.index) > 0:
+                    trafo_idx = net.trafo.index[0]  # single transformer assumed
+                    rated_mva = float(net.trafo.at[trafo_idx, 'sn_mva'])
+                    base_cap_mva = 0.8 * rated_mva  # same base cap used in tightening diagnostics
+                    for t in list(time_steps)[:10]:
+                        # Apparent power at transformer
+                        p_tr = float(P_trafo_vars[t, trafo_idx].x)
+                        q_tr = float(Q_trafo_vars[t, trafo_idx].x)
+                        s_mva = float(np.sqrt(p_tr * p_tr + q_tr * q_tr))
+                        # Percent relative to rated and base cap
+                        pct_rated = (s_mva / rated_mva * 100.0) if rated_mva > 0 else 0.0
+                        pct_base = (s_mva / base_cap_mva * 100.0) if base_cap_mva > 0 else 0.0
+                        # Retrieve tightened cap from recorded dict (var or numeric)
+                        w_cap_val = None
+                        if (t, trafo_idx) in trafo_tight_cap:
+                            cap_entry = trafo_tight_cap[(t, trafo_idx)]
+                            try:
+                                # Model var with .X
+                                w_cap_val = float(cap_entry.X)
+                            except Exception:
+                                try:
+                                    # Numeric cap
+                                    w_cap_val = float(cap_entry)
+                                except Exception:
+                                    w_cap_val = None
+                        pct_tightened = (s_mva / w_cap_val * 100.0) if (w_cap_val is not None and w_cap_val > 0) else None
+                        tightened_cap_str = f"{w_cap_val:.5f}" if w_cap_val is not None else "None"
+                        pct_tightened_str = f"{pct_tightened:.2f}%" if pct_tightened is not None else "N/A"
+                        print(
+                            f"  t={t}: S={s_mva:.5f} MVA | P={p_tr:.5f} MW | Q={q_tr:.5f} MVAr | "
+                            f"rated_cap={rated_mva:.5f} | base_cap(0.8*rated)={base_cap_mva:.5f} | tightened_cap={tightened_cap_str} | "
+                            f"%rated={pct_rated:.2f}% | %base={pct_base:.2f}% | %tightened={pct_tightened_str}"
+                        )
+                else:
+                    print("[DEBUG TRAFO POWER SERIES] No transformer present in network.")
+        except Exception as _e_tr_dbg:
+            print(f"[DEBUG TRAFO POWER SERIES] Failed: {_e_tr_dbg}")
+
+        # Deep-dive sigma diagnostics at peak loading times (transformer 0)
+        try:
+            if ENABLE_DRCC_NETWORK_TIGHTENING and DRCC_TIGHTEN_TRAFO and len(net.trafo.index) > 0:
+                trafo_idx = net.trafo.index[0]
+                rated_mva = float(net.trafo.at[trafo_idx, 'sn_mva'])
+                base_cap_mva = 0.8 * rated_mva
+                # Build list of (t, S_t) to find peak loading periods
+                s_series = []
+                for t in time_steps:
+                    p_tr = float(P_trafo_vars[t, trafo_idx].x)
+                    q_tr = float(Q_trafo_vars[t, trafo_idx].x)
+                    s_series.append((t, float(np.sqrt(p_tr * p_tr + q_tr * q_tr))))
+                # Top 6 periods by S
+                top = sorted(s_series, key=lambda x: x[1], reverse=True)[:6]
+                print("\n[DEBUG TRAFO SIGMA DECOMP] (peak-loading timesteps)")
+                const_pv_std_arr = globals().get('const_pv_std', np.zeros(len(time_steps)))
+                T_amb_std_arr = globals().get('T_amb_std', np.zeros(len(time_steps)))
+                sigma_Tavg_by_day = globals().get('sigma_Tavg_by_day', {})
+                Var_HDD_by_t = globals().get('Var_HDD_by_t', {})
+                Pmax_HP = HP_DRCC_PMAX; bTav_loc = HP_DRCC_BTAV; bHDD_loc = HP_DRCC_BHDD
+                rho_pv = max(0.0, min(1.0, float(PV_STD_CORRELATION))) if 'PV_STD_CORRELATION' in globals() else 0.0
+                # Downstream set for transformer LV bus
+                lv_bus = int(net.trafo.at[trafo_idx, 'lv_bus'])
+                downstream_set = set(downstream_map[lv_bus]) | {lv_bus}
+                for t, s_mva in top:
+                    # PV sigma over downstream set
+                    sigmaP_PV = [float(const_pv_std_arr[t]) * float(base_pv_bus_limits.get(b, 0.0)) if b in pv_buses else 0.0 for b in downstream_set]
+                    sumPV = float(np.sum(sigmaP_PV)); sumsqPV = float(np.sum(np.array(sigmaP_PV)**2))
+                    varPV = (1.0 - rho_pv) * sumsqPV + rho_pv * (sumPV ** 2)
+                    stdPV = float(np.sqrt(max(0.0, varPV)))
+                    # HP sigma components
+                    try:
+                        dt_local = time_index[t]
+                    except Exception:
+                        dt_local = None
+                    try:
+                        sigma_Tavg_d = float(sigma_Tavg_by_day.get(dt_local.date(), 0.0)) if dt_local is not None else 0.0
+                    except Exception:
+                        sigma_Tavg_d = 0.0
+                    try:
+                        var_HDD_t = float(Var_HDD_by_t.get(t, 0.0))
+                    except Exception:
+                        var_HDD_t = 0.0
+                    sigma_HP_temp = float(np.sqrt(max(0.0, (Pmax_HP*bTav_loc*sigma_Tavg_d)**2 + (Pmax_HP*bHDD_loc)**2 * var_HDD_t)))
+                    sigma_hp_resid = float(HP_PRED_PMAX * HP_RESIDUAL_SIGMA_NORM) if bool(HP_INCLUDE_RESIDUAL) else 0.0
+                    sigma_HP_t = float(np.sqrt(max(0.0, sigma_HP_temp**2 + sigma_hp_resid**2)))
+                    # Distribute over downstream buses (same heuristic as build path)
+                    if len(hp_load_buses) > 0:
+                        per_bus_hp_sigma = sigma_HP_t / max(1, len(hp_load_buses))
+                        sigmaQ_HP = [per_bus_hp_sigma * qfactor_heatpump if b in hp_load_buses else 0.0 for b in downstream_set]
+                        sigmaP_HP = [per_bus_hp_sigma if b in hp_load_buses else 0.0 for b in downstream_set]
+                    else:
+                        sigmaP_HP = [0.0 for _ in downstream_set]
+                        sigmaQ_HP = [0.0 for _ in downstream_set]
+                    if HP_FULLY_CORRELATED:
+                        stdHP_P = float(np.sum(sigmaP_HP)); stdHP_Q = float(np.sum(sigmaQ_HP))
+                    else:
+                        stdHP_P = float(np.sqrt(np.sum(np.array(sigmaP_HP)**2)))
+                        stdHP_Q = float(np.sqrt(np.sum(np.array(sigmaQ_HP)**2)))
+                    sigmaP_trafo = float(np.sqrt(stdPV**2 + stdHP_P**2))
+                    sigmaQ_trafo = float(stdHP_Q)
+                    sigmaS_trafo = float(np.sqrt(sigmaP_trafo**2 + sigmaQ_trafo**2))
+                    # Retrieve tightened cap used
+                    w_cap_val = None
+                    cap_entry = trafo_tight_cap.get((t, trafo_idx), None)
+                    if cap_entry is not None:
+                        try:
+                            w_cap_val = float(cap_entry.X)
+                        except Exception:
+                            try:
+                                w_cap_val = float(cap_entry)
+                            except Exception:
+                                w_cap_val = None
+                    # Retrieve affine s_trafo and K gains if available (affine path)
+                    s_tr_val = None
+                    try:
+                        s_var_aff = model.getVarByName(f"s_trafo_t{t}_tr{trafo_idx}")
+                        if s_var_aff is not None:
+                            s_tr_val = float(s_var_aff.X)
+                    except Exception:
+                        s_tr_val = None
+                    K_pv_b = None; K_hp_b = None; K_pv_c = None; K_hp_c = None
+                    try:
+                        K_pv_b = float(K_pv_bess[t].X)
+                        K_hp_b = float(K_hp_bess[t].X)
+                        K_pv_c = float(K_pv_pvcurt[t].X)
+                        K_hp_c = float(K_hp_pvcurt[t].X)
+                    except Exception:
+                        pass
+                    # Recompute downstream shares and alphas for transparency (match build path)
+                    ds = set(downstream_map[lv_bus]) | {lv_bus}
+                    sum_pv_share_ds = float(sum(pv_share_by_bus.get(b, 0.0) for b in ds))
+                    sum_bess_share_ds = float(sum(bess_share_by_bus.get(b, 0.0) for b in ds))
+                    sum_hp_share_ds = float(sum(hp_share_by_bus.get(b, 0.0) for b in ds))
+                    alpha_pv_P = (sum_pv_share_ds) + (sum_bess_share_ds) * (K_pv_b if K_pv_b is not None else 0.0) - (sum_pv_share_ds) * (K_pv_c if K_pv_c is not None else 0.0)
+                    alpha_hp_P = (-sum_hp_share_ds) + (sum_bess_share_ds) * (K_hp_b if K_hp_b is not None else 0.0) - (sum_pv_share_ds) * (K_hp_c if K_hp_c is not None else 0.0)
+                    alpha_hp_Q = (-sum_hp_share_ds) * qfactor_heatpump
+                    tstd = float(T_amb_std_arr[t]) if t < len(T_amb_std_arr) else float('nan')
+                    pvsd = float(const_pv_std_arr[t]) if t < len(const_pv_std_arr) else float('nan')
+                    # Expected tightening amount k*sigmaS
+                    ks = (kappa_val or 0.0) * sigmaS_trafo if ENABLE_DRCC_NETWORK_TIGHTENING else 0.0
+                    print(
+                        f"  t={t}: S={s_mva:.5f} | base_cap={base_cap_mva:.5f} | w_cap={w_cap_val if w_cap_val is not None else 'None'} | "
+                        f"stdPV={stdPV:.5f} | sigma_HP_temp={sigma_HP_temp:.5f} | sigma_HP_resid={sigma_hp_resid:.5f} | sigmaS_trafo={sigmaS_trafo:.5f} | s_tr_aff={s_tr_val if s_tr_val is not None else 'NA'} | "
+                        f"T_amb_std={tstd:.4f} | sigma_Tavg_day={sigma_Tavg_d:.5f} | Var_HDD={var_HDD_t:.6f} | pv_std={pvsd:.4f} | k*s={ks:.5f} | "
+                        f"KpvB={K_pv_b if K_pv_b is not None else 'NA'}, KhpB={K_hp_b if K_hp_b is not None else 'NA'}, KpvC={K_pv_c if K_pv_c is not None else 'NA'}, KhpC={K_hp_c if K_hp_c is not None else 'NA'} | "
+                        f"alpha_pv_P={alpha_pv_P:.3f}, alpha_hp_P={alpha_hp_P:.3f}, alpha_hp_Q={alpha_hp_Q:.3f}"
+                    )
+        except Exception as _e_sig_dbg:
+            print(f"[DEBUG TRAFO SIGMA DECOMP] Failed: {_e_sig_dbg}")
+
+        # Export transformer tightening instrumentation
+        try:
+            print(f"[instrument] transformer_cap_debug len={len(transformer_cap_debug)}")
+            if len(transformer_cap_debug) > 0:
+                import pandas as _pd
+                _cap_df = _pd.DataFrame(transformer_cap_debug)
+                # Post-solve: fill numeric final caps for variable paths
+                for idx, row in _cap_df.iterrows():
+                    if row.get('final_cap_numeric') is None and isinstance(row.get('final_cap_var'), str):
+                        try:
+                            v = model.getVarByName(row.get('final_cap_var'))
+                            if v is not None:
+                                _cap_df.at[idx, 'final_cap_numeric'] = float(v.X)
+                                base_cap = row.get('base_cap')
+                                if base_cap is not None:
+                                    _cap_df.at[idx, 'fallback_flag'] = bool(abs(float(v.X) - float(base_cap)) < 1e-9)
+                        except Exception:
+                            pass
+                fb_count = int(_cap_df['fallback_flag'].sum()) if 'fallback_flag' in _cap_df.columns else 0
+                _cap_df.to_csv('transformer_cap_debug.csv', index=False)
+                print(f"[instrument] transformer_cap_debug rows={len(_cap_df)} fallback_count={fb_count} saved->transformer_cap_debug.csv")
+                # Print first few rows for quick glance
+                try:
+                    print("[instrument] first 5 rows:\n" + _cap_df.head().to_string(index=False))
+                except Exception:
+                    pass
+            else:
+                print("[instrument] No transformer tightening instrumentation rows captured.")
+        except Exception as _e_inst:
+            print(f"[instrument] failed to export transformer_cap_debug: {_e_inst}")
+
+        # Export line tightening instrumentation
+        try:
+            print(f"[instrument] line_cap_debug len={len(line_cap_debug)}")
+            if len(line_cap_debug) > 0:
+                import pandas as _pd
+                _line_df = _pd.DataFrame(line_cap_debug)
+                # Fill numeric caps for variable paths
+                for idx, row in _line_df.iterrows():
+                    if row.get('final_cap_numeric') is None and isinstance(row.get('final_cap_var'), str):
+                        try:
+                            v = model.getVarByName(row.get('final_cap_var'))
+                            if v is not None:
+                                _line_df.at[idx, 'final_cap_numeric'] = float(v.X)
+                                base_cap = row.get('base_cap')
+                                if base_cap is not None:
+                                    _line_df.at[idx, 'fallback_flag'] = bool(abs(float(v.X) - float(base_cap)) < 1e-9)
+                        except Exception:
+                            pass
+                fb_line = int(_line_df['fallback_flag'].sum()) if 'fallback_flag' in _line_df.columns else 0
+                _line_df.to_csv('line_cap_debug.csv', index=False)
+                print(f"[instrument] line_cap_debug rows={len(_line_df)} fallback_count={fb_line} saved->line_cap_debug.csv")
+                try:
+                    print('[instrument] line first 5 rows:\n' + _line_df.head().to_string(index=False))
+                except Exception:
+                    pass
+            else:
+                print('[instrument] No line tightening instrumentation rows captured.')
+        except Exception as _e_line_inst:
+            print(f"[instrument] failed to export line_cap_debug: {_e_line_inst}")
+
+        # Export voltage band tightening instrumentation
+        try:
+            print(f"[instrument] voltage_band_debug len={len(voltage_band_debug)}")
+            if len(voltage_band_debug) > 0:
+                import pandas as _pd
+                _volt_df = _pd.DataFrame(voltage_band_debug)
+                # Fill s_volt_val where affine exact
+                for idx, row in _volt_df.iterrows():
+                    if row.get('s_volt_val') is None and isinstance(row.get('s_volt_var'), str):
+                        try:
+                            v = model.getVarByName(row.get('s_volt_var'))
+                            if v is not None:
+                                _volt_df.at[idx, 's_volt_val'] = float(v.X)
+                        except Exception:
+                            pass
+                    # Populate tightened band numerics for affine rows post-solve
+                    if row.get('branch') == 'affine_voltage_exact' and _volt_df.at[idx, 's_volt_val'] is not None and row.get('tight_v_min') is None:
+                        try:
+                            base_v_min = float(row.get('base_v_min')) if row.get('base_v_min') is not None else None
+                            base_v_max = float(row.get('base_v_max')) if row.get('base_v_max') is not None else None
+                            k_eps = float(row.get('k_epsilon')) if row.get('k_epsilon') is not None else None
+                            s_val = float(_volt_df.at[idx, 's_volt_val'])
+                            if base_v_min is not None and base_v_max is not None and k_eps is not None:
+                                _volt_df.at[idx, 'tight_v_min'] = base_v_min + k_eps * VOLTAGE_TIGHTEN_SCALE * s_val
+                                _volt_df.at[idx, 'tight_v_max'] = base_v_max - k_eps * VOLTAGE_TIGHTEN_SCALE * s_val
+                        except Exception:
+                            pass
+                _volt_df.to_csv('voltage_band_debug.csv', index=False)
+                print(f"[instrument] voltage_band_debug rows={len(_volt_df)} saved->voltage_band_debug.csv")
+                try:
+                    print('[instrument] voltage first 5 rows:\n' + _volt_df.head().to_string(index=False))
+                except Exception:
+                    pass
+            else:
+                print('[instrument] No voltage band instrumentation rows captured.')
+        except Exception as _e_volt_inst:
+            print(f"[instrument] failed to export voltage_band_debug: {_e_volt_inst}")
 
         # Return results in a structured format
         results = {
@@ -3248,6 +4299,17 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
             print(f"  model.ObjVal = {model.ObjVal}")
         except Exception:
             pass
+        # Export-only DA total cost (electricity import/export + flexible curtailment penalty).
+        try:
+            _elec_val = float(electricity_cost_value) if electricity_cost_value is not None else 0.0
+        except Exception:
+            _elec_val = 0.0
+        try:
+            _curt_val = float(curtailment_cost_val) if curtailment_cost_val is not None else 0.0
+        except Exception:
+            _curt_val = 0.0
+        da_total_cost_eur = _elec_val + _curt_val
+        print(f"  da_total_cost_eur (export) = {da_total_cost_eur}")
         # Diagnostics for flexible capacity cap (print first few periods)
         if bool(DEBUG_PRINT_FLEX_DIAGNOSTICS) and 'diag_sum_flex' in globals():
             try:
@@ -3271,6 +4333,12 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         results_data = {
             'period': [t+1 for t in time_steps],
         }
+
+        # Inject scalar DA total cost column (same value each timestep for convenience in downstream readers)
+        try:
+            results_data['da_total_cost_eur'] = [da_total_cost_eur for _ in time_steps]
+        except Exception:
+            results_data['da_total_cost_eur'] = [float('nan') for _ in time_steps]
 
         # Add timestamp column for exact time alignment in downstream simulators
         try:
@@ -3646,6 +4714,301 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
                     print(f"WARNING: flex export failed: {_flex_export_err}")
         except Exception:
             pass
+
+        # ------------------------------------------------------------------
+        # Export affine DRCC gains (K) and sigma proxies used for recourse
+        # These enable v3 to apply the same closed-loop policy in OOS.
+        # ------------------------------------------------------------------
+        try:
+            # Per-timestep affine gains (fallback to NaN when missing)
+            import numpy as _np
+            def _val_from_var(_v):
+                try:
+                    if hasattr(_v, 'X') and _v.X is not None:
+                        return float(_v.X)
+                    if hasattr(_v, 'x') and _v.x is not None:
+                        return float(_v.x)
+                except Exception:
+                    pass
+                return _np.nan
+
+            def _col_from_var_dict(var_like):
+                col = []
+                for t in time_steps:
+                    try:
+                        if isinstance(var_like, dict) and t in var_like:
+                            col.append(_val_from_var(var_like[t]))
+                        elif hasattr(var_like, '__getitem__'):
+                            col.append(_val_from_var(var_like[t]))
+                        else:
+                            col.append(_np.nan)
+                    except Exception:
+                        col.append(_np.nan)
+                return col
+
+            # Prefer local K dicts defined in this scope; fall back to globals only if missing
+            try:
+                _K_pv_bess_ref = K_pv_bess
+            except NameError:
+                _K_pv_bess_ref = globals().get('K_pv_bess', {})
+            try:
+                _K_hp_bess_ref = K_hp_bess
+            except NameError:
+                _K_hp_bess_ref = globals().get('K_hp_bess', {})
+            try:
+                _K_pv_pvcurt_ref = K_pv_pvcurt
+            except NameError:
+                _K_pv_pvcurt_ref = globals().get('K_pv_pvcurt', {})
+            try:
+                _K_hp_pvcurt_ref = K_hp_pvcurt
+            except NameError:
+                _K_hp_pvcurt_ref = globals().get('K_hp_pvcurt', {})
+
+            # Store references globally as a convenience for downstream tools (optional)
+            globals()['K_pv_bess'] = _K_pv_bess_ref
+            globals()['K_hp_bess'] = _K_hp_bess_ref
+            globals()['K_pv_pvcurt'] = _K_pv_pvcurt_ref
+            globals()['K_hp_pvcurt'] = _K_hp_pvcurt_ref
+
+            # K gains exist when affine DRCC path is active; otherwise NaN
+            results_df['K_pv_bess'] = _col_from_var_dict(_K_pv_bess_ref)
+            results_df['K_hp_bess'] = _col_from_var_dict(_K_hp_bess_ref)
+            results_df['K_pv_pvcurt'] = _col_from_var_dict(_K_pv_pvcurt_ref)
+            results_df['K_hp_pvcurt'] = _col_from_var_dict(_K_hp_pvcurt_ref)
+
+            # Quick debug: counts of finite K values
+            try:
+                _isfin = _np.isfinite
+                print("[export] K finite counts:",
+                      { 'K_pv_bess': int(_np.sum(_isfin(results_df['K_pv_bess'].to_numpy()))),
+                        'K_hp_bess': int(_np.sum(_isfin(results_df['K_hp_bess'].to_numpy()))),
+                        'K_pv_pvcurt': int(_np.sum(_isfin(results_df['K_pv_pvcurt'].to_numpy()))),
+                        'K_hp_pvcurt': int(_np.sum(_isfin(results_df['K_hp_pvcurt'].to_numpy()))) })
+            except Exception:
+                pass
+
+            # Also export aggregate disturbance scales used in constraints (diagnostic)
+            const_pv_std_arr = globals().get('const_pv_std', _np.zeros(len(time_steps)))
+            base_pv_bus_limits_loc = globals().get('base_pv_bus_limits', {})
+            pv_cap_sum = float(sum(base_pv_bus_limits_loc.get(b, 0.0) for b in base_pv_bus_limits_loc)) if isinstance(base_pv_bus_limits_loc, dict) else 0.0
+            sig_pv_series = []
+            sig_hp_series = []
+            T_amb_std_arr = globals().get('T_amb_std', _np.zeros(len(time_steps)))
+            # HP coefficients for sigma construction (match earlier formulas)
+            Pmax_HP = globals().get('HP_DRCC_PMAX', globals().get('HP_PRED_PMAX', 0.0))
+            bTav_loc = globals().get('HP_DRCC_BTAV', globals().get('HP_COEFF_BTAV', 0.0))
+            bHDD_loc = globals().get('HP_DRCC_BHDD', globals().get('HP_COEFF_BHDD', 0.0))
+            sigma_Tavg_by_day = globals().get('sigma_Tavg_by_day', {})
+            Var_HDD_by_t = globals().get('Var_HDD_by_t', {})
+            hp_resid_norm = float(globals().get('HP_RESIDUAL_SIGMA_NORM', 0.0)) if bool(globals().get('HP_INCLUDE_RESIDUAL', False)) else 0.0
+
+            for idx, t in enumerate(time_steps):
+                # PV std (MW)
+                try:
+                    sig_pv = float(const_pv_std_arr[t]) * pv_cap_sum
+                except Exception:
+                    sig_pv = _np.nan
+                sig_pv_series.append(sig_pv)
+
+                # HP std (MW)
+                try:
+                    dt_local = time_index[t]
+                    sigma_Tavg_d = float(sigma_Tavg_by_day.get(dt_local.date(), 0.0)) if sigma_Tavg_by_day else 0.0
+                    var_HDD_t = float(Var_HDD_by_t.get(t, 0.0)) if Var_HDD_by_t else 0.0
+                    sigma_HP_temp = float(_np.sqrt(max(0.0, (Pmax_HP*bTav_loc*sigma_Tavg_d)**2 + (Pmax_HP*bHDD_loc)**2 * var_HDD_t)))
+                except Exception:
+                    try:
+                        sigma_HP_temp = abs(float(Pmax_HP) * float(bTav_loc)) * float(T_amb_std_arr[t])
+                    except Exception:
+                        sigma_HP_temp = _np.nan
+                try:
+                    sig_hp = float(_np.sqrt(max(0.0, sigma_HP_temp**2 + (float(Pmax_HP) * hp_resid_norm)**2)))
+                except Exception:
+                    sig_hp = _np.nan
+                sig_hp_series.append(sig_hp)
+
+            results_df['sigma_pv_mw'] = sig_pv_series
+            results_df['sigma_hp_mw'] = sig_hp_series
+
+            # Export actuator feasibility diagnostics if available
+            try:
+                s_rec_series = []
+                s_energy_series = []
+                R_energy_series = []
+                s_rec_ref = globals().get('s_bess_rec_vars', {})
+                s_eng_ref = globals().get('s_bess_energy_vars', {})
+                R_cum_ref = globals().get('R_bess_energy_cum_vars', {})
+                for t in time_steps:
+                    s_rec_series.append(_val_from_var(s_rec_ref.get(t, None)))
+                    s_energy_series.append(_val_from_var(s_eng_ref.get(t, None)))
+                    R_energy_series.append(_val_from_var(R_cum_ref.get(t, None)))
+                results_df['s_bess_rec_mw'] = s_rec_series
+                results_df['s_bess_energy_mwh'] = s_energy_series
+                results_df['R_bess_energy_cum_mwh'] = R_energy_series
+            except Exception as _afe_exp:
+                print(f"[export] Actuator feasibility diagnostics export skipped: {_afe_exp}")
+
+            # Export PV availability sum per t (used for scaling in some policies)
+            pv_avail_sum_by_t_loc = globals().get('pv_avail_sum_by_t', {})
+            results_df['pv_avail_sum_mw'] = [float(pv_avail_sum_by_t_loc.get(t, _np.nan)) for t in time_steps]
+
+            # Optional: export affine DRCC transformer sigma (trafo 0) and tightened cap, if present
+            try:
+                s_tr0_series = []
+                w_tr0_series = []
+                for t in time_steps:
+                    s_var = None
+                    w_var = None
+                    try:
+                        s_var = model.getVarByName(f"s_trafo_t{t}_tr0")
+                    except Exception:
+                        s_var = None
+                    try:
+                        w_var = model.getVarByName(f"w_tr_cap_affine_t{t}_tr0")
+                    except Exception:
+                        w_var = None
+                    s_tr0_series.append(_val_from_var(s_var) if s_var is not None else _np.nan)
+                    w_tr0_series.append(_val_from_var(w_var) if w_var is not None else _np.nan)
+                results_df['sigma_tr0_mva'] = s_tr0_series
+                results_df['w_tr0_cap_mva'] = w_tr0_series
+            except Exception as _sdiag_err:
+                print(f"[export] s_tr0 export skipped: {_sdiag_err}")
+
+            # Transformer margin decomposition and alpha logging (trafo 0, per t)
+            # Focus: contributions from HP (P and Q) and PV (P) to the DRCC sigma; plus BESS robust power slack
+            try:
+                # Identify trafo 0 LV-bus downstream set for shares
+                if len(net.trafo.index) > 0:
+                    tr0_lv_bus = int(net.trafo.loc[net.trafo.index[0], 'lv_bus'])
+                else:
+                    tr0_lv_bus = None
+
+                # Precompute downstream set and share sums (constant across t)
+                if tr0_lv_bus is not None:
+                    ds = set(downstream_map[tr0_lv_bus]) | {tr0_lv_bus}
+                    sum_pv_share_ds = float(sum(pv_share_by_bus.get(b, 0.0) for b in ds))
+                    sum_bess_share_ds = float(sum(bess_share_by_bus.get(b, 0.0) for b in ds))
+                    sum_hp_share_ds = float(sum(hp_share_by_bus.get(b, 0.0) for b in ds))
+                else:
+                    ds = set()
+                    sum_pv_share_ds = 0.0
+                    sum_bess_share_ds = 0.0
+                    sum_hp_share_ds = 0.0
+
+                # Pull sigmas already exported
+                sig_pv_arr = results_df['sigma_pv_mw'].to_numpy() if 'sigma_pv_mw' in results_df.columns else _np.array([_np.nan]*len(time_steps))
+                sig_hp_arr = results_df['sigma_hp_mw'].to_numpy() if 'sigma_hp_mw' in results_df.columns else _np.array([_np.nan]*len(time_steps))
+
+                # Gains K per t (NaN-safe)
+                K_pv_bess_arr = results_df['K_pv_bess'].to_numpy() if 'K_pv_bess' in results_df.columns else _np.zeros(len(time_steps))
+                K_hp_bess_arr = results_df['K_hp_bess'].to_numpy() if 'K_hp_bess' in results_df.columns else _np.zeros(len(time_steps))
+                K_pv_pvcurt_arr = results_df['K_pv_pvcurt'].to_numpy() if 'K_pv_pvcurt' in results_df.columns else _np.zeros(len(time_steps))
+                K_hp_pvcurt_arr = results_df['K_hp_pvcurt'].to_numpy() if 'K_hp_pvcurt' in results_df.columns else _np.zeros(len(time_steps))
+
+                # Containers
+                alpha_tr0_pv_P = []
+                alpha_tr0_hp_P = []
+                alpha_tr0_hp_Q = []
+                sigc_tr0_pvP = []
+                sigc_tr0_hpP = []
+                sigc_tr0_hpQ = []
+                sigc_tr0_calc = []
+
+                for idx, t in enumerate(time_steps):
+                    # Build alphas using solved K gains
+                    alpha_pv_P = (sum_pv_share_ds) + (sum_bess_share_ds) * float(K_pv_bess_arr[idx]) - (sum_pv_share_ds) * float(K_pv_pvcurt_arr[idx])
+                    alpha_hp_P = (-sum_hp_share_ds) + (sum_bess_share_ds) * float(K_hp_bess_arr[idx]) - (sum_pv_share_ds) * float(K_hp_pvcurt_arr[idx])
+                    alpha_hp_Q = (-sum_hp_share_ds) * float(qfactor_heatpump)
+
+                    # Sigma components (magnitudes) for trafo SOC: u1=alpha_pv_P*sig_pv, u2=alpha_hp_P*sig_hp, u3=alpha_hp_Q*sig_hp
+                    try:
+                        u1 = float(alpha_pv_P) * float(sig_pv_arr[idx])
+                    except Exception:
+                        u1 = _np.nan
+                    try:
+                        u2 = float(alpha_hp_P) * float(sig_hp_arr[idx])
+                    except Exception:
+                        u2 = _np.nan
+                    try:
+                        u3 = float(alpha_hp_Q) * float(sig_hp_arr[idx])
+                    except Exception:
+                        u3 = _np.nan
+
+                    # Record
+                    alpha_tr0_pv_P.append(float(alpha_pv_P))
+                    alpha_tr0_hp_P.append(float(alpha_hp_P))
+                    alpha_tr0_hp_Q.append(float(alpha_hp_Q))
+                    sigc_tr0_pvP.append(abs(u1) if not _np.isnan(u1) else _np.nan)
+                    sigc_tr0_hpP.append(abs(u2) if not _np.isnan(u2) else _np.nan)
+                    sigc_tr0_hpQ.append(abs(u3) if not _np.isnan(u3) else _np.nan)
+                    try:
+                        sigc_tr0_calc.append(float(_np.sqrt((0.0 if _np.isnan(u1) else u1*u1) + (0.0 if _np.isnan(u2) else u2*u2) + (0.0 if _np.isnan(u3) else u3*u3))))
+                    except Exception:
+                        sigc_tr0_calc.append(_np.nan)
+
+                # Add columns
+                results_df['alpha_tr0_pv_P'] = alpha_tr0_pv_P
+                results_df['alpha_tr0_hp_P'] = alpha_tr0_hp_P
+                results_df['alpha_tr0_hp_Q'] = alpha_tr0_hp_Q
+                results_df['sigma_tr0_comp_pvP_mva'] = sigc_tr0_pvP
+                results_df['sigma_tr0_comp_hpP_mva'] = sigc_tr0_hpP
+                results_df['sigma_tr0_comp_hpQ_mva'] = sigc_tr0_hpQ
+                results_df['sigma_tr0_calc_mva'] = sigc_tr0_calc
+            except Exception as _adecomp_err:
+                print(f"[export] trafo alpha/sigma decomposition skipped: {_adecomp_err}")
+
+            # BESS robust power slack diagnostics: min/mean over BESS buses of (Pmax - |net| - k*s_bess_rec)
+            try:
+                if len(bess_buses) > 0:
+                    k_eps_val = float(k_epsilon) if 'k_epsilon' in locals() and k_epsilon is not None else (float(results_df.get('meta_drcc_k_epsilon', _np.array([_np.nan]))[0]) if 'meta_drcc_k_epsilon' in results_df.columns else _np.nan)
+                    s_rec_ref = globals().get('s_bess_rec_vars', {})
+                    slack_min = []
+                    slack_mean = []
+                    for t in time_steps:
+                        try:
+                            s_rec = _val_from_var(s_rec_ref.get(t, None))
+                        except Exception:
+                            s_rec = _np.nan
+                        per_bus_slacks = []
+                        for bus in bess_buses:
+                            try:
+                                net_var = net_bess_power_vars[t][bus]
+                                net_val = _val_from_var(net_var)
+                                Pmax_bus = float(base_bess_bus_limits.get(bus, 0.0))
+                                slack_val = float(Pmax_bus) - abs(float(net_val)) - float(k_eps_val) * float(s_rec)
+                            except Exception:
+                                slack_val = _np.nan
+                            per_bus_slacks.append(slack_val)
+                        try:
+                            slack_min.append(float(_np.nanmin(_np.array(per_bus_slacks))))
+                        except Exception:
+                            slack_min.append(_np.nan)
+                        try:
+                            slack_mean.append(float(_np.nanmean(_np.array(per_bus_slacks))))
+                        except Exception:
+                            slack_mean.append(_np.nan)
+                    results_df['bess_power_robust_slack_min_mw'] = slack_min
+                    results_df['bess_power_robust_slack_mean_mw'] = slack_mean
+                else:
+                    results_df['bess_power_robust_slack_min_mw'] = [_np.nan for _ in time_steps]
+                    results_df['bess_power_robust_slack_mean_mw'] = [_np.nan for _ in time_steps]
+            except Exception as _bslack_err:
+                print(f"[export] BESS robust slack export skipped: {_bslack_err}")
+
+            # PV curtailment recourse norm (if present): s_pvcurt_rec_t{t}
+            try:
+                s_pvcurt_rec_series = []
+                for t in time_steps:
+                    try:
+                        s_var = model.getVarByName(f"s_pvcurt_rec_t{t}")
+                    except Exception:
+                        s_var = None
+                    s_pvcurt_rec_series.append(_val_from_var(s_var) if s_var is not None else _np.nan)
+                results_df['s_pvcurt_rec_mw'] = s_pvcurt_rec_series
+            except Exception as _pvcurt_err:
+                print(f"[export] s_pvcurt_rec export skipped: {_pvcurt_err}")
+        except Exception as _kexp_err:
+            print(f"WARNING: K/sigma export failed: {_kexp_err}")
         
         # Build DRCC-aware suffix for CSV filename
         try:
@@ -3675,7 +5038,13 @@ def solve_opf(net, time_steps, electricity_price, const_pv, const_load_household
         else:
             suffix = "drcc_false"
 
-        csv_filename = f"dso_model_v2_results_{suffix}.csv"
+        # Append RT identifier based on ENABLE_AFFINE_DRCC_EXACT only
+        try:
+            _rt_tag = "rt_on" if bool(ENABLE_AFFINE_DRCC_EXACT) else "rt_off"
+        except Exception:
+            _rt_tag = "rt_unk"
+
+        csv_filename = f"dso_model_v2_results_{suffix}_{_rt_tag}.csv"
         results_df.to_csv(csv_filename, index=False)
         print(f"\nResults saved to: {csv_filename}")
         

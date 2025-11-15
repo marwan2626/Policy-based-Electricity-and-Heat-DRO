@@ -95,7 +95,7 @@ USE_MEAN_CENTERED_POLICY = True  # <--- EDIT ME (base default to match v3)
 # Set to False to lock the above value regardless of CLI/env.
 ALLOW_RT_FLAG_RUNTIME_OVERRIDE = True
 ENABLE_DRCC_RT_BUDGETS = True  # <--- EDIT ME (uses PV/temperature std to size D+ / D-)
-DRCC_EPSILON = 0.30            # chance violation level; k = sqrt((1-eps)/eps)
+DRCC_EPSILON = 0.10            # chance violation level; k = sqrt((1-eps)/eps)
 
 # DRCC-based network tightening (transformers, lines, voltages)
 ENABLE_DRCC_NETWORK_TIGHTENING = True  # <--- EDIT ME (base default)
@@ -115,7 +115,7 @@ PV_STD_FROM_CSV = True         # try to read pv std from pv_profiles_output.csv
 PV_RELATIVE_STD = 0.20         # fallback relative std of PV availability (fraction of avail)
 PV_STD_CORRELATION = 1.00      # used only if constructing from per-bus stds (not CSV aggregate)
 HP_FULLY_CORRELATED = True     # temperature is common across HPs
-RHO_TEMP_AVG = 0             # 0=independent, 1=fully correlated within day
+RHO_TEMP_AVG = 1             # 0=independent, 1=fully correlated within day
 # Capacity buy-back pricing (EUR per MW-hour of purchased connection reduction)
 # Flexible load curtailment economics (simple formulation):
 # flex_load(t,b) = baseline(t,b) - curt(t,b); y_cap(t) = sum_b curt(t,b)

@@ -1,4 +1,4 @@
-# Out-of-sample analysis for v3 results
+# Out-of-sample analysis for v4 results
 # Builds an overview figure with costs vs epsilon and violation counts vs epsilon.
 
 from __future__ import annotations
@@ -24,15 +24,18 @@ import re
 import math
 
 # === User config ===
-# Distribution toggle: 'gaussian' (default) -> v3_oos; 'uniform' -> v3_oos_uniform; 'contaminated' -> v3_oos_contaminated; 'studentt' -> v3_oos_studentt
-DISTRIBUTION: str = os.getenv('V3_SAMPLE_DISTRIBUTION', 'studentt').strip().lower()
+# Distribution toggle: 'gaussian' (default) -> v4_oos; 'uniform' -> v4_oos_uniform; 'contaminated' -> v4_oos_contaminated; 'studentt' -> v4_oos_studentt
+# Defaulting to 'gaussian' to match dso_model_v4.py's default OUTDIR ('v4_oos')
+DISTRIBUTION: str = os.getenv('V4_SAMPLE_DISTRIBUTION', 'studentt').strip().lower()
+# Enable splitting by RT mode suffix (_rt_on / _rt_off) if present in filenames.
+INCLUDE_RT_SPLIT: bool = True  # set False to ignore RT mode suffixes and aggregate silently
 
 # Editable in-file aggregation toggle (no console needed):
 #   Set ENABLE_AGGREGATE_GAUSSIAN_STUDENTT = True to automatically build a combined dataset
 #   from Gaussian and Student-t results, then run ALL analyses on the combined data.
 #   You can optionally set AGGREGATE_GAUSSIAN_STUDENTT_WEIGHTS = (w_gaussian, w_studentt) for the small
 #   “overview aggregation” figure (full analyses always use concatenated samples for fairness).
-ENABLE_AGGREGATE_GAUSSIAN_STUDENTT: bool = True  # <- set to False to disable combined run
+ENABLE_AGGREGATE_GAUSSIAN_STUDENTT: bool = True  # disable by default to avoid legacy aggregation 'label' KeyError with RT variants
 AGGREGATE_GAUSSIAN_STUDENTT_WEIGHTS: Tuple[float, float] = (0.5, 0.5)  # editable; only affects overview weighted bars
 import sys as _sys
 # New: optional aggregation of two distributions, e.g. --aggregate-dists gaussian,studentt --agg-weights 0.5,0.5
@@ -98,9 +101,9 @@ if '--agg-weights' in _argv:
 if DISTRIBUTION not in {'gaussian', 'uniform', 'contaminated', 'studentt'}:
     DISTRIBUTION = 'gaussian'
 RESULTS_DIR = (
-    "v3_oos_uniform" if DISTRIBUTION == 'uniform' else (
-        "v3_oos_contaminated" if DISTRIBUTION == 'contaminated' else (
-            "v3_oos_studentt" if DISTRIBUTION == 'studentt' else "v3_oos"
+    "v4_oos_uniform" if DISTRIBUTION == 'uniform' else (
+        "v4_oos_contaminated" if DISTRIBUTION == 'contaminated' else (
+            "v4_oos_studentt" if DISTRIBUTION == 'studentt' else "v4_oos"
         )
     )
 )
@@ -108,13 +111,13 @@ print(f"[config] DISTRIBUTION = {DISTRIBUTION} | RESULTS_DIR = {RESULTS_DIR}")
 if AGGREGATE_DISTS is None and not os.path.isdir(RESULTS_DIR):
     raise FileNotFoundError(
         "Results directory '" + RESULTS_DIR + "' not found. "
-        "If you intended to analyze uniform runs, set --dist uniform (or V3_SAMPLE_DISTRIBUTION=uniform) and run v3 in uniform mode first; "
-        "for contaminated, use --dist contaminated and run v3 in contaminated mode; for studentt, use --dist studentt and run v3 in studentt mode."
+        "If you intended to analyze uniform runs, set --dist uniform (or V4_SAMPLE_DISTRIBUTION=uniform) and run v4 in uniform mode first; "
+        "for contaminated, use --dist contaminated and run v4 in contaminated mode; for studentt, use --dist studentt and run v4 in studentt mode."
     )
 # Global Matplotlib style: Times New Roman
 mpl.rcParams['font.family'] = 'Times New Roman'
-# Reduced epsilon set (removed 0.25 and 0.15 per user request)
-EPSILONS: List[float] = [0.30, 0.20, 0.10, 0.05]
+# Epsilon set: replace 0.20 with 0.05 -> show 0.15, 0.10, 0.05 (descending conservatism)
+EPSILONS: List[float] = [0.15, 0.10, 0.05]
 # Include baseline (k=1, no network tightening) summary as an extra category.
 # We now call this 'stochastic' (it still has RT budgets sized by forecast std but no quantile amplification).
 INCLUDE_DETERMINISTIC: bool = True
@@ -124,6 +127,7 @@ OUT_CSV = "oos_overview_summary.csv"
 SHOW: bool = False  # set True to display interactively
 PLOT_SOC_ENVELOPES: bool = True
 SOC_ENV_FIG = "soc_envelopes.png"
+SOC_FINAL_FIG = "soc_final_envelope.png"  # final timestep summary (median with 5–95% error bars)
 FRONTIER_CSV = "frontier_summary.csv"
 PLOT_FRONTIER_SCATTER: bool = True
 FRONTIER_SCATTER_FIG = "frontier_scatter.png"
@@ -140,33 +144,53 @@ TRAFO_VIOLATION_TIME_PROFILE_FIG = "trafo_violation_time_profile.png"
 PLOT_TRAFO_VIOLATION_HEATMAP: bool = True
 TRAFO_VIOLATION_HEATMAP_FIG = "trafo_violation_heatmap.png"
 FRONTIER_HYBRID_SCATTER_FIG = "frontier_hybrid_scatter.png"
-# New: time series of lambda_plus and lambda0 across epsilon cases
-PLOT_POLICY_LAMBDA_TIME_SERIES: bool = True
-POLICY_LAMBDA_TIME_SERIES_FIG = "policy_lambda_time_series.png"
+# New: time series of K-gains across epsilon cases (replacing legacy lambda/chi focus)
+PLOT_POLICY_LAMBDA_TIME_SERIES: bool = False
+POLICY_LAMBDA_TIME_SERIES_FIG = "policy_lambda_time_series.png"  # kept for backward compatibility if re-enabled
+PLOT_POLICY_K_TIME_SERIES: bool = True
+POLICY_K_TIME_SERIES_FIG = "policy_k_time_series.png"
 # New: Tail/zoomed overview figure (additional diagnostics; does not replace existing plots)
 PLOT_TAIL_OVERVIEW: bool = True
 TAIL_OVERVIEW_FIG = "oos_overview_tail.png"
 
-# New: dedicated two-violin comparison (deterministic vs epsilon=0.10)
+# New: dedicated two-violin comparison (deterministic vs epsilon=0.05)
 PLOT_VIOLIN_COMPARE: bool = True
-VIOLIN_COMPARE_FIG = "violin_compare_det_vs_010.png"
+VIOLIN_COMPARE_FIG = "violin_compare_det_vs_005.png"
+PLOT_VIOLIN_EPS_010_RT_COMPARE: bool = True
+VIOLIN_COMPARE_010_RT_FIG = "violin_compare_010_rt_on_vs_off.png"
+PLOT_VIOLIN_ALL_CASES: bool = True  # new: standalone multi-case violin (epsilon × RT variants)
+VIOLIN_ALL_CASES_FIG: str = "violin_all_cases.png"
 VIOLIN_SPLIT_USE_KDE: bool = True
 VIOLIN_SPLIT_KDE_BW_ADJ: float = 2.0  # 1.0 ~ Matplotlib default smoothness; <1 sharper, >1 smoother
 
-# New: deterministic vs ε=0.10 comparison of total transformer overload energy (MVAh)
+# New: deterministic vs ε=0.05 comparison of total transformer overload energy (MVAh)
 PLOT_OVERLOAD_ENERGY_COMPARE: bool = True
-OVERLOAD_ENERGY_COMPARE_FIG = "overload_energy_compare_det_vs_010.png"
-OVERLOAD_ENERGY_COMPARE_CSV = "overload_energy_compare_det_vs_010.csv"
+OVERLOAD_ENERGY_COMPARE_FIG = "overload_energy_compare_det_vs_005.png"
+OVERLOAD_ENERGY_COMPARE_CSV = "overload_energy_compare_det_vs_005.csv"
 # Parameters per user instruction
-OVERLOAD_THRESHOLD_PCT: float = 80.0
+# Effective violation/overload threshold (pct). Allow env override; default to 80.09% to ignore tiny numerical overshoots.
+try:
+    OVERLOAD_THRESHOLD_PCT: float = float(os.getenv('V4_VIOL_THRESHOLD_PCT', '80.09'))
+except Exception:
+    OVERLOAD_THRESHOLD_PCT = 80.09
 RATED_TRAFO_MVA: float = 0.5
 STEP_HOURS: float = 0.25  # 15-minute steps
 OVERLOAD_SAMPLE_COUNT_DEFAULT: int = 1000  # divide by number of samples to get per-sample energy
 
-# New: deterministic vs ε=0.10 comparison of CVaR90 transformer loading (%)
+# New: deterministic vs ε=0.05 comparison of CVaR90 transformer loading (%)
 PLOT_CVAR90_COMPARE: bool = True
-CVAR90_COMPARE_FIG = "cvar90_loading_compare_det_vs_010.png"
-CVAR90_COMPARE_CSV = "cvar90_loading_compare_det_vs_010.csv"
+CVAR90_COMPARE_FIG = "cvar90_loading_compare_det_vs_005.png"
+CVAR90_COMPARE_CSV = "cvar90_loading_compare_det_vs_005.csv"
+
+# New: evening transformer sigma decomposition diagnostic (v2 export)
+PLOT_EVENING_TRAFO_SIGMA_DECOMP: bool = True
+EVENING_TRAFO_SIGMA_DECOMP_FIG: str = "evening_sigma_decomposition.png"
+EVENING_TRAFO_SIGMA_DECOMP_CSV: str = "evening_sigma_decomposition.csv"
+
+# New: BESS clipping vs transformer violations correlation
+PLOT_BESS_CLIPPING_CORRELATION: bool = True
+BESS_CLIP_CORR_FIG: str = "bess_clipping_vs_violations.png"
+BESS_CLIP_SUMMARY_PREFIX: str = "bess_clipping_summary_epsilon_"  # + <token>.csv
 
 # Cost model parameters for OOS components
 PV_CURT_PRICE_FACTOR = 1.0  # EUR per MWh of curtailed PV is factor * price
@@ -175,98 +199,142 @@ BESS_THROUGHPUT_COST_EUR_PER_MWH = 0.0  # cost per MWh of RT BESS throughput (se
 # Shared colormap for heatmaps: white at 0, blue at max
 WHITE_BLUE_CMAP = mcolors.LinearSegmentedColormap.from_list('white_blue', ['#ffffff', '#1f77b4'])
 
+# --- IO helpers: parquet preferred, CSV fallback ---
+def _read_parquet_or_csv(path: str) -> pd.DataFrame | None:
+    """Try reading a parquet table; if unavailable or engine missing, fall back to CSV.
+
+    If 'path' doesn't exist and endswith '.parquet', also try the sibling '.csv'.
+    Returns a DataFrame or None on failure.
+    """
+    try:
+        if os.path.exists(path):
+            # Try parquet first if extension matches
+            if path.lower().endswith('.parquet'):
+                try:
+                    return pd.read_parquet(path)
+                except Exception:
+                    # fall back to csv with same basename
+                    csv_path = path[:-8] + 'csv'
+                    if os.path.exists(csv_path):
+                        try:
+                            return pd.read_csv(csv_path)
+                        except Exception:
+                            return None
+                    return None
+            # If caller passed a CSV directly
+            if path.lower().endswith('.csv'):
+                try:
+                    return pd.read_csv(path)
+                except Exception:
+                    return None
+        # If file not present, attempt CSV sibling when parquet was expected
+        if path.lower().endswith('.parquet'):
+            csv_path = path[:-8] + 'csv'
+            if os.path.exists(csv_path):
+                try:
+                    return pd.read_csv(csv_path)
+                except Exception:
+                    return None
+        return None
+    except Exception:
+        return None
+
 
 def epsilon_token(eps: float) -> str:
     return f"{eps:.2f}".replace(".", "_")
 
+def _extract_rt_tag_from_name(name: str) -> str | None:
+    """Return 'rt_on' / 'rt_off' / 'rt_unk' if present in filename, else None."""
+    for tag in ('rt_on','rt_off','rt_unk'):
+        if f"_{tag}" in name:
+            return tag
+    return None
+
+def _rt_display(tag: str | None) -> str:
+    if tag == 'rt_on':
+        return 'RT ON'
+    if tag == 'rt_off':
+        return 'RT OFF'
+    if tag == 'rt_unk':
+        return 'RT ?'
+    return ''
+
+def find_summary_variant_paths(eps: float, results_dir: str) -> List[Tuple[str, str, str]]:
+    """Strict RT-only locator: returns (rt_tag, summary_path, meta_path) for existing RT-suffixed variants.
+
+    Unsuffixed legacy files are intentionally ignored.
+    """
+    token = epsilon_token(eps)
+    patterns = [
+        f"v4_summary_drcc_true_epsilon_{token}_rt_on.csv",
+        f"v4_summary_drcc_true_epsilon_{token}_rt_off.csv",
+        f"v4_summary_drcc_true_epsilon_{token}_rt_unk.csv",
+    ]
+    out: List[Tuple[str,str,str]] = []
+    for fname in patterns:
+        sp = os.path.join(results_dir, fname)
+        if os.path.exists(sp):
+            rt_tag = _extract_rt_tag_from_name(fname)  # guaranteed by pattern
+            meta_name = f"v4_meta_drcc_true_epsilon_{token}_{rt_tag}.json"
+            mp = os.path.join(results_dir, meta_name)
+            out.append((rt_tag, sp, mp if os.path.exists(mp) else ''))
+    return out
+
+def find_deterministic_variant_paths(results_dir: str) -> List[Tuple[str,str,str]]:
+    patterns = [
+        "v4_summary_drcc_false_rt_on.csv",
+        "v4_summary_drcc_false_rt_off.csv",
+        "v4_summary_drcc_false_rt_unk.csv",
+    ]
+    out: List[Tuple[str,str,str]] = []
+    for fname in patterns:
+        sp = os.path.join(results_dir, fname)
+        if os.path.exists(sp):
+            rt_tag = _extract_rt_tag_from_name(fname)
+            meta_name = f"v4_meta_drcc_false_{rt_tag}.json"
+            mp = os.path.join(results_dir, meta_name)
+            out.append((rt_tag, sp, mp if os.path.exists(mp) else ''))
+    return out
+
 
 def load_summary_for_epsilon(eps: float) -> pd.DataFrame:
     token = epsilon_token(eps)
-    # Preferred new naming (strict): v3_summary_drcc_true_epsilon_<token>.csv
-    preferred = os.path.join(RESULTS_DIR, f"v3_summary_drcc_true_epsilon_{token}.csv")
-    if os.path.exists(preferred):
-        return pd.read_csv(preferred)
-    # Fallback 1: legacy (pre-refactor) name (only use if no new drcc_true file found)
-    legacy = os.path.join(RESULTS_DIR, f"v3_summary_epsilon_{token}.csv")
-    if os.path.exists(legacy):
-        print(f"[WARN] Using legacy summary file for epsilon={eps:.2f}: {os.path.basename(legacy)} (consider re-running to produce drcc_true file)")
-        return pd.read_csv(legacy)
-    # Fallback 2: stray misnamed files (e.g., v3_summary_drcc_false_epsilon_<token>.csv) – ignore unless nothing else
-    stray = os.path.join(RESULTS_DIR, f"v3_summary_drcc_false_epsilon_{token}.csv")
-    if os.path.exists(stray):
-        print(f"[WARN] Falling back to stray drcc_false_epsilon file for epsilon={eps:.2f} (treating as placeholder): {os.path.basename(stray)}")
-        return pd.read_csv(stray)
-    raise FileNotFoundError(f"Missing summary for epsilon={eps:.2f}: expected {os.path.basename(preferred)} (or legacy {os.path.basename(legacy)})")
+    path = os.path.join(RESULTS_DIR, f"v4_summary_drcc_true_epsilon_{token}.csv")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Canonical summary missing for epsilon={eps:.2f}: {os.path.basename(path)}")
+    return pd.read_csv(path)
 
 # Dir-parameterized variants for aggregation mode
 def _load_summary_for_epsilon_in_dir(results_dir: str, eps: float) -> pd.DataFrame:
     token = epsilon_token(eps)
-    preferred = os.path.join(results_dir, f"v3_summary_drcc_true_epsilon_{token}.csv")
-    if os.path.exists(preferred):
-        return pd.read_csv(preferred)
-    legacy = os.path.join(results_dir, f"v3_summary_epsilon_{token}.csv")
-    if os.path.exists(legacy):
-        return pd.read_csv(legacy)
-    stray = os.path.join(results_dir, f"v3_summary_drcc_false_epsilon_{token}.csv")
-    if os.path.exists(stray):
-        return pd.read_csv(stray)
-    raise FileNotFoundError(f"[{results_dir}] Missing summary for epsilon={eps:.2f}")
+    path = os.path.join(results_dir, f"v4_summary_drcc_true_epsilon_{token}.csv")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"[{results_dir}] Missing canonical summary for epsilon={eps:.2f}: {os.path.basename(path)}")
+    return pd.read_csv(path)
 
 
 def load_meta_for_epsilon(eps: float) -> Dict:
     token = epsilon_token(eps)
-    # Preferred
-    preferred = os.path.join(RESULTS_DIR, f"v3_meta_drcc_true_epsilon_{token}.json")
-    if os.path.exists(preferred):
-        try:
-            with open(preferred, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            pass
-    # Legacy fallback
-    legacy = os.path.join(RESULTS_DIR, f"v3_meta_epsilon_{token}.json")
-    if os.path.exists(legacy):
-        try:
-            with open(legacy, 'r', encoding='utf-8') as f:
-                print(f"[WARN] Using legacy meta file for epsilon={eps:.2f}: {os.path.basename(legacy)}")
-                return json.load(f)
-        except Exception:
-            pass
-    # Stray drcc_false_epsilon (should not exist – fallback warning)
-    stray = os.path.join(RESULTS_DIR, f"v3_meta_drcc_false_epsilon_{token}.json")
-    if os.path.exists(stray):
-        try:
-            with open(stray, 'r', encoding='utf-8') as f:
-                print(f"[WARN] Falling back to stray drcc_false meta for epsilon={eps:.2f}: {os.path.basename(stray)}")
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+    path = os.path.join(RESULTS_DIR, f"v4_meta_drcc_true_epsilon_{token}.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
 
 def _load_meta_for_epsilon_in_dir(results_dir: str, eps: float) -> Dict:
     token = epsilon_token(eps)
-    preferred = os.path.join(results_dir, f"v3_meta_drcc_true_epsilon_{token}.json")
-    if os.path.exists(preferred):
-        try:
-            with open(preferred, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    legacy = os.path.join(results_dir, f"v3_meta_epsilon_{token}.json")
-    if os.path.exists(legacy):
-        try:
-            with open(legacy, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    stray = os.path.join(results_dir, f"v3_meta_drcc_false_epsilon_{token}.json")
-    if os.path.exists(stray):
-        try:
-            with open(stray, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    path = os.path.join(results_dir, f"v4_meta_drcc_true_epsilon_{token}.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
 def compute_avg_price_from_v2(meta: Dict) -> float:
@@ -342,6 +410,31 @@ def compute_v2_base_cost(meta: Dict) -> float:
     except Exception:
         return float('nan')
 
+def read_v2_da_total_cost(meta: Dict) -> float:
+    """Read exported scalar DA total cost (electricity + flex curtailment) from v2 results CSV.
+
+    Expects column 'da_total_cost_eur' with identical value each timestep.
+    Returns first non-NaN value if present; else NaN.
+    """
+    try:
+        v2_csv = meta.get('v2_results_csv') if isinstance(meta, dict) else None
+        if not v2_csv:
+            return float('nan')
+        if not os.path.exists(v2_csv):
+            cand = os.path.join(RESULTS_DIR, v2_csv)
+            v2_csv = cand if os.path.exists(cand) else v2_csv
+        if not os.path.exists(v2_csv):
+            return float('nan')
+        df = pd.read_csv(v2_csv, usecols=lambda c: c == 'da_total_cost_eur' or c == 'period')
+        if 'da_total_cost_eur' not in df.columns or df.empty:
+            return float('nan')
+        vals = pd.to_numeric(df['da_total_cost_eur'], errors='coerce').dropna()
+        if vals.empty:
+            return float('nan')
+        return float(vals.iloc[0])
+    except Exception:
+        return float('nan')
+
 
 def aggregate_metrics(df: pd.DataFrame, avg_price_eur_mwh: float) -> Dict[str, float]:
     """Legacy aggregate (kept for compatibility, but plotting now uses direct RT cost columns).
@@ -381,10 +474,10 @@ def aggregate_metrics(df: pd.DataFrame, avg_price_eur_mwh: float) -> Dict[str, f
 def _results_dir_from_dist(name: str) -> str:
     name = name.strip().lower()
     return (
-        "v3_oos" if name == 'gaussian' else (
-            "v3_oos_uniform" if name == 'uniform' else (
-                "v3_oos_contaminated" if name == 'contaminated' else (
-                    "v3_oos_studentt" if name == 'studentt' else name
+        "v4_oos" if name == 'gaussian' else (
+            "v4_oos_uniform" if name == 'uniform' else (
+                "v4_oos_contaminated" if name == 'contaminated' else (
+                    "v4_oos_studentt" if name == 'studentt' else name
                 )
             )
         )
@@ -411,6 +504,8 @@ def _build_bundle_for_dir(results_dir: str) -> Tuple[pd.DataFrame, Dict[str, np.
             except Exception:
                 horizon = np.nan
         da_import_cost_mean = float(df_eps.get('da_energy_cost_eur', pd.Series([0.0])).mean())
+        # Direct DA total cost (electricity + flex curtailment) from v2 CSV (scalar)
+        da_total_cost_eur = read_v2_da_total_cost(meta)
         rt_imb_cost_mean = float(df_eps.get('rt_imbalance_cost_eur', pd.Series([0.0])).mean())
         rt_pv_cost_mean = float(df_eps.get('rt_pv_curtail_cost_eur', pd.Series([0.0])).mean())
         rt_bess_cost_mean = float(df_eps.get('rt_bess_cycle_cost_eur', pd.Series([0.0])).mean())
@@ -429,39 +524,84 @@ def _build_bundle_for_dir(results_dir: str) -> Tuple[pd.DataFrame, Dict[str, np.
             'epsilon': eps if eps is not None else np.nan,
             'label': label,
             'da_import_cost_mean': da_import_cost_mean,
+            'da_total_cost_eur': da_total_cost_eur,
             'rt_imbalance_cost_mean': rt_imb_cost_mean,
             'rt_pv_cost_mean': rt_pv_cost_mean,
             'rt_bess_cost_mean': rt_bess_cost_mean,
             'trafo_steps': trafo_steps,
             'trafo_violation_probability_pct': trafo_violation_probability_pct,
             'horizon_timesteps': horizon,
+            'n_trajectories': n_traj,
             'total_rt_cost_mean': rt_imb_cost_mean + rt_pv_cost_mean + rt_bess_cost_mean,
         }
 
-    # summaries
+    # summaries (RT-variant aware with legacy fallback)
     rows: List[Dict[str, float]] = []
-    # deterministic
-    det_path = os.path.join(results_dir, 'v3_summary_drcc_false.csv')
-    if os.path.exists(det_path):
-        try:
-            det_df = pd.read_csv(det_path)
+    # Deterministic variants
+    try:
+        det_variants = find_deterministic_variant_paths(results_dir)
+    except Exception:
+        det_variants = []
+    if det_variants:
+        for rt_tag, summary_path, meta_path in det_variants:
+            try:
+                det_df = pd.read_csv(summary_path)
+            except Exception:
+                continue
             det_meta = {}
-            det_meta_path = os.path.join(results_dir, 'v3_meta_drcc_false.json')
-            if os.path.exists(det_meta_path):
-                with open(det_meta_path,'r',encoding='utf-8') as f:
-                    det_meta = json.load(f)
-            rows.append(_build_rt_row_local(det_df, det_meta, None, DETERMINISTIC_LABEL))
-        except Exception:
-            pass
-    # epsilons
+            if meta_path and os.path.exists(meta_path):
+                try:
+                    with open(meta_path,'r',encoding='utf-8') as f:
+                        det_meta = json.load(f)
+                except Exception:
+                    det_meta = {}
+            rows.append(_build_rt_row_local(det_df, det_meta, None, f"{DETERMINISTIC_LABEL} ({_rt_display(rt_tag)})"))
+    else:
+        # Legacy unsuffixed deterministic
+        det_path = os.path.join(results_dir, 'v4_summary_drcc_false.csv')
+        if os.path.exists(det_path):
+            try:
+                det_df = pd.read_csv(det_path)
+                det_meta = {}
+                det_meta_path = os.path.join(results_dir, 'v4_meta_drcc_false.json')
+                if os.path.exists(det_meta_path):
+                    with open(det_meta_path,'r',encoding='utf-8') as f:
+                        det_meta = json.load(f)
+                rows.append(_build_rt_row_local(det_df, det_meta, None, DETERMINISTIC_LABEL))
+            except Exception:
+                pass
+    # DRCC epsilon variants
     for e in EPSILONS:
         try:
-            df_e = _load_summary_for_epsilon_in_dir(results_dir, e)
+            var_paths = find_summary_variant_paths(e, results_dir)
         except Exception:
-            continue
-        meta_e = _load_meta_for_epsilon_in_dir(results_dir, e)
-        rows.append(_build_rt_row_local(df_e, meta_e, e, f"{e:.2f}"))
+            var_paths = []
+        if var_paths:
+            for rt_tag, summary_path, meta_path in var_paths:
+                try:
+                    df_e = pd.read_csv(summary_path)
+                except Exception:
+                    continue
+                meta_e = {}
+                if meta_path and os.path.exists(meta_path):
+                    try:
+                        with open(meta_path,'r',encoding='utf-8') as f:
+                            meta_e = json.load(f)
+                    except Exception:
+                        meta_e = {}
+                rows.append(_build_rt_row_local(df_e, meta_e, e, f"{e:.2f} ({_rt_display(rt_tag)})"))
+        else:
+            # Legacy unsuffixed per-epsilon
+            try:
+                df_e = _load_summary_for_epsilon_in_dir(results_dir, e)
+            except Exception:
+                df_e = None
+            if df_e is not None:
+                meta_e = _load_meta_for_epsilon_in_dir(results_dir, e)
+                rows.append(_build_rt_row_local(df_e, meta_e, e, f"{e:.2f}"))
     rt_df = pd.DataFrame(rows)
+    if 'label' not in rt_df.columns:
+        rt_df = pd.DataFrame({'label': []})
 
     # distributions
     def _load_flat_distribution_from_meta(meta: Dict) -> np.ndarray:
@@ -475,8 +615,10 @@ def _build_bundle_for_dir(results_dir: str) -> Tuple[pd.DataFrame, Dict[str, np.
             else:
                 return np.array([])
         try:
-            pdf = pd.read_parquet(pq)
+            pdf = _read_parquet_or_csv(pq)
         except Exception:
+            pdf = None
+        if pdf is None:
             return np.array([])
         must = {'sample_id','t','trafo_index','loading_pct'}
         if not must <= set(pdf.columns):
@@ -486,19 +628,48 @@ def _build_bundle_for_dir(results_dir: str) -> Tuple[pd.DataFrame, Dict[str, np.
         return arr[np.isfinite(arr)]
 
     dist_map: Dict[str, np.ndarray] = {}
-    # det
-    det_meta_p = os.path.join(results_dir, 'v3_meta_drcc_false.json')
-    if os.path.exists(det_meta_p):
-        try:
-            with open(det_meta_p,'r',encoding='utf-8') as f:
-                m = json.load(f)
-            dist_map[DETERMINISTIC_LABEL] = _load_flat_distribution_from_meta(m)
-        except Exception:
-            pass
+    # Deterministic distributions
+    if 'det_variants' in locals() and det_variants:
+        for rt_tag, _sp, mp in det_variants:
+            dmeta = {}
+            if mp and os.path.exists(mp):
+                try:
+                    with open(mp,'r',encoding='utf-8') as f:
+                        dmeta = json.load(f)
+                except Exception:
+                    dmeta = {}
+            lab = f"{DETERMINISTIC_LABEL} ({_rt_display(rt_tag)})"
+            dist_map[lab] = _load_flat_distribution_from_meta(dmeta)
+    else:
+        det_meta_p = os.path.join(results_dir, 'v4_meta_drcc_false.json')
+        if os.path.exists(det_meta_p):
+            try:
+                with open(det_meta_p,'r',encoding='utf-8') as f:
+                    m = json.load(f)
+                dist_map[DETERMINISTIC_LABEL] = _load_flat_distribution_from_meta(m)
+            except Exception:
+                pass
+    # Epsilon distributions
     for e in EPSILONS:
-        m = _load_meta_for_epsilon_in_dir(results_dir, e)
-        lab = f"{e:.2f}"
-        dist_map[lab] = _load_flat_distribution_from_meta(m)
+        try:
+            var_paths = find_summary_variant_paths(e, results_dir)
+        except Exception:
+            var_paths = []
+        if var_paths:
+            for rt_tag, _sp, mp in var_paths:
+                m = {}
+                if mp and os.path.exists(mp):
+                    try:
+                        with open(mp,'r',encoding='utf-8') as f:
+                            m = json.load(f)
+                    except Exception:
+                        m = {}
+                lab = f"{e:.2f} ({_rt_display(rt_tag)})"
+                dist_map[lab] = _load_flat_distribution_from_meta(m)
+        else:
+            m = _load_meta_for_epsilon_in_dir(results_dir, e)
+            lab = f"{e:.2f}"
+            dist_map[lab] = _load_flat_distribution_from_meta(m)
 
     return rt_df, dist_map
 
@@ -514,7 +685,7 @@ def _run_dual_aggregation(dist_a: str, dist_b: str, weights: Tuple[float,float] 
     if not os.path.isdir(a_dir) or not os.path.isdir(b_dir):
         raise SystemExit(f"Required result directories not found: '{a_dir}' or '{b_dir}'.")
     w = weights if weights is not None else (0.5, 0.5)
-    out_dir = f"v3_oos_agg_{dist_a}_{dist_b}"
+    out_dir = f"v4_oos_agg_{dist_a}_{dist_b}"
     try:
         os.makedirs(out_dir, exist_ok=True)
     except Exception:
@@ -523,8 +694,26 @@ def _run_dual_aggregation(dist_a: str, dist_b: str, weights: Tuple[float,float] 
 
     a_sum, a_dist = _build_bundle_for_dir(a_dir)
     b_sum, b_dist = _build_bundle_for_dir(b_dir)
-    # unify labels
-    labels = sorted(set(a_sum['label']).union(set(b_sum['label'])), key=lambda s: (0 if s==DETERMINISTIC_LABEL else 1, s))
+    # unify labels with RT-aware sorting
+    def _base_from_label(lbl: str) -> Tuple[int, float]:
+        try:
+            if isinstance(lbl, str) and lbl.startswith(DETERMINISTIC_LABEL):
+                return (0, 0.0)
+            part = str(lbl).split()[0]
+            return (1, float(part))
+        except Exception:
+            return (2, 0.0)
+    def _rt_rank(lbl: str) -> int:
+        s = str(lbl)
+        if '(RT ON' in s:
+            return 0
+        if '(RT OFF' in s:
+            return 1
+        if '(RT ?' in s or '(RT UNK' in s:
+            return 2
+        return 3
+    labels = sorted(set(a_sum['label'] if 'label' in a_sum.columns else []).union(set(b_sum['label'] if 'label' in b_sum.columns else [])),
+                    key=lambda s: (_base_from_label(s)[0], _base_from_label(s)[1], _rt_rank(s), str(s)))
     rows = []
     for lab in labels:
         a_row = a_sum[a_sum['label']==lab].iloc[0] if (lab in set(a_sum['label'])) else None
@@ -541,30 +730,61 @@ def _run_dual_aggregation(dist_a: str, dist_b: str, weights: Tuple[float,float] 
             if np.isfinite(va) and np.isfinite(vb):
                 return w[0]*va + w[1]*vb
             return va if np.isfinite(va) else (vb if np.isfinite(vb) else np.nan)
+        # Count-weighted mean using number of trajectories
+        def _cwmean(col):
+            va = _get(a_row, col) if a_row is not None else np.nan
+            vb = _get(b_row, col) if b_row is not None else np.nan
+            na = _get(a_row, 'n_trajectories') if a_row is not None else np.nan
+            nb = _get(b_row, 'n_trajectories') if b_row is not None else np.nan
+            na = na if np.isfinite(na) and na > 0 else 0.0
+            nb = nb if np.isfinite(nb) and nb > 0 else 0.0
+            if na + nb <= 0:
+                return np.nan
+            sa = (va * na) if np.isfinite(va) else 0.0
+            sb = (vb * nb) if np.isfinite(vb) else 0.0
+            return (sa + sb) / (na + nb)
         # epsilon value if available
         eps_val = None
         try:
             eps_val = float(lab) if lab != DETERMINISTIC_LABEL else None
         except Exception:
             eps_val = None
+        # Count-based aggregation for transformer violation steps and probability
+        a_steps = _get(a_row, 'trafo_steps') if a_row is not None else 0.0
+        b_steps = _get(b_row, 'trafo_steps') if b_row is not None else 0.0
+        steps_total = 0.0
+        if np.isfinite(a_steps):
+            steps_total += a_steps
+        if np.isfinite(b_steps):
+            steps_total += b_steps
+        a_h = _get(a_row, 'horizon_timesteps') if a_row is not None else np.nan
+        b_h = _get(b_row, 'horizon_timesteps') if b_row is not None else np.nan
+        a_n = _get(a_row, 'n_trajectories') if a_row is not None else np.nan
+        b_n = _get(b_row, 'n_trajectories') if b_row is not None else np.nan
+        denom = 0.0
+        if np.isfinite(a_h) and np.isfinite(a_n) and a_h > 0 and a_n > 0:
+            denom += a_h * a_n
+        if np.isfinite(b_h) and np.isfinite(b_n) and b_h > 0 and b_n > 0:
+            denom += b_h * b_n
+        agg_prob_pct = (steps_total / denom * 100.0) if denom > 0 else np.nan
         rows.append({
             'label': lab,
             'epsilon': eps_val,
-            'rt_imbalance_cost_mean': _wavg('rt_imbalance_cost_mean'),
-            'total_rt_cost_mean': _wavg('total_rt_cost_mean'),
-            'trafo_steps': _wavg('trafo_steps'),
-            'trafo_violation_probability_pct': _wavg('trafo_violation_probability_pct')
+            'rt_imbalance_cost_mean': _cwmean('rt_imbalance_cost_mean'),
+            'total_rt_cost_mean': _cwmean('total_rt_cost_mean'),
+            'trafo_steps': steps_total,
+            'trafo_violation_probability_pct': agg_prob_pct
         })
     agg_df = pd.DataFrame(rows)
     agg_csv = os.path.join(out_dir, 'agg_summary.csv')
     agg_df.to_csv(agg_csv, index=False)
     print(f"✓ Aggregated summary CSV: {agg_csv}")
 
-    # Build compact 3-panel plot: (1) RT imbalance cost (2) Trafo steps (3) Violin of loading per case (mixture)
+    # Build compact 3-panel plot: (1) Total RT cost (PCC deviation + recourse) (2) Trafo steps (3) Violin of loading per case (mixture)
     fig, axes = plt.subplots(1, 3, figsize=(22, 4.5), constrained_layout=True)
     x = np.arange(len(labels))
 
-    # 1) RT imbalance bars (show A, B, and weighted)
+    # 1) Total RT cost bars (show A, B, and weighted)
     def _values_for(col: str, df: pd.DataFrame):
         vals = []
         for lab in labels:
@@ -573,27 +793,42 @@ def _run_dual_aggregation(dist_a: str, dist_b: str, weights: Tuple[float,float] 
         return np.array(vals)
     # augment a_sum/b_sum to ensure necessary columns
     for df in (a_sum, b_sum):
-        for c in ['rt_imbalance_cost_mean','total_rt_cost_mean','trafo_steps','trafo_violation_probability_pct']:
+        for c in ['total_rt_cost_mean','rt_imbalance_cost_mean','rt_pv_cost_mean','rt_bess_cost_mean','trafo_steps','trafo_violation_probability_pct','n_trajectories','horizon_timesteps']:
             if c not in df.columns:
                 df[c] = np.nan
-    a_vals = _values_for('rt_imbalance_cost_mean', a_sum)
-    b_vals = _values_for('rt_imbalance_cost_mean', b_sum)
-    agg_vals = w[0]*np.nan_to_num(a_vals, nan=0.0) + w[1]*np.nan_to_num(b_vals, nan=0.0)
+    # Use count-weighted aggregated total RT cost (imbalance + pv + bess)
+    a_vals = _values_for('total_rt_cost_mean', a_sum)
+    b_vals = _values_for('total_rt_cost_mean', b_sum)
+    # Build count arrays per label
+    a_counts = _values_for('n_trajectories', a_sum)
+    b_counts = _values_for('n_trajectories', b_sum)
+    agg_vals = np.empty_like(a_vals)
+    for i in range(len(labels)):
+        va = a_vals[i] if np.isfinite(a_vals[i]) else np.nan
+        vb = b_vals[i] if np.isfinite(b_vals[i]) else np.nan
+        na = a_counts[i] if np.isfinite(a_counts[i]) and a_counts[i] > 0 else 0.0
+        nb = b_counts[i] if np.isfinite(b_counts[i]) and b_counts[i] > 0 else 0.0
+        if na + nb <= 0:
+            agg_vals[i] = np.nan
+        else:
+            sa = va * na if np.isfinite(va) else 0.0
+            sb = vb * nb if np.isfinite(vb) else 0.0
+            agg_vals[i] = (sa + sb) / (na + nb)
     width = 0.25
     axes[0].bar(x - width, a_vals, width=width, color='#1f77b4', label=dist_a)
-    axes[0].bar(x, agg_vals, width=width, color='#636363', label='aggregated')
+    axes[0].bar(x, agg_vals, width=width, color='#636363', label='combined')
     axes[0].bar(x + width, b_vals, width=width, color='#ff7f0e', label=dist_b)
     axes[0].set_xticks(x)
     axes[0].set_xticklabels([('deterministic' if lab==DETERMINISTIC_LABEL else f"DRCC, ε={lab}") for lab in labels])
     axes[0].set_ylabel('EUR (mean across samples)')
-    axes[0].set_title('RT imbalance cost (mean)')
+    axes[0].set_title('Total RT cost (mean)')
     axes[0].grid(axis='y', alpha=0.3)
     axes[0].legend(fontsize=8, frameon=False)
 
     # 2) Trafo steps
     a_steps = _values_for('trafo_steps', a_sum)
     b_steps = _values_for('trafo_steps', b_sum)
-    agg_steps = w[0]*np.nan_to_num(a_steps, nan=0.0) + w[1]*np.nan_to_num(b_steps, nan=0.0)
+    agg_steps = np.nan_to_num(a_steps, nan=0.0) + np.nan_to_num(b_steps, nan=0.0)
     axes[1].bar(x - width, a_steps, width=width, color='#1f77b4', label=dist_a)
     axes[1].bar(x, agg_steps, width=width, color='#636363', label='aggregated')
     axes[1].bar(x + width, b_steps, width=width, color='#ff7f0e', label=dist_b)
@@ -681,27 +916,81 @@ def _run_dual_aggregation(dist_a: str, dist_b: str, weights: Tuple[float,float] 
             # if rel is different between metas, try both absolute constructions
             return a if os.path.exists(a) else (b if os.path.exists(b) else (rel if os.path.exists(rel) else None))
 
-        paths = []
-        for m in (a_meta, b_meta):
-            p = None
-            if isinstance(m, dict) and 'trafo_loading_file' in m:
-                rel = m['trafo_loading_file']
-                cand = os.path.join(a_dir, rel)
-                if os.path.exists(cand):
-                    p = cand
-                else:
-                    cand2 = os.path.join(b_dir, rel)
-                    if os.path.exists(cand2):
-                        p = cand2
-                    elif os.path.exists(rel):
-                        p = rel
-            if p and os.path.exists(p):
-                paths.append(p)
-        if not paths:
+        # Resolve candidate parquet paths for A and B separately
+        p_a = None
+        p_b = None
+        if isinstance(a_meta, dict) and 'trafo_loading_file' in a_meta:
+            rel_a = a_meta['trafo_loading_file']
+            cand = os.path.join(a_dir, rel_a)
+            if os.path.exists(cand):
+                p_a = cand
+            elif os.path.exists(rel_a):
+                p_a = rel_a
+        if isinstance(b_meta, dict) and 'trafo_loading_file' in b_meta:
+            rel_b = b_meta['trafo_loading_file']
+            cand = os.path.join(b_dir, rel_b)
+            if os.path.exists(cand):
+                p_b = cand
+            elif os.path.exists(rel_b):
+                p_b = rel_b
+        if not p_a and not p_b:
             return False
         try:
-            dfs = [pd.read_parquet(p) for p in paths]
-            pdf = pd.concat(dfs, ignore_index=True)
+            df_a = _read_parquet_or_csv(p_a) if p_a else None
+            df_b = _read_parquet_or_csv(p_b) if p_b else None
+            if df_a is None and df_b is None:
+                return False
+            # Ensure required columns exist; otherwise drop that source
+            must = {'sample_id','t','trafo_index','loading_pct'}
+            if df_a is not None and not must <= set(df_a.columns):
+                df_a = None
+            if df_b is not None and not must <= set(df_b.columns):
+                df_b = None
+            if df_a is None and df_b is None:
+                return False
+            # Normalize dtypes carefully, preserving distinct sample identities
+            def _normalize_and_encode_samples(df: pd.DataFrame) -> pd.DataFrame:
+                df = df.copy()
+                # loading and indices
+                df['t'] = pd.to_numeric(df['t'], errors='coerce')
+                df['trafo_index'] = pd.to_numeric(df['trafo_index'], errors='coerce')
+                df['loading_pct'] = pd.to_numeric(df['loading_pct'], errors='coerce')
+                # sample id: prefer numeric if fully numeric; else factorize to unique ints
+                sid_raw = df['sample_id']
+                sid_num = pd.to_numeric(sid_raw, errors='coerce')
+                if sid_num.isna().any():
+                    # mixed or non-numeric -> factorize on string form
+                    sid_codes, _ = pd.factorize(sid_raw.astype(str), sort=False)
+                    df['sample_id'] = sid_codes.astype(int)
+                else:
+                    df['sample_id'] = sid_num.astype(int)
+                # finalize index columns as ints
+                df['t'] = df['t'].fillna(-1).astype(int)
+                df['trafo_index'] = df['trafo_index'].fillna(-1).astype(int)
+                df['loading_pct'] = df['loading_pct'].astype(float)
+                return df
+
+            if df_a is not None:
+                df_a = _normalize_and_encode_samples(df_a)
+            if df_b is not None:
+                df_b = _normalize_and_encode_samples(df_b)
+
+            # Make sample_id unique across A and B by offsetting df_b codes
+            if df_a is not None and df_b is not None:
+                try:
+                    max_id = pd.to_numeric(df_a['sample_id'], errors='coerce').dropna().astype(int).max()
+                    offset = int(max_id) + 1 if np.isfinite(max_id) else 0
+                except Exception:
+                    offset = 0
+                df_b = df_b.copy()
+                try:
+                    df_b['sample_id'] = pd.to_numeric(df_b['sample_id'], errors='coerce').fillna(0).astype(int) + int(offset)
+                except Exception:
+                    # As a last resort, factorize again with a global offset via row index
+                    df_b['sample_id'] = (pd.factorize(df_b.index, sort=False)[0] + int(offset)).astype(int)
+                pdf = pd.concat([df_a, df_b], ignore_index=True)
+            else:
+                pdf = df_a if df_a is not None else df_b
             out_abs = os.path.join(out_dir, out_rel.replace('/', os.sep))
             os.makedirs(os.path.dirname(out_abs), exist_ok=True)
             pdf.to_parquet(out_abs, index=False)
@@ -711,13 +1000,19 @@ def _run_dual_aggregation(dist_a: str, dist_b: str, weights: Tuple[float,float] 
             return False
 
     # Baseline: summaries and meta/parquet
-    det_a_sum = os.path.join(a_dir, 'v3_summary_drcc_false.csv')
-    det_b_sum = os.path.join(b_dir, 'v3_summary_drcc_false.csv')
-    det_out_sum = os.path.join(out_dir, 'v3_summary_drcc_false.csv')
+    det_a_sum = os.path.join(a_dir, 'v4_summary_drcc_false.csv')
+    det_b_sum = os.path.join(b_dir, 'v4_summary_drcc_false.csv')
+    det_out_sum = os.path.join(out_dir, 'v4_summary_drcc_false.csv')
     _combine_summary(det_a_sum, det_b_sum, det_out_sum)
+    # RT-suffixed deterministic summaries
+    for tag in ('rt_on','rt_off','rt_unk'):
+        a_p = os.path.join(a_dir, f'v4_summary_drcc_false_{tag}.csv')
+        b_p = os.path.join(b_dir, f'v4_summary_drcc_false_{tag}.csv')
+        out_p = os.path.join(out_dir, f'v4_summary_drcc_false_{tag}.csv')
+        _combine_summary(a_p, b_p, out_p)
     # meta
-    det_a_meta_p = os.path.join(a_dir, 'v3_meta_drcc_false.json')
-    det_b_meta_p = os.path.join(b_dir, 'v3_meta_drcc_false.json')
+    det_a_meta_p = os.path.join(a_dir, 'v4_meta_drcc_false.json')
+    det_b_meta_p = os.path.join(b_dir, 'v4_meta_drcc_false.json')
     det_meta_a = {}
     det_meta_b = {}
     if os.path.exists(det_a_meta_p):
@@ -732,26 +1027,18 @@ def _run_dual_aggregation(dist_a: str, dist_b: str, weights: Tuple[float,float] 
                 det_meta_b = json.load(f)
         except Exception:
             pass
-    det_parquet_rel = 'v3_loading/trafo_loading_raw_drcc_false_combined.parquet'
+    det_parquet_rel = 'v4_loading/trafo_loading_raw_drcc_false_combined.parquet'
     if _combine_parquet_from_meta(det_meta_a, det_meta_b, det_parquet_rel):
         # choose a base meta and update parquet ref
         det_meta_out = det_meta_b if det_meta_b else det_meta_a
         if isinstance(det_meta_out, dict):
             det_meta_out['trafo_loading_file'] = det_parquet_rel.replace('\\', '/')
-            with open(os.path.join(out_dir,'v3_meta_drcc_false.json'),'w',encoding='utf-8') as f:
+            with open(os.path.join(out_dir,'v4_meta_drcc_false.json'),'w',encoding='utf-8') as f:
                 json.dump(det_meta_out, f, indent=2)
-
-    # DRCC epsilons
-    for e in EPSILONS:
-        tok = epsilon_token(e)
-        # summaries
-        a_sum_p = os.path.join(a_dir, f'v3_summary_drcc_true_epsilon_{tok}.csv')
-        b_sum_p = os.path.join(b_dir, f'v3_summary_drcc_true_epsilon_{tok}.csv')
-        out_sum_p = os.path.join(out_dir, f'v3_summary_drcc_true_epsilon_{tok}.csv')
-        _combine_summary(a_sum_p, b_sum_p, out_sum_p)
-        # metas
-        a_meta_p = os.path.join(a_dir, f'v3_meta_drcc_true_epsilon_{tok}.json')
-        b_meta_p = os.path.join(b_dir, f'v3_meta_drcc_true_epsilon_{tok}.json')
+    # RT-suffixed deterministic metas/parquets
+    for tag in ('rt_on','rt_off','rt_unk'):
+        a_meta_p = os.path.join(a_dir, f'v4_meta_drcc_false_{tag}.json')
+        b_meta_p = os.path.join(b_dir, f'v4_meta_drcc_false_{tag}.json')
         a_meta = {}
         b_meta = {}
         if os.path.exists(a_meta_p):
@@ -766,13 +1053,73 @@ def _run_dual_aggregation(dist_a: str, dist_b: str, weights: Tuple[float,float] 
                     b_meta = json.load(f)
             except Exception:
                 b_meta = {}
-        pq_rel = f'v3_loading/trafo_loading_raw_epsilon_{tok}_combined.parquet'
+        pq_rel = f'v4_loading/trafo_loading_raw_drcc_false_{tag}_combined.parquet'
         if _combine_parquet_from_meta(a_meta, b_meta, pq_rel):
             meta_out = b_meta if b_meta else a_meta
             if isinstance(meta_out, dict):
                 meta_out['trafo_loading_file'] = pq_rel.replace('\\', '/')
-                with open(os.path.join(out_dir, f'v3_meta_drcc_true_epsilon_{tok}.json'),'w',encoding='utf-8') as f:
+                with open(os.path.join(out_dir, f'v4_meta_drcc_false_{tag}.json'),'w',encoding='utf-8') as f:
                     json.dump(meta_out, f, indent=2)
+
+    # DRCC epsilons
+    for e in EPSILONS:
+        tok = epsilon_token(e)
+        # unsuffixed (legacy)
+        a_sum_p = os.path.join(a_dir, f'v4_summary_drcc_true_epsilon_{tok}.csv')
+        b_sum_p = os.path.join(b_dir, f'v4_summary_drcc_true_epsilon_{tok}.csv')
+        out_sum_p = os.path.join(out_dir, f'v4_summary_drcc_true_epsilon_{tok}.csv')
+        _combine_summary(a_sum_p, b_sum_p, out_sum_p)
+        a_meta_p = os.path.join(a_dir, f'v4_meta_drcc_true_epsilon_{tok}.json')
+        b_meta_p = os.path.join(b_dir, f'v4_meta_drcc_true_epsilon_{tok}.json')
+        a_meta = {}
+        b_meta = {}
+        if os.path.exists(a_meta_p):
+            try:
+                with open(a_meta_p,'r',encoding='utf-8') as f:
+                    a_meta = json.load(f)
+            except Exception:
+                a_meta = {}
+        if os.path.exists(b_meta_p):
+            try:
+                with open(b_meta_p,'r',encoding='utf-8') as f:
+                    b_meta = json.load(f)
+            except Exception:
+                b_meta = {}
+        pq_rel = f'v4_loading/trafo_loading_raw_epsilon_{tok}_combined.parquet'
+        if _combine_parquet_from_meta(a_meta, b_meta, pq_rel):
+            meta_out = b_meta if b_meta else a_meta
+            if isinstance(meta_out, dict):
+                meta_out['trafo_loading_file'] = pq_rel.replace('\\', '/')
+                with open(os.path.join(out_dir, f'v4_meta_drcc_true_epsilon_{tok}.json'),'w',encoding='utf-8') as f:
+                    json.dump(meta_out, f, indent=2)
+        # RT-suffixed variants
+        for tag in ('rt_on','rt_off','rt_unk'):
+            a_sum_v = os.path.join(a_dir, f'v4_summary_drcc_true_epsilon_{tok}_{tag}.csv')
+            b_sum_v = os.path.join(b_dir, f'v4_summary_drcc_true_epsilon_{tok}_{tag}.csv')
+            out_sum_v = os.path.join(out_dir, f'v4_summary_drcc_true_epsilon_{tok}_{tag}.csv')
+            _combine_summary(a_sum_v, b_sum_v, out_sum_v)
+            a_meta_v = os.path.join(a_dir, f'v4_meta_drcc_true_epsilon_{tok}_{tag}.json')
+            b_meta_v = os.path.join(b_dir, f'v4_meta_drcc_true_epsilon_{tok}_{tag}.json')
+            ma = {}; mb = {}
+            if os.path.exists(a_meta_v):
+                try:
+                    with open(a_meta_v,'r',encoding='utf-8') as f:
+                        ma = json.load(f)
+                except Exception:
+                    ma = {}
+            if os.path.exists(b_meta_v):
+                try:
+                    with open(b_meta_v,'r',encoding='utf-8') as f:
+                        mb = json.load(f)
+                except Exception:
+                    mb = {}
+            pq_rel_v = f'v4_loading/trafo_loading_raw_epsilon_{tok}_{tag}_combined.parquet'
+            if _combine_parquet_from_meta(ma, mb, pq_rel_v):
+                m_out = mb if mb else ma
+                if isinstance(m_out, dict):
+                    m_out['trafo_loading_file'] = pq_rel_v.replace('\\', '/')
+                    with open(os.path.join(out_dir, f'v4_meta_drcc_true_epsilon_{tok}_{tag}.json'),'w',encoding='utf-8') as f:
+                        json.dump(m_out, f, indent=2)
 
     # Copy policy coeffs and SoC envelopes from whichever exists (prefer dist_b then dist_a)
     def _copy_if_exists(rel_name: str):
@@ -836,6 +1183,7 @@ def main() -> None:
             except Exception:
                 pass
         da_import_cost_mean = float(df_eps.get('da_energy_cost_eur', pd.Series([0.0])).mean())
+        da_total_cost_eur = read_v2_da_total_cost(meta)
         rt_imb_cost_mean = float(df_eps.get('rt_imbalance_cost_eur', pd.Series([0.0])).mean())
         rt_pv_cost_mean = float(df_eps.get('rt_pv_curtail_cost_eur', pd.Series([0.0])).mean())
         rt_bess_cost_mean = float(df_eps.get('rt_bess_cycle_cost_eur', pd.Series([0.0])).mean())
@@ -860,6 +1208,7 @@ def main() -> None:
             'epsilon': eps if eps is not None else np.nan,
             'label': label,
             'da_import_cost_mean': da_import_cost_mean,
+            'da_total_cost_eur': da_total_cost_eur,
             'rt_imbalance_cost_mean': rt_imb_cost_mean,
             'rt_pv_cost_mean': rt_pv_cost_mean,
             'rt_bess_cost_mean': rt_bess_cost_mean,
@@ -868,7 +1217,8 @@ def main() -> None:
             'trafo_violation_probability_pct': trafo_violation_probability_pct,
             'horizon_timesteps': horizon,
             'total_rt_cost_mean': rt_imb_cost_mean + rt_pv_cost_mean + rt_bess_cost_mean,
-            'is_deterministic': int(eps is None)
+            'is_deterministic': int(eps is None),
+            'n_trajectories': n_traj
         }
 
     rt_rows: List[Dict[str, float]] = []
@@ -881,7 +1231,7 @@ def main() -> None:
         try:
             # If label parses as a float, it's an epsilon string like '0.10'
             float(lab)
-            return f"DRCC, ε = {lab}"
+            return f"DRCC, ε = {float(lab):.2f}"
         except Exception:
             # 'deterministic' or other non-epsilon labels pass through
             return lab
@@ -900,7 +1250,7 @@ def main() -> None:
         """Load transformer loading parquet (if present) and compute CVaR90/95 of max loading across trafos/time.
 
         Assumptions:
-          - meta['trafo_loading_file'] is a relative path (e.g., 'v3_loading\\trafo_loading_raw_epsilon_0_05.parquet')
+          - meta['trafo_loading_file'] is a relative path (e.g., 'v4_loading\\trafo_loading_raw_epsilon_0_05.parquet')
           - Parquet contains columns either like 'loading_pct' per record or per-trafo columns.
         Strategy:
           1. Read parquet to DataFrame (if engine available).
@@ -909,7 +1259,7 @@ def main() -> None:
           4. Compute CVaR90 & CVaR95 over that array.
         """
         rel_path = meta.get('trafo_loading_file')
-        base_dir = RESULTS_DIR  # parquets appear inside RESULTS_DIR/v3_loading
+        base_dir = RESULTS_DIR  # parquets appear inside RESULTS_DIR/v4_loading
         if not rel_path:
             return {"cvar90": float('nan'), "cvar95": float('nan'), "sev_cvar90": float('nan'), "sev_cvar95": float('nan')}
         abs_path = os.path.join(base_dir, rel_path.replace('/', os.sep))
@@ -920,8 +1270,10 @@ def main() -> None:
             else:
                 return {"cvar90": float('nan'), "cvar95": float('nan'), "sev_cvar90": float('nan'), "sev_cvar95": float('nan')}
         try:
-            df_load = pd.read_parquet(abs_path)
+            df_load = _read_parquet_or_csv(abs_path)
         except Exception:
+            df_load = None
+        if df_load is None:
             return {"cvar90": float('nan'), "cvar95": float('nan'), "sev_cvar90": float('nan'), "sev_cvar95": float('nan')}
         # Identify loading columns
         cand_cols = [c for c in df_load.columns if 'load' in c.lower() and ('pct' in c.lower() or 'percent' in c.lower())]
@@ -942,53 +1294,86 @@ def main() -> None:
         sev_cvar90 = cvar(excess[excess > 0], 0.90) if np.any(excess > 0) else float('nan')
         sev_cvar95 = cvar(excess[excess > 0], 0.95) if np.any(excess > 0) else float('nan')
         return {"cvar90": raw_cvar90, "cvar95": raw_cvar95, "sev_cvar90": sev_cvar90, "sev_cvar95": sev_cvar95}
+    meta_map: Dict[str, Dict] = {}
     for eps in EPSILONS:
-        try:
-            df_eps = load_summary_for_epsilon(eps)
-        except FileNotFoundError:
+        variant_paths = find_summary_variant_paths(eps, RESULTS_DIR) if INCLUDE_RT_SPLIT else []
+        if not variant_paths:
+            # Strict mode: skip epsilon if no RT-suffixed summaries present.
             continue
-        meta = load_meta_for_epsilon(eps)
-        severity = load_trafo_loading(meta)
-        row = build_rt_row(df_eps, meta, eps, f"{eps:.2f}")
-        row.update({
-            'trafo_cvar90_loading_pct': severity['cvar90'],
-            'trafo_cvar95_loading_pct': severity['cvar95'],
-            'trafo_violation_excess_cvar90_pct': severity['sev_cvar90'],
-            'trafo_violation_excess_cvar95_pct': severity['sev_cvar95'],
-        })
-        rt_rows.append(row)
+        for rt_tag, summary_path, meta_path in variant_paths:
+            try:
+                df_eps = pd.read_csv(summary_path)
+            except Exception:
+                continue
+            meta = {}
+            if meta_path and os.path.exists(meta_path):
+                try:
+                    with open(meta_path,'r',encoding='utf-8') as f:
+                        meta = json.load(f)
+                except Exception:
+                    meta = {}
+            severity = load_trafo_loading(meta)
+            label_base = f"{eps:.2f}"
+            label_display = f"{label_base} ({_rt_display(rt_tag)})"
+            row = build_rt_row(df_eps, meta, eps, label_display)
+            row.update({
+                'trafo_cvar90_loading_pct': severity['cvar90'],
+                'trafo_cvar95_loading_pct': severity['cvar95'],
+                'trafo_violation_excess_cvar90_pct': severity['sev_cvar90'],
+                'trafo_violation_excess_cvar95_pct': severity['sev_cvar95'],
+            })
+            row['rt_tag'] = rt_tag
+            rt_rows.append(row)
+            meta_map[label_display] = meta
 
     # Deterministic (baseline k=1) appended (ordering handled later so it appears first)
-    det_path = os.path.join(RESULTS_DIR, 'v3_summary_drcc_false.csv')
-    if INCLUDE_DETERMINISTIC and os.path.exists(det_path):
-        det_df = pd.read_csv(det_path)
-        # Try load its meta
-        det_meta_path = os.path.join(RESULTS_DIR, 'v3_meta_drcc_false.json')
-        if os.path.exists(det_meta_path):
+    det_variants = find_deterministic_variant_paths(RESULTS_DIR) if INCLUDE_RT_SPLIT else []
+    if INCLUDE_DETERMINISTIC and det_variants:
+        for rt_tag, summary_path, meta_path in det_variants:
             try:
-                with open(det_meta_path, 'r', encoding='utf-8') as f:
-                    det_meta = json.load(f)
+                det_df = pd.read_csv(summary_path)
             except Exception:
-                det_meta = {}
-        else:
+                continue
             det_meta = {}
-        sev_det = load_trafo_loading(det_meta)
-        det_row = build_rt_row(det_df, det_meta, None, DETERMINISTIC_LABEL)
-        det_row.update({
-            'trafo_cvar90_loading_pct': sev_det['cvar90'],
-            'trafo_cvar95_loading_pct': sev_det['cvar95'],
-            'trafo_violation_excess_cvar90_pct': sev_det['sev_cvar90'],
-            'trafo_violation_excess_cvar95_pct': sev_det['sev_cvar95'],
-        })
-        rt_rows.append(det_row)
+            if meta_path and os.path.exists(meta_path):
+                try:
+                    with open(meta_path,'r',encoding='utf-8') as f:
+                        det_meta = json.load(f)
+                except Exception:
+                    det_meta = {}
+            sev_det = load_trafo_loading(det_meta)
+            label_display = f"{DETERMINISTIC_LABEL} ({_rt_display(rt_tag)})"
+            det_row = build_rt_row(det_df, det_meta, None, label_display)
+            det_row.update({
+                'trafo_cvar90_loading_pct': sev_det['cvar90'],
+                'trafo_cvar95_loading_pct': sev_det['cvar95'],
+                'trafo_violation_excess_cvar90_pct': sev_det['sev_cvar90'],
+                'trafo_violation_excess_cvar95_pct': sev_det['sev_cvar95'],
+            })
+            det_row['rt_tag'] = rt_tag
+            rt_rows.append(det_row)
+            meta_map[label_display] = det_meta
 
     rt_summary = pd.DataFrame(rt_rows)
-    # Build label ordering: deterministic first (if present) then epsilon cases in given order
-    if INCLUDE_DETERMINISTIC and os.path.exists(det_path):
-        label_order = [DETERMINISTIC_LABEL] + [f"{e:.2f}" for e in EPSILONS]
-    else:
-        label_order = [f"{e:.2f}" for e in EPSILONS]
-    rt_summary['plot_order'] = rt_summary['label'].apply(lambda x: label_order.index(x) if x in label_order else 999)
+    # Build label ordering ignoring RT suffix. Deterministic first (if present) then epsilon bases.
+    def _label_base(l: str) -> str:
+        if l.startswith(DETERMINISTIC_LABEL):
+            return DETERMINISTIC_LABEL
+        try:
+            part = l.split()[0]
+            float(part)
+            return part
+        except Exception:
+            return l
+    bases_present = [_label_base(l) for l in rt_summary['label']]
+    label_order: List[str] = []
+    if any(b == DETERMINISTIC_LABEL for b in bases_present):
+        label_order.append(DETERMINISTIC_LABEL)
+    for e in EPSILONS:
+        tok = f"{e:.2f}"
+        if tok in bases_present:
+            label_order.append(tok)
+    rt_summary['plot_order'] = rt_summary['label'].apply(lambda x: label_order.index(_label_base(x)) if _label_base(x) in label_order else 999)
     rt_summary = rt_summary.sort_values('plot_order')
 
     # Merge legacy (epsilon keyed) for DRCC rows only
@@ -998,10 +1383,16 @@ def main() -> None:
     else:
         summary = rt_summary.copy()
 
+    # Add all-in total cost (DA total + mean RT costs) for convenience in downstream analyses
+    try:
+        summary['all_in_total_cost_mean'] = summary['da_total_cost_eur'] + summary['total_rt_cost_mean']
+    except Exception:
+        summary['all_in_total_cost_mean'] = np.nan
+
     summary.to_csv(os.path.join(RESULTS_DIR, OUT_CSV), index=False)
 
     # === Radial-only adaptation ===
-    # New v3 (post-refactor) provides only radial (Option A) network loading; voltages are NaN/omitted.
+    # New v4 (post-refactor) provides only radial (Option A) network loading; voltages are NaN/omitted.
     # Detect this to adjust plot labels & console messaging.
     radial_only_mode = True  # currently always true after removal of admittance logic
     if radial_only_mode:
@@ -1011,11 +1402,11 @@ def main() -> None:
     threshold_candidates = []
     if 'loading_violation_threshold_pct' in summary.columns:
         threshold_candidates.extend(list(pd.to_numeric(summary['loading_violation_threshold_pct'], errors='coerce').dropna().unique()))
-    # Fallback: look directly into a representative v3_summary file if not populated (older runs)
+    # Fallback: look directly into a representative v4_summary file if not populated (older runs)
     if not threshold_candidates:
         for eps in EPSILONS:
             token = epsilon_token(eps)
-            fpath = os.path.join(RESULTS_DIR, f"v3_summary_drcc_true_epsilon_{token}.csv")
+            fpath = os.path.join(RESULTS_DIR, f"v4_summary_drcc_true_epsilon_{token}.csv")
             if os.path.exists(fpath):
                 try:
                     tmp_df = pd.read_csv(fpath, nrows=1)
@@ -1026,9 +1417,11 @@ def main() -> None:
                             break
                 except Exception:
                     pass
-    # Final fallback constant
+    # Final fallback constant from summary; use it as-is to match generation (no bump)
     violation_threshold_pct = float(threshold_candidates[0]) if threshold_candidates else 80.0
-    print(f"[INFO] Using transformer violation threshold = {violation_threshold_pct:.0f}% for plots.")
+    # Effective threshold equals the run's own threshold to keep plots consistent with summaries
+    viol_threshold_eff = float(violation_threshold_pct)
+    print(f"[INFO] Using transformer violation threshold = {viol_threshold_eff:.2f}% (from summaries)")
 
     # New condensed overview: 9 panels
     # 0: RT imbalance cost (already simplified earlier)
@@ -1054,10 +1447,10 @@ def main() -> None:
     axes[0].set_title('RT imbalance cost')
     axes[0].grid(axis='y', alpha=0.3)
 
-    # All-in total cost bar: v2 base cost (no RT proxies) + v3 RT recourse costs
+    # All-in total cost bar: v2 base cost (no RT proxies) + v4 RT recourse costs
     # Build meta cache for labels
     meta_by_label: Dict[str, Dict] = {}
-    det_meta_path = os.path.join(RESULTS_DIR, 'v3_meta_drcc_false.json')
+    det_meta_path = os.path.join(RESULTS_DIR, 'v4_meta_drcc_false.json')
     if INCLUDE_DETERMINISTIC and os.path.exists(det_meta_path):
         try:
             with open(det_meta_path, 'r', encoding='utf-8') as f:
@@ -1071,10 +1464,13 @@ def main() -> None:
     base_costs: List[float] = []
     for lab in rt_summary['label']:
         meta = meta_by_label.get(lab, {})
-        base_val = compute_v2_base_cost(meta)
-        base_costs.append(base_val if np.isfinite(base_val) else np.nan)
+        # Prefer direct exported DA total cost; fallback to import-only reconstruction
+        da_total = read_v2_da_total_cost(meta)
+        if not np.isfinite(da_total):
+            da_total = compute_v2_base_cost(meta)
+        base_costs.append(da_total if np.isfinite(da_total) else np.nan)
     base_series = pd.Series(base_costs, index=rt_summary.index)
-    # RT recourse mean costs from v3
+    # RT recourse mean costs from v4
     c_rt = pd.to_numeric(rt_summary['total_rt_cost_mean'], errors='coerce')
     # If base is missing, fallback to DA import mean just to keep the plot complete
     c_da_fallback = pd.to_numeric(rt_summary.get('da_import_cost_mean', pd.Series([np.nan]*len(rt_summary))), errors='coerce')
@@ -1128,7 +1524,7 @@ def main() -> None:
     axes[2].set_xticklabels([_display_label_for_case(l) for l in rt_summary['label']])
     axes[2].set_xlabel('epsilon / mode')
     axes[2].set_ylabel('Steps (sum across trajectories)')
-    axes[2].set_title(f'Transformer loading violations (> {violation_threshold_pct:.0f}%)')
+    axes[2].set_title(f'Transformer loading violations (> {viol_threshold_eff:.2f}%)')
     axes[2].grid(axis='y', alpha=0.3)
     # Annotate bars (always show value, even if very small or large)
     for rect, val in zip(bars, t_steps):
@@ -1144,7 +1540,7 @@ def main() -> None:
     axes[3].set_xticklabels([_display_label_for_case(l) for l in rt_summary['label']])
     axes[3].set_xlabel('epsilon / mode')
     axes[3].set_ylabel('% of total timesteps')
-    axes[3].set_title(f'Transformer violation probability (> {violation_threshold_pct:.0f}%)')
+    axes[3].set_title(f'Transformer violation probability (> {viol_threshold_eff:.2f}%)')
     axes[3].grid(axis='y', alpha=0.3)
     axes[3].legend()
 
@@ -1172,8 +1568,10 @@ def main() -> None:
             else:
                 return np.array([])
         try:
-            pdf = pd.read_parquet(abs_path)
+            pdf = _read_parquet_or_csv(abs_path)
         except Exception:
+            pdf = None
+        if pdf is None:
             return np.array([])
         must_cols = {'sample_id','t','trafo_index','loading_pct'}
         if not must_cols <= set(pdf.columns):
@@ -1182,22 +1580,10 @@ def main() -> None:
         arr = pd.to_numeric(grp['loading_pct'], errors='coerce').to_numpy()
         return arr[np.isfinite(arr)]
 
-    # Collect meta mapping for epsilons during earlier loop wasn't stored; reload here
-    meta_cache: Dict[str, Dict] = {}
-    # Deterministic baseline
-    if INCLUDE_DETERMINISTIC and os.path.exists(os.path.join(RESULTS_DIR,'v3_meta_drcc_false.json')):
-        try:
-            with open(os.path.join(RESULTS_DIR,'v3_meta_drcc_false.json'),'r',encoding='utf-8') as f:
-                meta_cache[DETERMINISTIC_LABEL] = json.load(f)
-        except Exception:
-            meta_cache[DETERMINISTIC_LABEL] = {}
-    for eps in EPSILONS:
-        lab = f"{eps:.2f}"
-        meta_cache[lab] = load_meta_for_epsilon(eps)
-
+    # Build distributions strictly per full label using meta_map (constructed earlier)
     for lab in rt_summary['label']:
-        meta = meta_cache.get(lab, {})
-        dist = _load_loading_distribution(meta)
+        meta = meta_map.get(lab, {})
+        dist = _load_loading_distribution(meta if isinstance(meta, dict) else {})
         distributions.append(dist if dist.size else np.array([np.nan]))
         labels_box.append(lab)
 
@@ -1253,6 +1639,56 @@ def main() -> None:
     ax_vio.set_title('Transformer loading (violin)')
     ax_vio.grid(axis='y', alpha=0.3)
 
+    # Standalone multi-case violin figure (optional)
+    if PLOT_VIOLIN_ALL_CASES:
+        try:
+            # Reuse distributions & labels_box already built (labels may include RT modes)
+            finite_groups = []
+            finite_labels = []
+            for lab, dist in zip(labels_box, distributions):
+                vals = dist[np.isfinite(dist)] if isinstance(dist, np.ndarray) else np.array([])
+                if vals.size:
+                    finite_groups.append(vals)
+                    finite_labels.append(lab)
+            if finite_groups:
+                fig_va, ax_va = plt.subplots(figsize=(1.4*len(finite_groups)+2, 4.0))
+                vp = ax_va.violinplot(finite_groups, positions=list(range(1, len(finite_groups)+1)), showmeans=False, showmedians=True, showextrema=False)
+                for i, body in enumerate(vp['bodies']):
+                    base = finite_labels[i]
+                    # Color code RT tag if present
+                    if 'rt_off' in base:
+                        body.set_facecolor('#9ecae1'); body.set_edgecolor('#08519c')
+                    elif 'rt_on' in base:
+                        body.set_facecolor('#fb6a4a'); body.set_edgecolor('#cb181d')
+                    else:
+                        body.set_facecolor('#b2df8a'); body.set_edgecolor('#1b7837')
+                    body.set_alpha(0.65)
+                if 'cmedians' in vp:
+                    vp['cmedians'].set_color('black')
+                ax_va.set_xticks(range(1, len(finite_groups)+1))
+                # Display labels using epsilon display helper; preserve RT mode suffix in parenthesis
+                disp = []
+                for lab in finite_labels:
+                    base_disp = _display_label_for_case(_label_base(lab) if '_label_base' in globals() else lab)
+                    if 'rt_on' in lab:
+                        base_disp += ' (RT ON)'
+                    elif 'rt_off' in lab:
+                        base_disp += ' (RT OFF)'
+                    ax_va.set_xlabel('epsilon / mode')
+                    disp.append(base_disp)
+                ax_va.set_xticklabels(disp, rotation=25, ha='right')
+                ax_va.set_ylabel('Transformer loading %')
+                ax_va.set_title('Transformer loading distributions (all cases)')
+                ax_va.grid(axis='y', alpha=0.3)
+                out_va = os.path.join(RESULTS_DIR, VIOLIN_ALL_CASES_FIG)
+                fig_va.tight_layout()
+                fig_va.savefig(out_va, dpi=150)
+                print(f"✓ Multi-case violin figure: {out_va}")
+            else:
+                print('[INFO] Multi-case violin figure skipped (no finite groups).')
+        except Exception as e:
+            print(f"[WARN] Failed multi-case violin figure: {e}")
+
     # 6. Violation severity bar plot (mean exceedance above threshold per case)
     ax_sev = axes[6]
     means_sev: List[float] = []
@@ -1263,7 +1699,7 @@ def main() -> None:
             means_sev.append(0.0)
             pos_sev.append(i)
             continue
-        excess = vals - violation_threshold_pct
+        excess = vals - viol_threshold_eff
         excess = excess[excess > 0]
         means_sev.append(float(np.mean(excess)) if excess.size > 0 else 0.0)
         pos_sev.append(i)
@@ -1271,7 +1707,7 @@ def main() -> None:
     ax_sev.set_xticks(pos_sev)
     ax_sev.set_xticklabels([_display_label_for_case(l) for l in labels_box])
     ax_sev.set_xlabel('epsilon / mode')
-    ax_sev.set_ylabel(f'Exceedance over {int(violation_threshold_pct)}% (pp)')
+    ax_sev.set_ylabel(f'Exceedance over {viol_threshold_eff:.2f}% (pp)')
     ax_sev.set_title('Violation severity (mean among violations)')
     ax_sev.grid(axis='y', alpha=0.3)
     # annotate bars
@@ -1360,16 +1796,82 @@ def main() -> None:
     print(f"✓ Overview saved: {out_path}")
     print(f"✓ Summary CSV: {os.path.join(RESULTS_DIR, OUT_CSV)}")
 
-    # --- New: Split-violin comparison figure (deterministic vs epsilon=0.10) ---
+    # --- New: Split-violin comparison figure (deterministic vs epsilon=0.05) ---
     if PLOT_VIOLIN_COMPARE:
         try:
-            # Map label -> distribution for quick access
+            # Variant-aware grouped violin: if rt_tag present and both rt_on/off appear for any epsilon
+            if 'rt_tag' in rt_summary.columns and any(rt_summary['rt_tag'].notna()):
+                # Build mapping epsilon -> {rt_tag: distribution array}
+                # Use distributions list aligned with labels_box
+                dist_map = {lab: arr for lab, arr in zip(labels_box, distributions)}
+                eps_groups: Dict[str, Dict[str, np.ndarray]] = {}
+                for lab in labels_box:
+                    base = lab  # labels are raw epsilon strings or 'deterministic'
+                    if base == DETERMINISTIC_LABEL:
+                        continue
+                    # Find rt tags for this epsilon from rt_summary by matching label base
+                    matching_rows = rt_summary[rt_summary['label'] == base]
+                    for _, row in matching_rows.iterrows():
+                        tag = row.get('rt_tag')
+                        arr = dist_map.get(base, np.array([]))
+                        if tag and isinstance(arr, np.ndarray) and arr.size:
+                            eps_groups.setdefault(base, {})[tag] = arr[np.isfinite(arr)]
+                # Filter only groups with at least one variant
+                eps_groups = {k: v for k, v in eps_groups.items() if v}
+                if eps_groups:
+                    # Build side-by-side violins: order eps ascending; each epsilon yields consecutive positions for rt_off then rt_on
+                    try:
+                        ordered_eps = sorted(eps_groups.keys(), key=lambda x: float(x))
+                    except Exception:
+                        ordered_eps = sorted(eps_groups.keys())
+                    data_list: List[np.ndarray] = []
+                    pos_list: List[int] = []
+                    tick_labels: List[str] = []
+                    pos = 1
+                    for eps_lab in ordered_eps:
+                        variants = eps_groups[eps_lab]
+                        # ensure consistent order
+                        for tag in ('rt_off','rt_on','rt_unk'):
+                            arr = variants.get(tag)
+                            if arr is None or arr.size == 0:
+                                continue
+                            data_list.append(arr)
+                            pos_list.append(pos)
+                            tick_labels.append(f"ε={eps_lab} {'RT OFF' if tag=='rt_off' else 'RT ON' if tag=='rt_on' else 'RT ?'}")
+                            pos += 1
+                    if data_list:
+                        fig_grp, ax_grp = plt.subplots(figsize=(1.6*len(pos_list)+2, 3.6))
+                        vp = ax_grp.violinplot(data_list, positions=pos_list, showmeans=False, showmedians=True, showextrema=False)
+                        for i, body in enumerate(vp['bodies']):
+                            lab = tick_labels[i]
+                            if 'RT OFF' in lab:
+                                body.set_facecolor('#9ecae1')
+                                body.set_edgecolor('#08519c')
+                            elif 'RT ON' in lab:
+                                body.set_facecolor('#fb6a4a')
+                                body.set_edgecolor('#cb181d')
+                            else:
+                                body.set_facecolor('#cccccc')
+                                body.set_edgecolor('#666666')
+                            body.set_alpha(0.65)
+                        if 'cmedians' in vp:
+                            vp['cmedians'].set_color('black')
+                        ax_grp.set_xticks(pos_list)
+                        ax_grp.set_xticklabels(tick_labels, rotation=25, ha='right')
+                        ax_grp.set_ylabel('Transformer loading %')
+                        ax_grp.set_title('Loading distributions by ε and RT mode')
+                        ax_grp.grid(axis='y', alpha=0.3)
+                        out_grp = os.path.join(RESULTS_DIR, VIOLIN_COMPARE_FIG)
+                        fig_grp.tight_layout()
+                        fig_grp.savefig(out_grp, dpi=150)
+                        print(f"✓ Violin comparison figure (RT variants): {out_grp}")
+                        # Do not return here; continue to subsequent plots (SoC envelopes, etc.)
+            # Fallback original deterministic vs epsilon=0.05 split violin
             dist_map = {lab: arr for lab, arr in zip(labels_box, distributions)}
             left_label = DETERMINISTIC_LABEL
-            right_label = f"{0.10:.2f}"
+            right_label = f"{0.05:.2f}"
             left_vals = dist_map.get(left_label, np.array([]))
             right_vals = dist_map.get(right_label, np.array([]))
-            # Filter finite values
             left_vals = left_vals[np.isfinite(left_vals)] if isinstance(left_vals, np.ndarray) and left_vals.size else np.array([])
             right_vals = right_vals[np.isfinite(right_vals)] if isinstance(right_vals, np.ndarray) and right_vals.size else np.array([])
             fig_cmp, ax_cmp = plt.subplots(figsize=(4.0, 8.0))
@@ -1379,91 +1881,41 @@ def main() -> None:
                 ax_cmp.set_xticks([x0])
                 ax_cmp.set_xticklabels([f"{_display_label_for_case(left_label)} vs DRCC, ε={right_label}"])
             else:
-                # Determine y-limits from data
                 vals_list = []
-                side_tags = []  # 'left' or 'right' matching bodies index order
+                side_tags = []
                 if left_vals.size:
-                    vals_list.append(left_vals)
-                    side_tags.append('left')
+                    vals_list.append(left_vals); side_tags.append('left')
                 if right_vals.size:
-                    vals_list.append(right_vals)
-                    side_tags.append('right')
+                    vals_list.append(right_vals); side_tags.append('right')
                 stacked = np.concatenate(vals_list) if vals_list else np.array([])
                 y_min = float(np.nanmin(stacked)) if stacked.size else 0.0
                 y_max = float(np.nanmax(stacked)) if stacked.size else 1.0
                 if not np.isfinite(y_min) or not np.isfinite(y_max) or y_max <= y_min:
                     y_min, y_max = 0.0, 1.0
                 pad = 0.02 * (y_max - y_min + 1e-9)
-                y_min -= pad
-                y_max += pad
+                y_min -= pad; y_max += pad
                 ax_cmp.set_ylim(y_min, y_max)
                 ax_cmp.set_xlim(x0 - 0.6, x0 + 0.6)
-
-                # Build violins using Matplotlib's KDE and aesthetics
-                positions = [x0 for _ in vals_list]
-                vp = ax_cmp.violinplot(vals_list, positions=positions, showmeans=False, showmedians=False, showextrema=False)
-
-                # Clip bodies to halves and color them
+                vp = ax_cmp.violinplot(vals_list, positions=[x0 for _ in vals_list], showmeans=False, showmedians=False, showextrema=False)
                 from matplotlib.patches import Rectangle, Patch
-                xmin, xmax = ax_cmp.get_xlim()
-                ymin, ymax = ax_cmp.get_ylim()
+                xmin, xmax = ax_cmp.get_xlim(); ymin, ymax = ax_cmp.get_ylim()
                 left_clip = Rectangle((xmin, ymin), width=(x0 - xmin), height=(ymax - ymin), transform=ax_cmp.transData)
                 right_clip = Rectangle((x0, ymin), width=(xmax - x0), height=(ymax - ymin), transform=ax_cmp.transData)
                 for body, tag in zip(vp['bodies'], side_tags):
                     if tag == 'left':
-                        body.set_facecolor('#b2df8a')
-                        body.set_edgecolor('#1b7837')
-                        body.set_alpha(0.6)
-                        body.set_clip_path(left_clip)
+                        body.set_facecolor('#b2df8a'); body.set_edgecolor('#1b7837'); body.set_alpha(0.6); body.set_clip_path(left_clip)
                     else:
-                        body.set_facecolor('#a6cee3')
-                        body.set_edgecolor('#1f78b4')
-                        body.set_alpha(0.6)
-                        body.set_clip_path(right_clip)
-
-                # Ensure default median lines (if any) are hidden
+                        body.set_facecolor('#a6cee3'); body.set_edgecolor('#1f78b4'); body.set_alpha(0.6); body.set_clip_path(right_clip)
                 if isinstance(vp, dict) and 'cmedians' in vp and vp['cmedians'] is not None:
-                    try:
-                        vp['cmedians'].set_visible(False)
-                    except Exception:
-                        pass
-
-                # Replace median with short ticks per side for clarity
+                    try: vp['cmedians'].set_visible(False)
+                    except Exception: pass
                 if left_vals.size:
-                    m_left = float(np.nanmedian(left_vals))
-                    # Median tick starting at center and extending left
-                    ax_cmp.plot([x0 - 0.21, x0], [m_left, m_left], color='#1b7837', linewidth=2)
-                    # Extrema ticks (min/max)
-                    try:
-                        l_min = float(np.nanmin(left_vals))
-                        l_max = float(np.nanmax(left_vals))
-                        # Extrema ticks starting at center and extending left
-                        ax_cmp.plot([x0 - 0.10, x0], [l_min, l_min], color='#1b7837', linewidth=1.6)
-                        ax_cmp.plot([x0 - 0.10, x0], [l_max, l_max], color='#1b7837', linewidth=1.6)
-                    except Exception:
-                        pass
+                    m_left = float(np.nanmedian(left_vals)); ax_cmp.plot([x0 - 0.21, x0], [m_left, m_left], color='#1b7837', linewidth=2)
                 if right_vals.size:
-                    m_right = float(np.nanmedian(right_vals))
-                    # Median tick starting at center and extending right
-                    ax_cmp.plot([x0, x0 + 0.21], [m_right, m_right], color='#1f78b4', linewidth=2)
-                    # Extrema ticks (min/max)
-                    try:
-                        r_min = float(np.nanmin(right_vals))
-                        r_max = float(np.nanmax(right_vals))
-                        # Extrema ticks starting at center and extending right
-                        ax_cmp.plot([x0, x0 + 0.10], [r_min, r_min], color='#1f78b4', linewidth=1.6)
-                        ax_cmp.plot([x0, x0 + 0.10], [r_max, r_max], color='#1f78b4', linewidth=1.6)
-                    except Exception:
-                        pass
-                                
-                ax_cmp.set_xticks([x0])
-                ax_cmp.set_xticklabels([f"{left_label} vs {right_label}"])
-                ax_cmp.set_ylabel('Transformer loading %')
-                #ax_cmp.set_title('Transformer loading comparison')
-                ax_cmp.grid(axis='y', alpha=0.3)
-                # Center divider line
+                    m_right = float(np.nanmedian(right_vals)); ax_cmp.plot([x0, x0 + 0.21], [m_right, m_right], color='#1f78b4', linewidth=2)
+                ax_cmp.set_xticks([x0]); ax_cmp.set_xticklabels([f"{left_label} vs {right_label}"])
+                ax_cmp.set_ylabel('Transformer loading %'); ax_cmp.grid(axis='y', alpha=0.3)
                 ax_cmp.axvline(x0, color='black', linewidth=0.9, alpha=0.8, zorder=3)
-                # Legend
                 legend_handles = []
                 if left_vals.size:
                     legend_handles.append(Patch(facecolor='#b2df8a', edgecolor='#1b7837', label=_display_label_for_case(left_label), alpha=0.6))
@@ -1477,25 +1929,102 @@ def main() -> None:
         except Exception as e:
             print(f"[WARN] Failed to build violin comparison figure: {e}")
 
-    # --- New: Overload energy comparison (deterministic vs ε=0.10) ---
+    # --- New: Focused ε=0.10 RT ON vs RT OFF split violin ---
+    if PLOT_VIOLIN_EPS_010_RT_COMPARE:
+        try:
+            target_eps = f"{0.10:.2f}"  # "0.10"
+            dist_map = {lab: arr for lab, arr in zip(labels_box, distributions)}
+            # Expected labels like "0.10 (RT ON)" and "0.10 (RT OFF)"
+            label_on = None; label_off = None
+            for lab in labels_box:
+                if lab.startswith(target_eps):
+                    if '(RT ON' in lab:
+                        label_on = lab
+                    elif '(RT OFF' in lab:
+                        label_off = lab
+            if not label_on and not label_off:
+                print(f"[INFO] ε={target_eps} RT ON/OFF distributions not both present; skipping focused violin.")
+            else:
+                vals_on = dist_map.get(label_on, np.array([])) if label_on else np.array([])
+                vals_off = dist_map.get(label_off, np.array([])) if label_off else np.array([])
+                vals_on = vals_on[np.isfinite(vals_on)] if isinstance(vals_on, np.ndarray) and vals_on.size else np.array([])
+                vals_off = vals_off[np.isfinite(vals_off)] if isinstance(vals_off, np.ndarray) and vals_off.size else np.array([])
+                fig_rt, ax_rt = plt.subplots(figsize=(4.2, 8.0))
+                x0 = 1.0
+                if vals_on.size == 0 and vals_off.size == 0:
+                    ax_rt.text(0.5, 0.5, 'No ε=0.10 RT data', ha='center', va='center', transform=ax_rt.transAxes,
+                               fontsize=9, color='gray')
+                    ax_rt.set_xticks([x0]); ax_rt.set_xticklabels([f"ε={target_eps} RT ON vs RT OFF"])
+                else:
+                    vals_list = []
+                    side_tags = []
+                    if vals_off.size: vals_list.append(vals_off); side_tags.append('off')
+                    if vals_on.size: vals_list.append(vals_on); side_tags.append('on')
+                    stacked = np.concatenate(vals_list) if vals_list else np.array([])
+                    y_min = float(np.nanmin(stacked)) if stacked.size else 0.0
+                    y_max = float(np.nanmax(stacked)) if stacked.size else 1.0
+                    if not np.isfinite(y_min) or not np.isfinite(y_max) or y_max <= y_min:
+                        y_min, y_max = 0.0, 1.0
+                    pad = 0.02 * (y_max - y_min + 1e-9)
+                    y_min -= pad; y_max += pad
+                    ax_rt.set_ylim(y_min, y_max)
+                    ax_rt.set_xlim(x0 - 0.6, x0 + 0.6)
+                    vp = ax_rt.violinplot(vals_list, positions=[x0 for _ in vals_list], showmeans=False, showmedians=False, showextrema=False)
+                    from matplotlib.patches import Rectangle, Patch
+                    xmin, xmax = ax_rt.get_xlim(); ymin, ymax = ax_rt.get_ylim()
+                    left_clip = Rectangle((xmin, ymin), width=(x0 - xmin), height=(ymax - ymin), transform=ax_rt.transData)
+                    right_clip = Rectangle((x0, ymin), width=(xmax - x0), height=(ymax - ymin), transform=ax_rt.transData)
+                    for body, tag in zip(vp['bodies'], side_tags):
+                        if tag == 'off':
+                            body.set_facecolor('#9ecae1'); body.set_edgecolor('#08519c'); body.set_alpha(0.65); body.set_clip_path(left_clip)
+                        else:
+                            body.set_facecolor('#fb6a4a'); body.set_edgecolor('#cb181d'); body.set_alpha(0.65); body.set_clip_path(right_clip)
+                    # Medians
+                    if vals_off.size:
+                        m_off = float(np.nanmedian(vals_off)); ax_rt.plot([x0 - 0.21, x0], [m_off, m_off], color='#08519c', linewidth=2)
+                    if vals_on.size:
+                        m_on = float(np.nanmedian(vals_on)); ax_rt.plot([x0, x0 + 0.21], [m_on, m_on], color='#cb181d', linewidth=2)
+                    ax_rt.axvline(x0, color='black', linewidth=0.9, alpha=0.8, zorder=3)
+                    ax_rt.set_xticks([x0])
+                    ax_rt.set_xticklabels([f"ε={target_eps}"])
+                    ax_rt.set_ylabel('Transformer loading %')
+                    ax_rt.grid(axis='y', alpha=0.3)
+                    legend_handles = []
+                    if vals_off.size:
+                        legend_handles.append(Patch(facecolor='#9ecae1', edgecolor='#08519c', label=f"ε={target_eps} RT OFF", alpha=0.65))
+                    if vals_on.size:
+                        legend_handles.append(Patch(facecolor='#fb6a4a', edgecolor='#cb181d', label=f"ε={target_eps} RT ON", alpha=0.65))
+                    if legend_handles:
+                        ax_rt.legend(handles=legend_handles, loc='upper right', frameon=False, fontsize=8)
+                out_rt = os.path.join(RESULTS_DIR, VIOLIN_COMPARE_010_RT_FIG)
+                fig_rt.tight_layout()
+                fig_rt.savefig(out_rt, dpi=150)
+                print(f"✓ Focused ε=0.10 RT ON vs OFF violin: {out_rt}")
+        except Exception as e:
+            print(f"[WARN] Failed focused ε=0.10 RT violin: {e}")
+
+    # --- New: Overload energy comparison (deterministic vs ε=0.05) ---
     if PLOT_OVERLOAD_ENERGY_COMPARE:
         try:
             # Helper to compute total overload energy (excess above threshold) in MVAh from parquet
+            threshold_pct_local = viol_threshold_eff  # align with summaries/plots threshold
             def _compute_overload_energy_from_parquet(parquet_path: str) -> float:
                 try:
-                    pdf = pd.read_parquet(parquet_path)
+                    pdf = _read_parquet_or_csv(parquet_path)
                 except Exception:
+                    pdf = None
+                if pdf is None:
                     return float('nan')
                 must = {'sample_id','t','trafo_index','loading_pct'}
                 if not must <= set(pdf.columns):
                     return float('nan')
                 lp = pd.to_numeric(pdf['loading_pct'], errors='coerce').to_numpy()
-                mask = np.isfinite(lp) & (lp > OVERLOAD_THRESHOLD_PCT)
+                mask = np.isfinite(lp) & (lp > threshold_pct_local)
                 if not np.any(mask):
                     # No exceedances => zero overload energy
                     # Still return 0.0 kWh per sample
                     return 0.0
-                excess_pct = lp[mask] - OVERLOAD_THRESHOLD_PCT
+                excess_pct = lp[mask] - threshold_pct_local
                 excess_mva = (excess_pct / 100.0) * RATED_TRAFO_MVA
                 total_mvah = float(np.sum(excess_mva) * STEP_HOURS)
                 # Convert to kWh and average per sample
@@ -1508,7 +2037,7 @@ def main() -> None:
                 return total_kwh_per_sample
 
             # Load baseline meta for path
-            det_meta_path = os.path.join(RESULTS_DIR, 'v3_meta_drcc_false.json')
+            det_meta_path = os.path.join(RESULTS_DIR, 'v4_meta_drcc_false.json')
             det_over_mvah = float('nan')
             if os.path.exists(det_meta_path):
                 try:
@@ -1520,13 +2049,13 @@ def main() -> None:
                         det_over_mvah = _compute_overload_energy_from_parquet(det_parquet)
                 except Exception:
                     pass
-            # Load epsilon=0.10 meta for path
-            eps_label = f"{0.10:.2f}"
-            meta_010 = load_meta_for_epsilon(0.10)
+            # Load epsilon=0.05 meta for path
+            eps_label = f"{0.05:.2f}"
+            meta_005 = load_meta_for_epsilon(0.05)
             eps_over_mvah = float('nan')
-            if meta_010 and meta_010.get('trafo_loading_file'):
-                pq_010 = os.path.join(RESULTS_DIR, meta_010['trafo_loading_file'])
-                eps_over_mvah = _compute_overload_energy_from_parquet(pq_010)
+            if meta_005 and meta_005.get('trafo_loading_file'):
+                pq_005 = os.path.join(RESULTS_DIR, meta_005['trafo_loading_file'])
+                eps_over_mvah = _compute_overload_energy_from_parquet(pq_005)
 
             # If either is available, plot
             if np.isfinite(det_over_mvah) or np.isfinite(eps_over_mvah):
@@ -1558,11 +2087,11 @@ def main() -> None:
         except Exception as e:
             print(f"[WARN] Failed to build overload energy comparison: {e}")
 
-    # --- New: CVaR90 transformer loading comparison (deterministic vs ε=0.10) ---
+    # --- New: CVaR90 transformer loading comparison (deterministic vs ε=0.05) ---
     if PLOT_CVAR90_COMPARE:
         try:
             # Deterministic meta and CVaR90
-            det_meta_path = os.path.join(RESULTS_DIR, 'v3_meta_drcc_false.json')
+            det_meta_path = os.path.join(RESULTS_DIR, 'v4_meta_drcc_false.json')
             det_cvar = float('nan')
             if os.path.exists(det_meta_path):
                 try:
@@ -1572,17 +2101,17 @@ def main() -> None:
                     det_cvar = float(sev_det.get('cvar90', float('nan')))
                 except Exception:
                     pass
-            # Epsilon 0.10 meta and CVaR90
-            meta_010 = load_meta_for_epsilon(0.10)
+            # Epsilon 0.05 meta and CVaR90
+            meta_005 = load_meta_for_epsilon(0.05)
             eps_cvar = float('nan')
-            if meta_010:
+            if meta_005:
                 try:
-                    sev_010 = load_trafo_loading(meta_010)
-                    eps_cvar = float(sev_010.get('cvar90', float('nan')))
+                    sev_005 = load_trafo_loading(meta_005)
+                    eps_cvar = float(sev_005.get('cvar90', float('nan')))
                 except Exception:
                     pass
             if np.isfinite(det_cvar) or np.isfinite(eps_cvar):
-                labels = ['deterministic', 'DRCC, ε=0.10']
+                labels = ['deterministic', 'DRCC, ε=0.05']
                 values = [det_cvar if np.isfinite(det_cvar) else 0.0,
                           eps_cvar if np.isfinite(eps_cvar) else 0.0]
                 fig_cv, ax_cv = plt.subplots(figsize=(4.0, 8.0))
@@ -1612,10 +2141,10 @@ def main() -> None:
         except Exception as e:
             print(f"[WARN] Failed to build CVaR90 comparison: {e}")
 
-    # --- Build cost-risk frontier (VaR95 + mean) using per-trajectory v3_summary_* CSVs ---
+    # --- Build cost-risk frontier (VaR95 + mean) using per-trajectory v4_summary_* CSVs ---
     def build_frontier(results_dir: str = RESULTS_DIR) -> pd.DataFrame:
         rows: List[Dict[str, object]] = []
-        pattern = os.path.join(results_dir, 'v3_summary_*.csv')
+        pattern = os.path.join(results_dir, 'v4_summary_*.csv')
         for path in glob.glob(pattern):
             try:
                 df_sum = pd.read_csv(path)
@@ -1623,10 +2152,10 @@ def main() -> None:
                 continue
             fname = os.path.basename(path)
             # Skip legacy simple names if a preferred drcc_true exists for same epsilon
-            legacy_match = re.match(r'v3_summary_epsilon_([0-9]+_[0-9]+)\.csv', fname)
+            legacy_match = re.match(r'v4_summary_epsilon_([0-9]+_[0-9]+)\.csv', fname)
             if legacy_match:
                 tok = legacy_match.group(1)
-                preferred = os.path.join(results_dir, f"v3_summary_drcc_true_epsilon_{tok}.csv")
+                preferred = os.path.join(results_dir, f"v4_summary_drcc_true_epsilon_{tok}.csv")
                 if os.path.exists(preferred):
                     continue  # ignore legacy because updated file present
             # Skip misnamed drcc_false_epsilon_ variants (deterministic should not carry epsilon)
@@ -1636,16 +2165,23 @@ def main() -> None:
             if 'drcc_false' in fname:
                 mode = 'stochastic'
                 eps_val = None
+                meta_path = os.path.join(results_dir, 'v4_meta_drcc_false.json')
+                tok_str = None
             else:
-                mode_match = re.search(r'v3_summary_(drcc_[a-zA-Z]+)_epsilon_', fname)
+                mode_match = re.search(r'v4_summary_(drcc_[a-zA-Z]+)_epsilon_', fname)
                 mode = mode_match.group(1) if mode_match else 'drcc_true'
                 tok_match = re.search(r'_epsilon_([0-9]+_[0-9]+)', fname)
                 eps_val = None
+                meta_path = None
+                tok_str = None
                 if tok_match:
                     try:
-                        eps_val = float(tok_match.group(1).replace('_', '.'))
+                        tok_str = tok_match.group(1)
+                        eps_val = float(tok_str.replace('_', '.'))
+                        meta_path = os.path.join(results_dir, f"{ 'v4_meta_drcc_true_epsilon_' + tok_str }.json")
                     except Exception:
                         eps_val = None
+                        meta_path = None
             if df_sum.empty:
                 continue
             # Mean & VaR95 (quantile) of total cost
@@ -1675,6 +2211,37 @@ def main() -> None:
                 trafo_vrate = float(np.mean(vrates)) if vrates else float('nan')
             else:
                 trafo_vrate = float('nan')
+
+            # New: per-timestep violation probability (max over time) computed from parquet, if available
+            trafo_vrate_max = float('nan')
+            try:
+                # Determine meta path if not set above (baseline case)
+                if meta_path is None and mode == 'stochastic':
+                    meta_path = os.path.join(results_dir, 'v4_meta_drcc_false.json')
+                # Attempt computation only if meta exists
+                if meta_path and os.path.exists(meta_path):
+                    with open(meta_path, 'r', encoding='utf-8') as f:
+                        meta_obj = json.load(f)
+                    rel = meta_obj.get('trafo_loading_file') if isinstance(meta_obj, dict) else None
+                    if rel:
+                        pq_path = os.path.join(results_dir, rel.replace('/', os.sep))
+                        if not os.path.exists(pq_path) and os.path.exists(rel):
+                            pq_path = rel
+                        if os.path.exists(pq_path):
+                            try:
+                                pdf = _read_parquet_or_csv(pq_path)
+                                if pdf is not None:
+                                    must = {'sample_id','t','trafo_index','loading_pct'}
+                                    if must <= set(pdf.columns):
+                                        grp = pdf.groupby(['sample_id','t'])['loading_pct'].max().reset_index()
+                                        counts = grp.groupby('t')['sample_id'].nunique()
+                                        viol = grp[grp['loading_pct'] > viol_threshold_eff].groupby('t')['sample_id'].nunique()
+                                        rate_series = (viol / counts).reindex(counts.index).fillna(0.0)
+                                        trafo_vrate_max = float(np.nanmax(rate_series.to_numpy())) if len(rate_series) else float('nan')
+                            except Exception:
+                                pass
+            except Exception:
+                trafo_vrate_max = float('nan')
             n_traj = int(len(df_sum))
             n_steps = int(df_sum.get('n_steps', pd.Series([np.nan])).iloc[0]) if 'n_steps' in df_sum.columns else np.nan
             rows.append({
@@ -1685,6 +2252,7 @@ def main() -> None:
                 'var95_cost_eur': var95_cost,
                 'cvar95_cost_eur': cvar95_cost,
                 'trafo_violation_rate_mean': trafo_vrate,
+                'trafo_violation_rate_max': trafo_vrate_max,
                 'n_trajectories': n_traj,
                 'n_steps': n_steps
             })
@@ -1710,8 +2278,8 @@ def main() -> None:
         # Deduplicate by picking row with max trajectories per (mode, epsilon)
         subset_rows = []
         for (mode, eps), grp in frontier_df.groupby(['mode','epsilon'], dropna=False):
-            # Prefer rows with non-null violation rate; among those pick highest trajectory count
-            grp_valid = grp[grp['trafo_violation_rate_mean'].notna()]
+            # Prefer rows with non-null MAX violation rate; among those pick highest trajectory count
+            grp_valid = grp[grp['trafo_violation_rate_max'].notna()]
             if not grp_valid.empty:
                 pick = grp_valid.sort_values('n_trajectories', ascending=False).iloc[0]
             else:
@@ -1725,23 +2293,23 @@ def main() -> None:
         # Plot baseline first (bottom layer)
         if not base_df.empty:
             ax_f.scatter(
-                base_df['trafo_violation_rate_mean'],
+                base_df['trafo_violation_rate_max'],
                 base_df['mean_cost_eur'],
                 marker='o', s=80, c='black', edgecolors='none', zorder=2
             )
             # Annotate deterministic mean point
             for _, r in base_df.iterrows():
-                if np.isfinite(r['trafo_violation_rate_mean']) and np.isfinite(r['mean_cost_eur']):
-                    _ann = ax_f.annotate('deterministic', (r['trafo_violation_rate_mean'], r['mean_cost_eur']),
+                if np.isfinite(r['trafo_violation_rate_max']) and np.isfinite(r['mean_cost_eur']):
+                    _ann = ax_f.annotate('deterministic', (r['trafo_violation_rate_max'], r['mean_cost_eur']),
                                          textcoords='offset points', xytext=(4,4), fontsize=8, color='black')
                     _ann.set_path_effects([patheffects.withStroke(linewidth=2.5, foreground='white')])
-        # DRCC points layered: 0.10, 0.20, 0.30 (others, if any, first)
+        # DRCC points layered (preferred ordering): 0.10, 0.15, 0.05 (others, if any, first)
         if not drcc_df.empty:
             eps_vals = drcc_df['epsilon'].to_numpy(dtype=float)
             vmin, vmax = float(np.nanmin(eps_vals)), float(np.nanmax(eps_vals))
             norm = plt.Normalize(vmin=vmin, vmax=vmax)
             cmap = plt.cm.viridis
-            preferred = [0.10, 0.20, 0.30]
+            preferred = [0.10, 0.15, 0.05]
             present = [float(e) for e in sorted(pd.unique(drcc_df['epsilon'].dropna()))]
             extras = [e for e in present if e not in preferred]
             order_eps = extras + [e for e in preferred if e in present]
@@ -1750,21 +2318,22 @@ def main() -> None:
                 if sub.empty:
                     continue
                 ax_f.scatter(
-                    sub['trafo_violation_rate_mean'],
+                    sub['trafo_violation_rate_max'],
                     sub['mean_cost_eur'],
                     color=cmap(norm(e)), s=70, edgecolors='k', linewidths=0.4, zorder=3
                 )
             # Colorbar using ScalarMappable
-            sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
-            sm.set_array([])
-            fig_f.colorbar(sm, ax=ax_f, label='risk level (ε)')
+            # Removed colorbar per user request (keep colormap encoding but no legend bar)
+            # sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+            # sm.set_array([])
+            # fig_f.colorbar(sm, ax=ax_f, label='risk level (ε)')
         # Annotate epsilon values
         for _, r in drcc_df.iterrows():
             if r['epsilon'] is not None and np.isfinite(r['epsilon']):
-                _ann2 = ax_f.annotate(f"ε = {r['epsilon']:.2f}", (r['trafo_violation_rate_mean'], r['mean_cost_eur']),
+                _ann2 = ax_f.annotate(f"ε = {r['epsilon']:.2f}", (r['trafo_violation_rate_max'], r['mean_cost_eur']),
                                       textcoords='offset points', xytext=(4,4), fontsize=8, color='black')
                 _ann2.set_path_effects([patheffects.withStroke(linewidth=2.5, foreground='white')])
-        ax_f.set_xlabel('Transformer violation rate (mean)')
+        ax_f.set_xlabel('Transformer violation rate (max over time)')
         ax_f.set_ylabel('Mean total cost (EUR)')
         ax_f.set_title('Cost–Risk Frontier (Mean vs Violation Rate)')
         ax_f.grid(alpha=0.35)
@@ -1775,11 +2344,103 @@ def main() -> None:
         fig_f.savefig(frontier_fig_path, dpi=150)
         print(f"✓ Frontier scatter: {frontier_fig_path}")
 
+    # --- New: BESS clipping vs transformer violations correlation (ε selection) ---
+    if PLOT_BESS_CLIPPING_CORRELATION:
+        try:
+            # Prefer epsilon=0.10; else pick the smallest available that has a summary
+            chosen_eps = None
+            chosen_df = None
+            for e in ([0.10] + sorted(EPSILONS)):
+                try:
+                    df_try = load_summary_for_epsilon(e)
+                except Exception:
+                    df_try = None
+                if df_try is not None and not df_try.empty:
+                    chosen_eps = e
+                    chosen_df = df_try
+                    break
+            if chosen_df is None:
+                print('[INFO] Skipped BESS clipping correlation (no v4_summary for any epsilon).')
+            else:
+                df = chosen_df.copy()
+                must = {
+                    'n_steps','steps_trafo_over_80pct',
+                    'bess_clip_power_steps','bess_clip_energy_steps','bess_clip_both_steps',
+                    'bess_clip_total_energy_mwh','bess_clip_avg_abs_mw'
+                }
+                missing = [c for c in must if c not in df.columns]
+                if missing:
+                    print(f"[INFO] Skipped BESS clipping correlation (missing columns: {missing})")
+                else:
+                    n_steps = pd.to_numeric(df['n_steps'], errors='coerce')
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        df['violation_rate'] = pd.to_numeric(df['steps_trafo_over_80pct'], errors='coerce') / n_steps
+                        df['clip_power_rate'] = pd.to_numeric(df['bess_clip_power_steps'], errors='coerce') / n_steps
+                        df['clip_energy_rate'] = pd.to_numeric(df['bess_clip_energy_steps'], errors='coerce') / n_steps
+                        df['clip_both_rate'] = pd.to_numeric(df['bess_clip_both_steps'], errors='coerce') / n_steps
+                    df = df.replace([np.inf, -np.inf], np.nan)
+                    df = df.dropna(subset=['violation_rate','clip_power_rate','clip_energy_rate','clip_both_rate','bess_clip_avg_abs_mw'])
+
+                    # Persist per-trajectory CSV
+                    tok = epsilon_token(chosen_eps)
+                    out_csv = os.path.join(RESULTS_DIR, f"{BESS_CLIP_SUMMARY_PREFIX}{tok}.csv")
+                    export_cols = []
+                    if 'sample_id' in df.columns:
+                        export_cols.append('sample_id')
+                    export_cols += [
+                        'n_steps','steps_trafo_over_80pct','violation_rate',
+                        'bess_clip_power_steps','bess_clip_energy_steps','bess_clip_both_steps',
+                        'clip_power_rate','clip_energy_rate','clip_both_rate',
+                        'bess_clip_total_energy_mwh','bess_clip_avg_abs_mw'
+                    ]
+                    for c in ['bess_headroom_charge_avg_mw','bess_headroom_discharge_avg_mw']:
+                        if c in df.columns:
+                            export_cols.append(c)
+                    df.loc[:, export_cols].to_csv(out_csv, index=False)
+                    print(f"✓ BESS clipping summary CSV (ε={chosen_eps:.2f}): {out_csv}")
+
+                    # Build scatter figure
+                    fig_c, axes_c = plt.subplots(1, 3, figsize=(15, 4.5), constrained_layout=True)
+                    pairs = [
+                        ('clip_power_rate', 'Power-clip rate'),
+                        ('clip_energy_rate', 'Energy-clip rate'),
+                        ('bess_clip_avg_abs_mw', 'Avg |clip| (MW)')
+                    ]
+                    x = df['violation_rate'].to_numpy(dtype=float)
+                    for ax, (col, title) in zip(axes_c, pairs):
+                        y = pd.to_numeric(df[col], errors='coerce').to_numpy(dtype=float)
+                        ax.scatter(x, y, s=28, alpha=0.8, color='#1f77b4', edgecolors='none')
+                        # Pearson correlation
+                        r = np.nan
+                        try:
+                            mask = np.isfinite(x) & np.isfinite(y)
+                            if np.count_nonzero(mask) > 1:
+                                r = float(np.corrcoef(x[mask], y[mask])[0,1])
+                        except Exception:
+                            r = np.nan
+                        ax.set_title(f"{title}\n r={r:.2f}" if np.isfinite(r) else title)
+                        ax.set_xlabel('Transformer violation rate')
+                        ax.grid(alpha=0.3)
+                        if col.endswith('_rate'):
+                            ax.set_ylabel('rate')
+                            ax.set_ylim(0, 1.0)
+                            ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
+                            ax.xaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
+                        else:
+                            ax.set_ylabel('MW')
+                            ax.xaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
+                    fig_c.suptitle(f"BESS clipping vs transformer violations (ε={chosen_eps:.2f})")
+                    out_fig = os.path.join(RESULTS_DIR, BESS_CLIP_CORR_FIG.replace('.png', f'_epsilon_{tok}.png'))
+                    fig_c.savefig(out_fig, dpi=150)
+                    print(f"✓ BESS clipping correlation figure: {out_fig}")
+        except Exception as e:
+            print(f"[WARN] Failed to build BESS clipping correlation: {e}")
+
     # --- Per-trajectory frontier scatter (many dots) ---
     if PLOT_FRONTIER_TRAJECTORY_SCATTER:
         traj_points = []  # list of dicts: {'epsilon':..., 'mode':..., 'vrate':..., 'cost':...}
         # Baseline first
-        base_summary = os.path.join(RESULTS_DIR, 'v3_summary_drcc_false.csv')
+        base_summary = os.path.join(RESULTS_DIR, 'v4_summary_drcc_false.csv')
         if os.path.exists(base_summary):
             try:
                 dfb = pd.read_csv(base_summary)
@@ -1801,33 +2462,58 @@ def main() -> None:
                                 pass
             except Exception:
                 pass
-        # DRCC runs
+        # DRCC runs (include RT variants if present)
         for eps in EPSILONS:
             tok = epsilon_token(eps)
-            fpath = os.path.join(RESULTS_DIR, f'v3_summary_drcc_true_epsilon_{tok}.csv')
-            if not os.path.exists(fpath):
-                continue
-            try:
-                df_eps = pd.read_csv(fpath)
-            except Exception:
-                continue
-            if 'steps_trafo_over_80pct' not in df_eps.columns:
-                continue
-            if 'n_steps' not in df_eps.columns:
-                continue
-            for _, r in df_eps.iterrows():
+            variant_paths = find_summary_variant_paths(eps, RESULTS_DIR) if INCLUDE_RT_SPLIT else []
+            if variant_paths:
+                for rt_tag, summary_path, _meta in variant_paths:
+                    if not os.path.exists(summary_path):
+                        continue
+                    try:
+                        df_eps = pd.read_csv(summary_path)
+                    except Exception:
+                        continue
+                    if 'steps_trafo_over_80pct' not in df_eps.columns or 'n_steps' not in df_eps.columns:
+                        continue
+                    for _, r in df_eps.iterrows():
+                        try:
+                            ns = float(r.get('n_steps', np.nan))
+                            st = float(r.get('steps_trafo_over_80pct', np.nan))
+                            if ns > 0 and np.isfinite(st):
+                                traj_points.append({
+                                    'epsilon': eps,
+                                    'mode': 'drcc_true',
+                                    'rt_tag': rt_tag,
+                                    'vrate': st / ns,
+                                    'cost': float(r.get('total_cost_eur', np.nan))
+                                })
+                        except Exception:
+                            pass
+            else:
+                fpath = os.path.join(RESULTS_DIR, f"v4_summary_drcc_true_epsilon_{tok}.csv")
+                if not os.path.exists(fpath):
+                    continue
                 try:
-                    ns = float(r.get('n_steps', np.nan))
-                    st = float(r.get('steps_trafo_over_80pct', np.nan))
-                    if ns > 0 and np.isfinite(st):
-                        traj_points.append({
-                            'epsilon': eps,
-                            'mode': 'drcc_true',
-                            'vrate': st / ns,
-                            'cost': float(r.get('total_cost_eur', np.nan))
-                        })
+                    df_eps = pd.read_csv(fpath)
                 except Exception:
-                    pass
+                    continue
+                if 'steps_trafo_over_80pct' not in df_eps.columns or 'n_steps' not in df_eps.columns:
+                    continue
+                for _, r in df_eps.iterrows():
+                    try:
+                        ns = float(r.get('n_steps', np.nan))
+                        st = float(r.get('steps_trafo_over_80pct', np.nan))
+                        if ns > 0 and np.isfinite(st):
+                            traj_points.append({
+                                'epsilon': eps,
+                                'mode': 'drcc_true',
+                                'rt_tag': None,
+                                'vrate': st / ns,
+                                'cost': float(r.get('total_cost_eur', np.nan))
+                            })
+                    except Exception:
+                        pass
         if traj_points:
             traj_df = pd.DataFrame(traj_points)
             fig_t, ax_t = plt.subplots(figsize=(6.5,5))
@@ -1874,43 +2560,102 @@ def main() -> None:
         # Rebuild mean subset (same logic as mean frontier) for consistency
         subset_rows = []
         for (mode, eps), grp in frontier_df.groupby(['mode','epsilon'], dropna=False):
-            grp_valid = grp[grp['trafo_violation_rate_mean'].notna()]
+            grp_valid = grp[grp['trafo_violation_rate_max'].notna()]
             if not grp_valid.empty:
                 pick = grp_valid.sort_values('n_trajectories', ascending=False).iloc[0]
             else:
                 pick = grp.sort_values('n_trajectories', ascending=False).iloc[0]
             subset_rows.append(pick)
         mean_df = pd.DataFrame(subset_rows)
-        # Gather trajectory cloud points (baseline + DRCC) reusing same approach
+        # Gather trajectory cloud points (baseline + DRCC) using per-trajectory max fraction of trafos violating at any timestep
         cloud_points: List[Dict] = []
-        base_summary = os.path.join(RESULTS_DIR, 'v3_summary_drcc_false.csv')
+        # Helpers
+        def _sample_max_violation_fraction_from_parquet(parquet_path: str, threshold_pct: float) -> Dict[int, float]:
+            try:
+                pdf = _read_parquet_or_csv(parquet_path)
+            except Exception:
+                pdf = None
+            if pdf is None:
+                return {}
+            must = {'sample_id','t','trafo_index','loading_pct'}
+            if not must <= set(pdf.columns):
+                return {}
+            grp = pdf.groupby(['sample_id','t'])['loading_pct'].apply(lambda s: np.mean(pd.to_numeric(s, errors='coerce') > threshold_pct)).reset_index(name='viol_frac')
+            smax = grp.groupby('sample_id')['viol_frac'].max()
+            out: Dict[int, float] = {}
+            for k, v in smax.items():
+                try:
+                    out[int(k)] = float(v)
+                except Exception:
+                    continue
+            return out
+        def _extract_sample_id(row: pd.Series, row_index: int) -> int:
+            for c in ('sample_id','case_id','case_index','trajectory_id','traj_id','i','sample'):
+                if c in row and pd.notna(row[c]):
+                    try:
+                        return int(row[c])
+                    except Exception:
+                        pass
+            return int(row_index)
+
+        base_summary = os.path.join(RESULTS_DIR, 'v4_summary_drcc_false.csv')
         if os.path.exists(base_summary):
             try:
                 dfb = pd.read_csv(base_summary)
-                if {'steps_trafo_over_80pct','n_steps','total_cost_eur'} <= set(dfb.columns):
-                    for _, r in dfb.iterrows():
-                        ns = float(r.get('n_steps', np.nan))
-                        st = float(r.get('steps_trafo_over_80pct', np.nan))
-                        if ns > 0 and np.isfinite(st):
-                            cloud_points.append({'epsilon': None,'mode':'stochastic','vrate': st/ns,'cost': float(r.get('total_cost_eur', np.nan))})
+                # Build baseline sample->max map from parquet
+                sample_max_map: Dict[int, float] = {}
+                base_meta_path = os.path.join(RESULTS_DIR, 'v4_meta_drcc_false.json')
+                if os.path.exists(base_meta_path):
+                    try:
+                        with open(base_meta_path,'r',encoding='utf-8') as f:
+                            base_meta = json.load(f)
+                        rel = base_meta.get('trafo_loading_file') if isinstance(base_meta, dict) else None
+                        if rel:
+                            pq_path = os.path.join(RESULTS_DIR, rel.replace('/', os.sep))
+                            if not os.path.exists(pq_path) and os.path.exists(rel):
+                                pq_path = rel
+                            if os.path.exists(pq_path):
+                                sample_max_map = _sample_max_violation_fraction_from_parquet(pq_path, viol_threshold_eff)
+                    except Exception:
+                        sample_max_map = {}
+                if 'total_cost_eur' in dfb.columns:
+                    for idx, r in dfb.iterrows():
+                        sid = _extract_sample_id(r, idx)
+                        xval = sample_max_map.get(sid, np.nan)
+                        cloud_points.append({'epsilon': None,'mode':'stochastic','vrate': xval,'cost': float(r.get('total_cost_eur', np.nan))})
             except Exception:
                 pass
         for eps in EPSILONS:
             tok = epsilon_token(eps)
-            fpath = os.path.join(RESULTS_DIR, f'v3_summary_drcc_true_epsilon_{tok}.csv')
+            fpath = os.path.join(RESULTS_DIR, f'v4_summary_drcc_true_epsilon_{tok}.csv')
             if not os.path.exists(fpath):
                 continue
             try:
                 df_eps = pd.read_csv(fpath)
             except Exception:
                 continue
-            if {'steps_trafo_over_80pct','n_steps','total_cost_eur'} - set(df_eps.columns):
+            if 'total_cost_eur' not in df_eps.columns:
                 continue
-            for _, r in df_eps.iterrows():
-                ns = float(r.get('n_steps', np.nan))
-                st = float(r.get('steps_trafo_over_80pct', np.nan))
-                if ns > 0 and np.isfinite(st):
-                    cloud_points.append({'epsilon': eps,'mode':'drcc_true','vrate': st/ns,'cost': float(r.get('total_cost_eur', np.nan))})
+            # sample->max map for this epsilon
+            sample_max_map: Dict[int, float] = {}
+            meta_path = os.path.join(RESULTS_DIR, f'v4_meta_drcc_true_epsilon_{tok}.json')
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path,'r',encoding='utf-8') as f:
+                        meta = json.load(f)
+                    rel = meta.get('trafo_loading_file') if isinstance(meta, dict) else None
+                    if rel:
+                        pq_path = os.path.join(RESULTS_DIR, rel.replace('/', os.sep))
+                        if not os.path.exists(pq_path) and os.path.exists(rel):
+                            pq_path = rel
+                        if os.path.exists(pq_path):
+                            sample_max_map = _sample_max_violation_fraction_from_parquet(pq_path, viol_threshold_eff)
+                except Exception:
+                    sample_max_map = {}
+            for idx, r in df_eps.iterrows():
+                sid = _extract_sample_id(r, idx)
+                xval = sample_max_map.get(sid, np.nan)
+                cloud_points.append({'epsilon': eps,'mode':'drcc_true','vrate': xval,'cost': float(r.get('total_cost_eur', np.nan))})
         if cloud_points and not mean_df.empty:
             cloud_df = pd.DataFrame(cloud_points)
             fig_h, ax_h = plt.subplots(figsize=(6,5))
@@ -1934,7 +2679,7 @@ def main() -> None:
                 vmin_m, vmax_m = float(np.nanmin(eps_mean)), float(np.nanmax(eps_mean))
                 norm_m = plt.Normalize(vmin=vmin_m, vmax=vmax_m)
                 cmap_m = plt.cm.viridis
-                preferred = [0.10, 0.20, 0.30]
+                preferred = [0.10, 0.15, 0.05]
                 present_m = [float(e) for e in sorted(pd.unique(drcc_mean['epsilon'].dropna()))]
                 extras_m = [e for e in present_m if e not in preferred]
                 order_eps_m = extras_m + [e for e in preferred if e in present_m]
@@ -1942,26 +2687,27 @@ def main() -> None:
                     subm = drcc_mean[np.isclose(drcc_mean['epsilon'].astype(float), e)]
                     if subm.empty:
                         continue
-                    ax_h.scatter(subm['trafo_violation_rate_mean'], subm['mean_cost_eur'],
+                    ax_h.scatter(subm['trafo_violation_rate_max'], subm['mean_cost_eur'],
                                  color=cmap_m(norm_m(e)), s=70, edgecolors='k', linewidths=0.4, zorder=4)
-                sm_m = mpl.cm.ScalarMappable(norm=norm_m, cmap=cmap_m)
-                sm_m.set_array([])
-                fig_h.colorbar(sm_m, ax=ax_h, label='risk level (ε)')
+                # Removed colorbar on hybrid mean overlay per user request
+                # sm_m = mpl.cm.ScalarMappable(norm=norm_m, cmap=cmap_m)
+                # sm_m.set_array([])
+                # fig_h.colorbar(sm_m, ax=ax_h, label='risk level (ε)')
             if not base_mean.empty:
-                ax_h.scatter(base_mean['trafo_violation_rate_mean'], base_mean['mean_cost_eur'],
+                ax_h.scatter(base_mean['trafo_violation_rate_max'], base_mean['mean_cost_eur'],
                              marker='o', s=85, c='black', edgecolors='white', linewidths=0.4, zorder=3)
                 # Annotate deterministic mean point(s)
                 for _, r in base_mean.iterrows():
-                    if np.isfinite(r['trafo_violation_rate_mean']) and np.isfinite(r['mean_cost_eur']):
-                        _ann3 = ax_h.annotate('deterministic', (r['trafo_violation_rate_mean'], r['mean_cost_eur']),
+                    if np.isfinite(r['trafo_violation_rate_max']) and np.isfinite(r['mean_cost_eur']):
+                        _ann3 = ax_h.annotate('deterministic', (r['trafo_violation_rate_max'], r['mean_cost_eur']),
                                                textcoords='offset points', xytext=(4,4), fontsize=8, color='black')
                         _ann3.set_path_effects([patheffects.withStroke(linewidth=2.5, foreground='white')])
             for _, r in drcc_mean.iterrows():
                 if r['epsilon'] is not None and np.isfinite(r['epsilon']):
-                    _ann4 = ax_h.annotate(f"ε = {r['epsilon']:.2f}", (r['trafo_violation_rate_mean'], r['mean_cost_eur']),
+                    _ann4 = ax_h.annotate(f"ε = {r['epsilon']:.2f}", (r['trafo_violation_rate_max'], r['mean_cost_eur']),
                                           textcoords='offset points', xytext=(4,4), fontsize=8, color='black')
                     _ann4.set_path_effects([patheffects.withStroke(linewidth=2.5, foreground='white')])
-            ax_h.set_xlabel('Transformer violation rate (trajectory / mean)')
+            ax_h.set_xlabel('Transformer violation rate (trajectory / max over time)')
             ax_h.set_ylabel('Total cost (EUR)')
             ax_h.set_title('Hybrid Cost–Risk Frontier (Cloud + Mean)')
             ax_h.grid(alpha=0.35)
@@ -1973,124 +2719,321 @@ def main() -> None:
         else:
             print('[INFO] Hybrid frontier scatter skipped (insufficient data).')
 
-    # --- Transformer violation probability per timestep ---
+    # --- Transformer violation probability per timestep (now RT variants distinguished) ---
     if PLOT_TRAFO_VIOLATION_TIME_PROFILE:
-        # Correct per-timestep probability: for each (sample_id, t) take max loading across trafos; violation if > threshold.
-        threshold_pct = violation_threshold_pct
-        profiles: List[Tuple[str, np.ndarray]] = []
+        threshold_pct = viol_threshold_eff  # strict '>' threshold
+        profiles: List[Tuple[str, np.ndarray]] = []  # (label, rate_series)
+        profiles_detail: Dict[str, Dict[str, np.ndarray]] = {}
         t_axis: np.ndarray | None = None
-        # Helper to compute profile from a parquet path
+
         def compute_profile(parquet_path: str):
+            """Return (t_index_array, n_counts, n_violations, rate_series)."""
             try:
-                pdf = pd.read_parquet(parquet_path)
+                pdf = _read_parquet_or_csv(parquet_path)
             except Exception:
+                pdf = None
+            if pdf is None:
                 return None
             must = {'sample_id','t','trafo_index','loading_pct'}
             if not must <= set(pdf.columns):
                 return None
-            # Max across trafos per (sample_id, t)
             grp = pdf.groupby(['sample_id','t'])['loading_pct'].max().reset_index()
             counts = grp.groupby('t')['sample_id'].nunique()
             viol = grp[grp['loading_pct'] > threshold_pct].groupby('t')['sample_id'].nunique()
-            rate_series = (viol / counts).reindex(counts.index).fillna(0.0)
-            return counts.index.to_numpy(), rate_series.to_numpy()
-        # Baseline (drcc_false)
-        base_meta = os.path.join(RESULTS_DIR, 'v3_meta_drcc_false.json')
-        if os.path.exists(base_meta):
+            viol = viol.reindex(counts.index).fillna(0.0)
+            rate_series = (viol / counts).astype(float)
+            return counts.index.to_numpy(), counts.to_numpy(), viol.to_numpy(), rate_series.to_numpy()
+
+        # Helper to add a meta path (with label) for baseline or epsilon variants
+        def add_meta_variant(label: str, meta_path: str):
+            nonlocal t_axis
+            if not os.path.exists(meta_path):
+                return
             try:
-                with open(base_meta,'r',encoding='utf-8') as f:
-                    m = json.load(f)
-                rel = m.get('trafo_loading_file')
-                if rel:
-                    base_pq = os.path.join(RESULTS_DIR, rel)
-                    if os.path.exists(base_pq):
-                        res = compute_profile(base_pq)
-                        if res:
-                            t_axis, rate = res
-                            profiles.append(('stochastic', rate))
-            except Exception as e:
-                print(f"[WARN] Baseline trafo profile failed: {e}")
-        # DRCC epsilons
-        for eps in EPSILONS:
-            meta_e = load_meta_for_epsilon(eps)
-            rel = meta_e.get('trafo_loading_file') if isinstance(meta_e, dict) else None
-            if not rel:
-                continue
-            pq_path = os.path.join(RESULTS_DIR, rel.replace('/', os.sep))
-            if not os.path.exists(pq_path):
-                continue
-            res = compute_profile(pq_path)
-            if not res:
-                continue
-            t_local, rate = res
-            if t_axis is None:
-                t_axis = t_local
-            else:
-                if len(t_local) != len(t_axis):  # simple alignment by truncation
-                    min_len = min(len(t_local), len(t_axis))
-                    t_axis = t_axis[:min_len]
-                    rate = rate[:min_len]
-            profiles.append((f"{eps:.2f}", rate))
-        if profiles and t_axis is not None:
-            # Normalize all lengths
-            min_len = min(len(r) for _, r in profiles)
-            profiles = [(lab, r[:min_len]) for lab, r in profiles]
-            t_axis = t_axis[:min_len]
-            fig_tp, ax_tp = plt.subplots(figsize=(10,4.8))
-            # baseline first
-            for lab, arr in sorted(profiles, key=lambda x: (0 if x[0]=='stochastic' else 1, x[0])):
-                if lab == 'stochastic':
-                    ax_tp.plot(t_axis, arr, color='black', linestyle='--', linewidth=1.8, label=lab)
+                with open(meta_path,'r',encoding='utf-8') as f:
+                    meta = json.load(f)
+                rel = meta.get('trafo_loading_file') if isinstance(meta, dict) else None
+                if not rel:
+                    return
+                pq_path = os.path.join(RESULTS_DIR, rel.replace('/', os.sep))
+                if not os.path.exists(pq_path):
+                    # allow absolute path fallback
+                    if os.path.exists(rel):
+                        pq_path = rel
+                if not os.path.exists(pq_path):
+                    return
+                res = compute_profile(pq_path)
+                if not res:
+                    return
+                t_local, cnts, viols, rate = res
+                if t_axis is None:
+                    t_axis = t_local
                 else:
-                    ax_tp.plot(t_axis, arr, linewidth=1.2, alpha=0.9, label=f"DRCC, ε={lab}")
+                    if len(t_local) != len(t_axis):
+                        min_len = min(len(t_local), len(t_axis))
+                        t_axis = t_axis[:min_len]
+                        rate = rate[:min_len]; cnts = cnts[:min_len]; viols = viols[:min_len]
+                profiles.append((label, rate))
+                profiles_detail[label] = {'t': t_axis.copy(), 'n': cnts.copy(), 'k': viols.copy(), 'p': rate.copy()}
+            except Exception as e:
+                print(f"[WARN] Failed adding trafo profile for {label}: {e}")
+
+        # Baseline RT variants (deterministic case) strict enumeration
+        for tag in ('rt_on','rt_off','rt_unk'):
+            add_meta_variant(f"{DETERMINISTIC_LABEL} ({_rt_display(tag)})", os.path.join(RESULTS_DIR, f'v4_meta_drcc_false_{tag}.json'))
+        # Fallback unsuffixed deterministic if none added
+        if not any(lab.startswith(DETERMINISTIC_LABEL) for lab, _ in profiles):
+            add_meta_variant(DETERMINISTIC_LABEL, os.path.join(RESULTS_DIR, 'v4_meta_drcc_false.json'))
+
+        # DRCC epsilon RT variants
+        for eps in EPSILONS:
+            tok = epsilon_token(eps)
+            per_eps_added = False
+            for tag in ('rt_on','rt_off','rt_unk'):
+                label = f"{eps:.2f} ({_rt_display(tag)})"
+                path_meta = os.path.join(RESULTS_DIR, f'v4_meta_drcc_true_epsilon_{tok}_{tag}.json')
+                before_ct = len(profiles)
+                add_meta_variant(label, path_meta)
+                if len(profiles) > before_ct:
+                    per_eps_added = True
+            if not per_eps_added:  # fallback unsuffixed
+                add_meta_variant(f"{eps:.2f}", os.path.join(RESULTS_DIR, f'v4_meta_drcc_true_epsilon_{tok}.json'))
+
+        if profiles and t_axis is not None:
+            # Optional sanity check: investigate timesteps that appear as ~100% violations while viol threshold is strict '>'
+            if str(os.getenv('V4_DEBUG_VIOL_CHECK', '0')).strip() in {'1','true','True'}:
+                try:
+                    def _debug_scan_case(label: str, meta: dict, rate: np.ndarray, threshold: float):
+                        # Re-load underlying table and compute per-(sample,t) maxima
+                        if not isinstance(meta, dict) or 'trafo_loading_file' not in meta:
+                            return
+                        pq = os.path.join(RESULTS_DIR, meta['trafo_loading_file'].replace('/', os.sep))
+                        pdf = _read_parquet_or_csv(pq)
+                        if pdf is None or {'sample_id','t','trafo_index','loading_pct'} - set(pdf.columns):
+                            return
+                        grp = pdf.groupby(['sample_id','t'])['loading_pct'].max().reset_index()
+                        # Find t where plotted rate >= 0.999
+                        idx_full = np.where(rate >= 0.999)[0]
+                        if idx_full.size == 0:
+                            return
+                        print(f"[DEBUG] Case {label}: {len(idx_full)} timesteps with ~100% violation prob (strict '>' {threshold:.2f}%)")
+                        # Map from local 0..T-1 index to actual t value used in parquet
+                        # Our profile rate arrays are ordered by increasing 't'; align via unique sorted t values
+                        unique_t = np.sort(grp['t'].unique())
+                        for k in idx_full[:10]:  # print first few
+                            if k >= len(unique_t):
+                                continue
+                            tval = unique_t[k]
+                            rows = grp[grp['t'] == tval]['loading_pct']
+                            vals = pd.to_numeric(rows, errors='coerce').to_numpy()
+                            vals = vals[np.isfinite(vals)]
+                            if vals.size == 0:
+                                continue
+                            eq_cnt = int(np.sum(vals == threshold))
+                            gt_cnt = int(np.sum(vals > threshold))
+                            n = int(len(vals))
+                            print(f"  - t={tval}: n={n}, min={np.min(vals):.6f}, max={np.max(vals):.6f}, ==thr={eq_cnt}, >thr={gt_cnt}")
+
+                    # Baseline
+                    base_meta_path = os.path.join(RESULTS_DIR, 'v4_meta_drcc_false.json')
+                    if os.path.exists(base_meta_path):
+                        with open(base_meta_path,'r',encoding='utf-8') as f:
+                            m0 = json.load(f)
+                        # Find its rate series from profiles
+                        for lab, arr in profiles:
+                            if lab == 'stochastic':
+                                _debug_scan_case('deterministic', m0, arr, viol_threshold_eff)
+                                break
+                    # DRCC eps
+                    for eps in EPSILONS:
+                        lab = f"{eps:.2f}"
+                        m = load_meta_for_epsilon(eps)
+                        for lab2, arr in profiles:
+                            if lab2 == lab:
+                                _debug_scan_case(lab, m, arr, viol_threshold_eff)
+                                break
+                except Exception as _dbg:
+                    print(f"[WARN] Debug violation check failed: {_dbg}")
+            # Align all series by the union of available timestep keys instead of truncation
+            try:
+                # Build union of t across all cases we collected in profiles_detail
+                union_t_vals = None
+                for lab in [lb for lb, _ in profiles]:
+                    det = profiles_detail.get(lab)
+                    if isinstance(det, dict) and 't' in det and det['t'] is not None:
+                        t_vals = np.asarray(det['t'])
+                        union_t_vals = t_vals if union_t_vals is None else np.union1d(union_t_vals, t_vals)
+                if union_t_vals is None:
+                    # Fallback to previous behavior if no t arrays found
+                    min_len = min(len(r) for _, r in profiles)
+                    profiles = [(lab, r[:min_len]) for lab, r in profiles]
+                    t_axis = t_axis[:min_len]
+                else:
+                    # Reindex each rate series onto the union t-axis
+                    aligned_profiles = []
+                    for lab, _rate in profiles:
+                        det = profiles_detail.get(lab, {})
+                        t_vals = np.asarray(det.get('t', []))
+                        p_vals = np.asarray(det.get('p', []), dtype=float)
+                        # Map existing t positions to union indices
+                        aligned = np.full(shape=(len(union_t_vals),), fill_value=np.nan, dtype=float)
+                        if t_vals.size and p_vals.size:
+                            # Build index via match
+                            # Use dict for speed on generic small horizons
+                            idx_map = {int(tv): i for i, tv in enumerate(union_t_vals)}
+                            for j, tv in enumerate(t_vals):
+                                i_u = idx_map.get(int(tv))
+                                if i_u is not None and j < len(p_vals):
+                                    aligned[i_u] = float(p_vals[j])
+                        aligned_profiles.append((lab, aligned))
+                    profiles = aligned_profiles
+                    t_axis = union_t_vals
+            except Exception:
+                # On any alignment failure, revert to safe truncation
+                min_len = min(len(r) for _, r in profiles)
+                profiles = [(lab, r[:min_len]) for lab, r in profiles]
+                t_axis = t_axis[:min_len]
+            fig_tp, ax_tp = plt.subplots(figsize=(10,4.8))
+            # Plot with ordering: deterministic variants first (rt_on, rt_off, rt_unk), then epsilons ascending with their RT tags
+            def _order_key(lab: str):
+                if lab.startswith(DETERMINISTIC_LABEL):
+                    # deterministic (rt_on first, then rt_off, rt_unk, unsuffixed)
+                    if '(RT ON)' in lab: return (0,0)
+                    if '(RT OFF)' in lab: return (0,1)
+                    if '(RT ?)' in lab or '(RT UNK)' in lab: return (0,2)
+                    return (0,3)
+                # epsilon labels start with number
+                try:
+                    base = lab.split()[0]
+                    val = float(base)
+                except Exception:
+                    val = 999.0
+                # keep rt_on before rt_off before rt_unk before unsuffixed for same epsilon
+                if '(RT ON)' in lab: tag_rank = 0
+                elif '(RT OFF)' in lab: tag_rank = 1
+                elif '(RT ?)' in lab or '(RT UNK)' in lab: tag_rank = 2
+                else: tag_rank = 3
+                return (1, val, tag_rank)
+            for lab, arr in sorted(profiles, key=lambda x: _order_key(x[0])):
+                # Choose style: deterministic dashed, others solid
+                style = '--' if lab.startswith(DETERMINISTIC_LABEL) else '-'
+                ax_tp.plot(t_axis, arr, linewidth=1.2 if style=='-' else 1.6, linestyle=style, alpha=0.95, label=lab)
             ax_tp.set_xlabel('Timestep index')
-            ax_tp.set_ylabel(f"P(any trafo > {int(threshold_pct)}%)")
+            ax_tp.set_ylabel(f"P(any trafo > {threshold_pct:.2f}%)")
             ax_tp.set_title('Per-Timestep Transformer Violation Probability')
             ax_tp.grid(alpha=0.3, linewidth=0.5)
             ax_tp.set_ylim(0, 1.0)
-            ax_tp.legend(fontsize=8, ncol=3, frameon=False)
+            ax_tp.legend(fontsize=8, ncol=min(4, len(profiles)), frameon=False)
             out_tp = os.path.join(RESULTS_DIR, TRAFO_VIOLATION_TIME_PROFILE_FIG)
             fig_tp.tight_layout()
             fig_tp.savefig(out_tp, dpi=160)
             print(f"✓ Transformer violation time profile: {out_tp}")
+            # Also export a CSV with per-timestep counts, violations, and probabilities per case
+            try:
+                rows_tp: List[Dict[str, float]] = []
+                for lab, det in profiles_detail.items():
+                    t_vals = det['t']
+                    n_vals = det['n']
+                    k_vals = det['k']
+                    p_vals = det['p']
+                    L = min(len(t_vals), len(n_vals), len(k_vals), len(p_vals))
+                    for i in range(L):
+                        rows_tp.append({
+                            'case': lab,
+                            't': int(t_vals[i]),
+                            'n_samples': int(n_vals[i]),
+                            'n_violations': int(k_vals[i]),
+                            'violation_probability': float(p_vals[i])
+                        })
+                out_tp_csv = os.path.join(RESULTS_DIR, 'trafo_violation_time_profile.csv')
+                pd.DataFrame(rows_tp).to_csv(out_tp_csv, index=False)
+                print(f"✓ Transformer violation time profile CSV: {out_tp_csv}")
+            except Exception as _e:
+                print(f"[WARN] Could not write time profile CSV: {_e}")
         else:
             print('[INFO] Skipped transformer violation time profile (no loading parquet data).')
 
-    # --- Transformer violation probability heatmap (cases x timesteps) ---
+    # --- Transformer violation probability heatmap (cases x timesteps, RT variants) ---
     if 'profiles' in locals() and profiles and 't_axis' in locals() and t_axis is not None and PLOT_TRAFO_VIOLATION_HEATMAP:
         try:
-            # Ensure consistent ordering: deterministic (baseline) first, then 0.30, 0.20, 0.10 (and others afterward)
-            labels_present = [lab for lab, _ in profiles]
-            desired_order = []
-            if 'stochastic' in labels_present:
-                desired_order.append('stochastic')
-            for e in EPSILONS:  # EPSILONS is [0.30, 0.20, 0.10, 0.05]
-                lab = f"{e:.2f}"
-                if lab in labels_present:
-                    desired_order.append(lab)
-            profiles_sorted = sorted(
-                profiles,
-                key=lambda it: desired_order.index(it[0]) if it[0] in desired_order else 999
-            )
-            # Align length to min length across rows, reuse earlier normalization if needed
-            min_len = min(len(r) for _, r in profiles_sorted)
-            mat = np.vstack([r[:min_len] for _, r in profiles_sorted])  # shape: (cases, T)
-            # Clip probabilities at 0.5 for visualization
-            mat = np.clip(mat, 0.0, 0.5)
-            case_labels = [(_display_label_for_case(lab) if lab != 'stochastic' else 'deterministic') for lab, _ in profiles_sorted]
+            # Re-order using same key function as time profile
+            def _hm_order_key(lab: str):
+                if lab.startswith(DETERMINISTIC_LABEL):
+                    if '(RT ON)' in lab: return (0,0)
+                    if '(RT OFF)' in lab: return (0,1)
+                    if '(RT ?)' in lab or '(RT UNK)' in lab: return (0,2)
+                    return (0,3)
+                try:
+                    base = lab.split()[0]
+                    val = float(base)
+                except Exception:
+                    val = 999.0
+                if '(RT ON)' in lab: tag_rank = 0
+                elif '(RT OFF)' in lab: tag_rank = 1
+                elif '(RT ?)' in lab or '(RT UNK)' in lab: tag_rank = 2
+                else: tag_rank = 3
+                return (1, val, tag_rank)
+            profiles_sorted = sorted(profiles, key=lambda it: _hm_order_key(it[0]))
+            # Build a shared t-axis using profiles_detail if available; otherwise, use current t_axis
+            try:
+                union_t_vals = None
+                if 'profiles_detail' in locals() and isinstance(profiles_detail, dict):
+                    for lab, _ in profiles_sorted:
+                        det = profiles_detail.get(lab)
+                        if isinstance(det, dict) and 't' in det and det['t'] is not None:
+                            t_vals = np.asarray(det['t'])
+                            union_t_vals = t_vals if union_t_vals is None else np.union1d(union_t_vals, t_vals)
+                if union_t_vals is None:
+                    # Fall back to existing axis
+                    union_t_vals = np.asarray(t_axis)
+                # For each profile, align to union_t_vals
+                aligned_rows = []
+                for lab, r in profiles_sorted:
+                    if 'profiles_detail' in locals() and isinstance(profiles_detail, dict) and lab in profiles_detail:
+                        det = profiles_detail[lab]
+                        t_vals = np.asarray(det.get('t', []))
+                        p_vals = np.asarray(det.get('p', []), dtype=float)
+                        row = np.full(shape=(len(union_t_vals),), fill_value=np.nan, dtype=float)
+                        if t_vals.size and p_vals.size:
+                            idx_map = {int(tv): i for i, tv in enumerate(union_t_vals)}
+                            for j, tv in enumerate(t_vals):
+                                i_u = idx_map.get(int(tv))
+                                if i_u is not None and j < len(p_vals):
+                                    row[i_u] = float(p_vals[j])
+                        aligned_rows.append(row)
+                    else:
+                        # If we don't have detailed t, assume r already matches current t_axis
+                        # Reindex to union_t by simple truncation/padding to the left
+                        row = np.full(shape=(len(union_t_vals),), fill_value=np.nan, dtype=float)
+                        L = min(len(r), len(union_t_vals))
+                        row[:L] = r[:L]
+                        aligned_rows.append(row)
+                mat = np.vstack(aligned_rows)
+                T = mat.shape[1]
+            except Exception:
+                # Fallback: previous behavior (min-length truncation)
+                min_len = min(len(r) for _, r in profiles_sorted)
+                mat = np.vstack([r[:min_len] for _, r in profiles_sorted])
+                T = mat.shape[1]
+            # Use full probability range [0,1]
+            mat = np.clip(mat, 0.0, 1.0)
+            case_labels = [lab for lab, _ in profiles_sorted]
             # Build heatmap
-            fig_hm, ax_hm = plt.subplots(figsize=(min_len/10 + 2.5, 0.6*len(case_labels) + 1.8))
-            im = ax_hm.imshow(mat, aspect='auto', cmap=WHITE_BLUE_CMAP, vmin=0.0, vmax=0.5, interpolation='nearest')
+            fig_hm, ax_hm = plt.subplots(figsize=(T/10 + 2.5, 0.6*len(case_labels) + 1.8))
+            # Mask NaNs so truly-missing timesteps are not misinterpreted
+            mat_masked = np.ma.masked_invalid(mat)
+            # Improve contrast by saturating at 0.4 probability
+            vmax_limit = 0.4
+            im = ax_hm.imshow(mat_masked, aspect='auto', cmap=WHITE_BLUE_CMAP, vmin=0.0, vmax=vmax_limit, interpolation='nearest')
             ax_hm.set_yticks(np.arange(len(case_labels)))
             ax_hm.set_yticklabels(case_labels)
             ax_hm.set_xlabel('timestep index')
-            ax_hm.set_ylabel('optimization case')
-            ax_hm.set_title('Chance of transformer overload per timestep')
+            ax_hm.set_ylabel('case (ε + RT)')
+            ax_hm.set_title('Transformer Overload Probability per Timestep (All RT Variants)')
             # Colorbar on the right
             cbar = fig_hm.colorbar(im, ax=ax_hm, fraction=0.046, pad=0.04)
-            cbar.set_label('violation probability (clipped at 0.5)')
+            cbar.set_label('violation probability (saturated at 0.4)')
             # Optionally thin x ticks for readability on long horizons
-            T = mat.shape[1]
             if T > 48:
                 step = 24 if T > 200 else 12
                 ax_hm.set_xticks(np.arange(0, T, step))
@@ -2111,9 +3054,20 @@ def main() -> None:
             heat_cases.append((DETERMINISTIC_LABEL, base_pol))
         for eps in EPSILONS:
             tok = epsilon_token(eps)
-            pol_path = os.path.join(RESULTS_DIR, f'policy_coeffs_drcc_true_epsilon_{tok}.csv')
-            if os.path.exists(pol_path):
-                heat_cases.append((f"{eps:.2f}", pol_path))
+            # Support RT-suffixed variants; prefer rt_on then rt_off then unsuffixed
+            pol_candidates = [
+                os.path.join(RESULTS_DIR, f'policy_coeffs_drcc_true_epsilon_{tok}_rt_on.csv'),
+                os.path.join(RESULTS_DIR, f'policy_coeffs_drcc_true_epsilon_{tok}_rt_off.csv'),
+                os.path.join(RESULTS_DIR, f'policy_coeffs_drcc_true_epsilon_{tok}_rt_unk.csv'),
+                os.path.join(RESULTS_DIR, f'policy_coeffs_drcc_true_epsilon_{tok}.csv'),
+            ]
+            chosen_pol = None
+            for _p in pol_candidates:
+                if os.path.exists(_p):
+                    chosen_pol = _p
+                    break
+            if chosen_pol:
+                heat_cases.append((f"{eps:.2f}", chosen_pol))
         if heat_cases:
             # Load first to get coeff order
             coeff_order: List[str] = []
@@ -2125,8 +3079,13 @@ def main() -> None:
                     continue
                 if 'timestamp' in pdf.columns:
                     pdf = pdf.drop(columns=['timestamp'])
-                # Identify coefficients (numeric columns)
-                cols = [c for c in pdf.columns if np.issubdtype(pdf[c].dtype, np.number)]
+                # Identify coefficients: prefer K-gain columns if present; otherwise use all numeric
+                k_pref = ['K_pv_bess','K_hp_bess','K_pv_pvcurt','K_hp_pvcurt']
+                available_k = [c for c in k_pref if c in pdf.columns]
+                if available_k:
+                    cols = available_k
+                else:
+                    cols = [c for c in pdf.columns if np.issubdtype(pdf[c].dtype, np.number)]
                 if not cols:
                     continue
                 if not coeff_order:
@@ -2159,6 +3118,15 @@ def main() -> None:
                         if s.endswith(suf):
                             s = s[: -len(suf)]
                     low = s.lower()
+                    # K gains
+                    if low == 'k_pv_bess':
+                        return r'$K_{pv\to bess}$'
+                    if low == 'k_hp_bess':
+                        return r'$K_{hp\to bess}$'
+                    if low == 'k_pv_pvcurt':
+                        return r'$K_{pv\to curt}$'
+                    if low == 'k_hp_pvcurt':
+                        return r'$K_{hp\to curt}$'
                     # lambda family
                     if low.startswith('lambda0') or low == 'lambda0':
                         return r'$\lambda^{(0)}$'
@@ -2214,9 +3182,19 @@ def main() -> None:
             lambda_cases.append((DETERMINISTIC_LABEL, base_pol, None))
         for eps in EPSILONS:
             tok = epsilon_token(eps)
-            pol_path = os.path.join(RESULTS_DIR, f'policy_coeffs_drcc_true_epsilon_{tok}.csv')
-            if os.path.exists(pol_path):
-                lambda_cases.append((f"{eps:.2f}", pol_path, eps))
+            pol_candidates = [
+                os.path.join(RESULTS_DIR, f'policy_coeffs_drcc_true_epsilon_{tok}_rt_on.csv'),
+                os.path.join(RESULTS_DIR, f'policy_coeffs_drcc_true_epsilon_{tok}_rt_off.csv'),
+                os.path.join(RESULTS_DIR, f'policy_coeffs_drcc_true_epsilon_{tok}_rt_unk.csv'),
+                os.path.join(RESULTS_DIR, f'policy_coeffs_drcc_true_epsilon_{tok}.csv'),
+            ]
+            chosen_pol = None
+            for _p in pol_candidates:
+                if os.path.exists(_p):
+                    chosen_pol = _p
+                    break
+            if chosen_pol:
+                lambda_cases.append((f"{eps:.2f}", chosen_pol, eps))
         # Need both lambda0_mw and lambda_plus to proceed
         if lambda_cases:
             try:
@@ -2273,19 +3251,118 @@ def main() -> None:
             except Exception as e:
                 print(f"[WARN] Failed to build lambda time series plot: {e}")
 
+        # --- Policy K-gain time series (K_pv_bess, K_hp_bess, K_pv_pvcurt, K_hp_pvcurt) ---
+        if 'PLOT_POLICY_K_TIME_SERIES' in globals() and PLOT_POLICY_K_TIME_SERIES:
+            k_cases: List[Tuple[str, str, float | None]] = []  # (label, path, epsilon)
+            base_pol = os.path.join(RESULTS_DIR, 'policy_coeffs_drcc_false.csv')
+            if os.path.exists(base_pol):
+                k_cases.append((DETERMINISTIC_LABEL, base_pol, None))
+            for eps in EPSILONS:
+                tok = epsilon_token(eps)
+                pol_candidates = [
+                    os.path.join(RESULTS_DIR, f'policy_coeffs_drcc_true_epsilon_{tok}_rt_on.csv'),
+                    os.path.join(RESULTS_DIR, f'policy_coeffs_drcc_true_epsilon_{tok}_rt_off.csv'),
+                    os.path.join(RESULTS_DIR, f'policy_coeffs_drcc_true_epsilon_{tok}_rt_unk.csv'),
+                    os.path.join(RESULTS_DIR, f'policy_coeffs_drcc_true_epsilon_{tok}.csv'),
+                ]
+                chosen_pol = None
+                for _p in pol_candidates:
+                    if os.path.exists(_p):
+                        chosen_pol = _p
+                        break
+                if chosen_pol:
+                    k_cases.append((f"{eps:.2f}", chosen_pol, eps))
+            if k_cases:
+                try:
+                    series_map: Dict[str, List[Tuple[str, np.ndarray]]] = {  # coeff -> list of (label, values)
+                        'K_pv_bess': [], 'K_hp_bess': [], 'K_pv_pvcurt': [], 'K_hp_pvcurt': []
+                    }
+                    for lab, path_pol, eps_val in k_cases:
+                        try:
+                            pdf = pd.read_csv(path_pol)
+                        except Exception:
+                            continue
+                        # Only proceed if at least one K column exists
+                        present = [k for k in series_map.keys() if k in pdf.columns]
+                        if not present:
+                            continue
+                        for k in present:
+                            series_map[k].append((lab, pd.to_numeric(pdf[k], errors='coerce').to_numpy(dtype=float)))
+                    # Filter out coefficients with no data
+                    series_map = {k: v for k, v in series_map.items() if v}
+                    if series_map:
+                        # Determine subplot rows: group BESS-target K on row 1, PV-curt on row 2
+                        def _color_for(lab: str, ordered_labels: List[str]) -> str:
+                            if lab == DETERMINISTIC_LABEL:
+                                return 'black'
+                            cmap = plt.cm.plasma
+                            if lab in ordered_labels:
+                                idx = ordered_labels.index(lab)
+                                return cmap((idx+1)/(len(ordered_labels)+1))
+                            return 'gray'
+                        # Order epsilon labels for consistent colors
+                        eps_labels = sorted([lab for lab, _, e in k_cases if e is not None], key=lambda x: float(x))
+                        figk, axk = plt.subplots(2, 1, figsize=(10, 6.0), sharex=True, constrained_layout=True)
+                        # Row 1: K to BESS
+                        for coeff in ['K_pv_bess','K_hp_bess']:
+                            if coeff in series_map:
+                                for lab, vals in series_map[coeff]:
+                                    axk[0].plot(vals, label=lab, linewidth=1.2,
+                                                color=_color_for(lab, eps_labels), linestyle='--' if lab==DETERMINISTIC_LABEL else '-')
+                        axk[0].set_ylabel('K to BESS')
+                        axk[0].grid(alpha=0.25)
+                        # Row 2: K to PV curtailment
+                        for coeff in ['K_pv_pvcurt','K_hp_pvcurt']:
+                            if coeff in series_map:
+                                for lab, vals in series_map[coeff]:
+                                    axk[1].plot(vals, label=lab, linewidth=1.2,
+                                                color=_color_for(lab, eps_labels), linestyle='--' if lab==DETERMINISTIC_LABEL else '-')
+                        axk[1].set_ylabel('K to Curtailment')
+                        axk[1].set_xlabel('Timestep index')
+                        axk[1].grid(alpha=0.25)
+                        # Legend once at top
+                        handles, labels = axk[0].get_legend_handles_labels()
+                        disp_labels = [_display_label_for_case(l) for l in labels]
+                        if handles:
+                            figk.legend(handles, disp_labels, loc='upper center', ncol=min(6, len(disp_labels)), frameon=False, fontsize=8, bbox_to_anchor=(0.5, 1.02))
+                        out_k = os.path.join(RESULTS_DIR, POLICY_K_TIME_SERIES_FIG)
+                        figk.savefig(out_k, dpi=150)
+                        print(f"✓ Policy K-gain time series: {out_k}")
+                except Exception as e:
+                    print(f"[WARN] Failed to build K time series plot: {e}")
+
     # --- SoC envelope plotting (optional) ---
     if PLOT_SOC_ENVELOPES:
-        # Collect envelope files consistent with naming
-        cases: List[Tuple[str, str, float | None]] = []  # (label, path, epsilon)
-        # Baseline
-        soc_base = os.path.join(RESULTS_DIR, 'soc_envelope_drcc_false.csv')
-        if os.path.exists(soc_base):
-            cases.append((DETERMINISTIC_LABEL, soc_base, None))
+        # Collect ALL RT mode envelopes per epsilon (strict); ignore unsuffixed unless no RT variant present.
+        cases: List[Tuple[str, str, float | None]] = []  # (display_label, path, epsilon)
+        # Deterministic baseline RT variants
+        det_variants = [
+            ('rt_on', os.path.join(RESULTS_DIR, 'soc_envelope_drcc_false_rt_on.csv')),
+            ('rt_off', os.path.join(RESULTS_DIR, 'soc_envelope_drcc_false_rt_off.csv')),
+            ('rt_unk', os.path.join(RESULTS_DIR, 'soc_envelope_drcc_false_rt_unk.csv')),
+        ]
+        det_added = False
+        for tag, pth in det_variants:
+            if os.path.exists(pth):
+                cases.append((f"{DETERMINISTIC_LABEL} ({_rt_display(tag)})", pth, None))
+                det_added = True
+        if not det_added:  # fall back to unsuffixed deterministic if no RT variants
+            soc_base_unsuff = os.path.join(RESULTS_DIR, 'soc_envelope_drcc_false.csv')
+            if os.path.exists(soc_base_unsuff):
+                cases.append((DETERMINISTIC_LABEL, soc_base_unsuff, None))
+        # Epsilon RT variants
         for eps in EPSILONS:
             tok = epsilon_token(eps)
-            soc_path = os.path.join(RESULTS_DIR, f'soc_envelope_drcc_true_epsilon_{tok}.csv')
-            if os.path.exists(soc_path):
-                cases.append((f"{eps:.2f}", soc_path, eps))
+            per_eps_added = False
+            for tag in ('rt_on','rt_off','rt_unk'):
+                pth = os.path.join(RESULTS_DIR, f'soc_envelope_drcc_true_epsilon_{tok}_{tag}.csv')
+                if os.path.exists(pth):
+                    cases.append((f"{eps:.2f} ({_rt_display(tag)})", pth, eps))
+                    per_eps_added = True
+            if not per_eps_added:  # no RT variant; try unsuffixed
+                p_unsuff = os.path.join(RESULTS_DIR, f'soc_envelope_drcc_true_epsilon_{tok}.csv')
+                if os.path.exists(p_unsuff):
+                    cases.append((f"{eps:.2f}", p_unsuff, eps))
         if cases:
             cols = len(cases)
             fig_soc, ax_soc = plt.subplots(1, cols, figsize=(4*cols, 3), constrained_layout=True)
@@ -2299,8 +3376,23 @@ def main() -> None:
                 if not {'soc_p05','soc_p50','soc_p95'}.issubset(df_env.columns):
                     continue
                 t = np.arange(len(df_env))
-                ax.fill_between(t, df_env['soc_p05'], df_env['soc_p95'], color='#c6dbef', alpha=0.6, label='5–95% band')
-                ax.plot(t, df_env['soc_p50'], color='#08519c', linewidth=1.5, label='Median')
+                # Detect degenerate envelopes (e.g., single trajectory -> identical percentiles)
+                try:
+                    p05 = pd.to_numeric(df_env['soc_p05'], errors='coerce')
+                    p50 = pd.to_numeric(df_env['soc_p50'], errors='coerce')
+                    p95 = pd.to_numeric(df_env['soc_p95'], errors='coerce')
+                    band_width = float(np.nanmax(p95 - p05)) if len(df_env) else 0.0
+                except Exception:
+                    p05, p50, p95 = df_env['soc_p05'], df_env['soc_p50'], df_env['soc_p95']
+                    band_width = 0.0
+                if not np.isfinite(band_width):
+                    band_width = 0.0
+                if band_width <= 1e-6:
+                    print(f"[INFO] SoC envelope degenerate for case '{lab}' (p05≈p50≈p95). Likely n_trajectories=1. Plotting median only.")
+                    ax.plot(t, p50, color='#08519c', linewidth=1.5, label='Median (degenerate)')
+                else:
+                    ax.fill_between(t, p05, p95, color='#c6dbef', alpha=0.6, label='5–95% band')
+                    ax.plot(t, p50, color='#08519c', linewidth=1.5, label='Median')
                 ax.set_ylim(0, 1.02)
                 ax.set_title(f"SoC envelope ({_display_label_for_case(lab)})")
                 ax.set_xlabel('t step')
@@ -2311,11 +3403,205 @@ def main() -> None:
             soc_fig_path = os.path.join(RESULTS_DIR, SOC_ENV_FIG)
             fig_soc.savefig(soc_fig_path, dpi=150)
             print(f"✓ SoC envelopes figure: {soc_fig_path}")
+
+            # Build final timestep summary across cases (median bar with asymmetric error bars to p05/p95)
+            final_rows = []  # (label, p05, p50, p95)
+            for lab, pth, _eps in cases:
+                try:
+                    df_env = pd.read_csv(pth)
+                except Exception:
+                    continue
+                if not {'soc_p05','soc_p50','soc_p95'}.issubset(df_env.columns) or df_env.empty:
+                    continue
+                last = df_env.iloc[-1]
+                try:
+                    p05 = float(last['soc_p05']); p50 = float(last['soc_p50']); p95 = float(last['soc_p95'])
+                except Exception:
+                    continue
+                # clamp to [0,1] to avoid numerical drift
+                p05 = max(0.0, min(1.0, p05)); p50 = max(0.0, min(1.0, p50)); p95 = max(0.0, min(1.0, p95))
+                final_rows.append((_display_label_for_case(lab), p05, p50, p95))
+            if final_rows:
+                labels = [r[0] for r in final_rows]
+                medians = np.array([r[2] for r in final_rows])
+                low_err = medians - np.array([r[1] for r in final_rows])
+                high_err = np.array([r[3] for r in final_rows]) - medians
+                # Ensure non-negative errors
+                low_err = np.clip(low_err, 0, None); high_err = np.clip(high_err, 0, None)
+                fig_final, ax_final = plt.subplots(figsize=(max(6, 0.6*len(final_rows)+2), 4))
+                x = np.arange(len(final_rows))
+                ax_final.bar(x, medians, color='#3182bd', alpha=0.85, label='Median final SoC')
+                ax_final.errorbar(x, medians, yerr=[low_err, high_err], fmt='none', ecolor='#08306b', elinewidth=1.2, capsize=4, label='5–95% range')
+                ax_final.set_xticks(x)
+                ax_final.set_xticklabels(labels, rotation=45, ha='right')
+                ax_final.set_ylabel('Final timestep SoC fraction')
+                ax_final.set_ylim(0, 1.05)
+                ax_final.grid(axis='y', alpha=0.3)
+                ax_final.legend(fontsize=8)
+                final_fig_path = os.path.join(RESULTS_DIR, SOC_FINAL_FIG)
+                fig_final.tight_layout()
+                fig_final.savefig(final_fig_path, dpi=150)
+                print(f"✓ Final timestep SoC summary figure: {final_fig_path}")
         else:
             print("[INFO] No SoC envelope files found to plot.")
 
     if SHOW:
         plt.show()
+
+    # --- Evening transformer sigma decomposition (from v2 CSV) ---
+    if PLOT_EVENING_TRAFO_SIGMA_DECOMP:
+        try:
+            def _resolve_v2_path(v2_csv: str | None) -> str | None:
+                if not v2_csv:
+                    return None
+                if os.path.exists(v2_csv):
+                    return v2_csv
+                # try resolve relative to RESULTS_DIR
+                cand = os.path.join(RESULTS_DIR, v2_csv)
+                if os.path.exists(cand):
+                    return cand
+                # try workspace root
+                if os.path.exists(os.path.basename(v2_csv)):
+                    return os.path.basename(v2_csv)
+                return None
+
+            # Prefer epsilon=0.10 case; else pick the smallest epsilon available
+            chosen_eps = None
+            chosen_meta = None
+            for e in ([0.10] + sorted(EPSILONS)):
+                try:
+                    m = load_meta_for_epsilon(e)
+                except Exception:
+                    m = {}
+                v2p = _resolve_v2_path(m.get('v2_results_csv') if isinstance(m, dict) else None)
+                if v2p:
+                    chosen_eps = e
+                    chosen_meta = m
+                    break
+            if chosen_meta is None:
+                print('[INFO] Skipped evening sigma decomposition (no v2_results_csv found in meta).')
+            else:
+                v2_path = _resolve_v2_path(chosen_meta.get('v2_results_csv'))
+                if not v2_path or not os.path.exists(v2_path):
+                    print(f"[INFO] Skipped evening sigma decomposition (v2 CSV not found: {v2_path}).")
+                else:
+                    df2 = pd.read_csv(v2_path)
+                    # Required columns (soft-check: proceed with what we have)
+                    cols_sigma = [
+                        'sigma_tr0_comp_pvP_mva',
+                        'sigma_tr0_comp_hpP_mva',
+                        'sigma_tr0_comp_hpQ_mva',
+                        'sigma_tr0_calc_mva',
+                    ]
+                    cols_k = ['K_pv_bess','K_hp_bess','K_pv_pvcurt','K_hp_pvcurt']
+                    col_slack_min = 'bess_power_robust_slack_min_mw'
+                    # Evening mask: pv availability near zero
+                    if 'pv_avail_sum_mw' in df2.columns:
+                        pv_sum = pd.to_numeric(df2['pv_avail_sum_mw'], errors='coerce').fillna(0.0)
+                        eve_mask = pv_sum <= max(1e-3, 0.01)  # <= 0.01 MW considered zero
+                    else:
+                        # fallback: evening hours 17–21 if timestamp available, else middle third of horizon
+                        eve_mask = None
+                    if eve_mask is None and 'timestamp' in df2.columns:
+                        try:
+                            ts = pd.to_datetime(df2['timestamp'])
+                            hrs = ts.dt.hour.to_numpy()
+                            eve_mask = (hrs >= 17) & (hrs <= 21)
+                        except Exception:
+                            eve_mask = None
+                    if eve_mask is None:
+                        n = len(df2)
+                        s = n//3
+                        eve_mask = np.zeros(n, dtype=bool)
+                        eve_mask[s:2*s] = True
+                    # Slice
+                    df_eve = df2.loc[eve_mask].reset_index(drop=True)
+                    if df_eve.empty:
+                        print('[INFO] Evening mask matched no rows; plotting full horizon instead.')
+                        df_eve = df2.reset_index(drop=True)
+                    # X axis
+                    if 'timestamp' in df_eve.columns:
+                        try:
+                            x = pd.to_datetime(df_eve['timestamp'])
+                            x_labels = x.dt.strftime('%H:%M')
+                        except Exception:
+                            x_labels = pd.Series(range(len(df_eve)))
+                    else:
+                        x_labels = pd.Series(range(len(df_eve)))
+                    # Build figure
+                    fig_ev, axes_ev = plt.subplots(2, 1, figsize=(12, 7.0), constrained_layout=True, sharex=True)
+                    # Panel 1: sigma components (MVA)
+                    present_sigma = [c for c in cols_sigma if c in df_eve.columns]
+                    if present_sigma:
+                        for c in present_sigma:
+                            axes_ev[0].plot(df_eve.index, pd.to_numeric(df_eve[c], errors='coerce'), label=c.replace('sigma_tr0_comp_','').replace('_mva','').replace('sigma_tr0_calc_','calc_'))
+                        axes_ev[0].set_ylabel('Transformer σ (MVA)')
+                        axes_ev[0].set_title(f"Trafo 0 sigma decomposition (ε={chosen_eps:.2f})")
+                        axes_ev[0].grid(alpha=0.3)
+                        axes_ev[0].legend(fontsize=8, ncol=2, frameon=False)
+                    else:
+                        axes_ev[0].text(0.5, 0.5, 'No sigma decomposition columns', ha='center', va='center', transform=axes_ev[0].transAxes, color='gray')
+                        axes_ev[0].set_title(f"Trafo 0 sigma decomposition (ε={chosen_eps:.2f})")
+                        axes_ev[0].grid(alpha=0.3)
+                    # Panel 2: K gains (dimensionless) and BESS robust slack (MW)
+                    present_k = [c for c in cols_k if c in df_eve.columns]
+                    axk = axes_ev[1]
+                    axk2 = axk.twinx()
+                    if present_k:
+                        for c in present_k:
+                            axk.plot(df_eve.index, pd.to_numeric(df_eve[c], errors='coerce'), linewidth=1.3, label=c)
+                    if col_slack_min in df_eve.columns:
+                        axk2.plot(df_eve.index, pd.to_numeric(df_eve[col_slack_min], errors='coerce'), color='#d62728', linewidth=1.6, alpha=0.85, label='bess_power_robust_slack_min_mw')
+                    axk.set_ylabel('K gains (dimensionless)')
+                    axk2.set_ylabel('BESS robust slack (MW)')
+                    axk.grid(alpha=0.3)
+                    # Legends
+                    h1, l1 = axk.get_legend_handles_labels()
+                    h2, l2 = axk2.get_legend_handles_labels()
+                    if h1 or h2:
+                        axes_ev[1].legend(h1+h2, l1+l2, loc='upper left', fontsize=8, frameon=False)
+                    # X labels
+                    axes_ev[1].set_xticks(range(len(df_eve)))
+                    try:
+                        axes_ev[1].set_xticklabels(list(x_labels))
+                    except Exception:
+                        pass
+                    axes_ev[1].set_xlabel('time (evening window)')
+                    # Save
+                    out_ev = os.path.join(RESULTS_DIR, EVENING_TRAFO_SIGMA_DECOMP_FIG)
+                    fig_ev.savefig(out_ev, dpi=150)
+                    print(f"✓ Evening sigma decomposition figure: {out_ev}")
+                    # Also export CSV with the evening slice
+                    try:
+                        export_cols = []
+                        # Keep timestamp if present
+                        if 'timestamp' in df_eve.columns:
+                            export_cols.append('timestamp')
+                        # Context columns if present
+                        for c in ['pv_avail_sum_mw']:
+                            if c in df_eve.columns:
+                                export_cols.append(c)
+                        # Sigma components and calc (subset of available)
+                        for c in cols_sigma:
+                            if c in df_eve.columns:
+                                export_cols.append(c)
+                        # K gains and BESS slack
+                        for c in cols_k:
+                            if c in df_eve.columns:
+                                export_cols.append(c)
+                        if col_slack_min in df_eve.columns:
+                            export_cols.append(col_slack_min)
+                        # Build export DF
+                        exp = df_eve.loc[:, [c for c in export_cols if c in df_eve.columns]].copy()
+                        exp.insert(0, 't_idx_evening', list(range(len(exp))))
+                        exp.insert(1, 'epsilon', chosen_eps)
+                        out_csv = os.path.join(RESULTS_DIR, EVENING_TRAFO_SIGMA_DECOMP_CSV)
+                        exp.to_csv(out_csv, index=False)
+                        print(f"✓ Evening sigma decomposition CSV: {out_csv}")
+                    except Exception as _e:
+                        print(f"[WARN] Failed to write evening sigma CSV: {_e}")
+        except Exception as e:
+            print(f"[WARN] Failed to build evening sigma decomposition plot: {e}")
 
 
 if __name__ == "__main__":
@@ -2333,7 +3619,7 @@ if __name__ == "__main__":
             def _load_case_profile(label: str, eps: float | None) -> tuple[np.ndarray, np.ndarray] | None:
                 # Return (t_axis, p_viol_t) where p_viol_t is violation probability per timestep
                 if label == DETERMINISTIC_LABEL:
-                    meta_path = os.path.join(RESULTS_DIR, 'v3_meta_drcc_false.json')
+                    meta_path = os.path.join(RESULTS_DIR, 'v4_meta_drcc_false.json')
                     if not os.path.exists(meta_path):
                         return None
                     with open(meta_path,'r',encoding='utf-8') as f:
@@ -2347,11 +3633,9 @@ if __name__ == "__main__":
                     if not meta_e or 'trafo_loading_file' not in meta_e:
                         return None
                     pq = os.path.join(RESULTS_DIR, meta_e['trafo_loading_file'])
-                if not os.path.exists(pq):
-                    return None
-                try:
-                    pdf = pd.read_parquet(pq)
-                except Exception:
+                # Load transformer loading table with CSV fallback
+                pdf = _read_parquet_or_csv(pq)
+                if pdf is None:
                     return None
                 must = {'sample_id','t','trafo_index','loading_pct'}
                 if not must <= set(pdf.columns):
@@ -2410,12 +3694,27 @@ if __name__ == "__main__":
                     if not rel:
                         return np.array([])
                     pq = os.path.join(RESULTS_DIR, rel)
+                    # Load parquet if available, else CSV
                     if not os.path.exists(pq):
-                        return np.array([])
-                    try:
-                        pdf = pd.read_parquet(pq)
-                    except Exception:
-                        return np.array([])
+                        pq_csv = pq.replace('.parquet', '.csv') if pq.endswith('.parquet') else pq + '.csv'
+                        if not os.path.exists(pq_csv):
+                            return np.array([])
+                        try:
+                            pdf = pd.read_csv(pq_csv)
+                        except Exception:
+                            return np.array([])
+                    else:
+                        try:
+                            pdf = pd.read_parquet(pq)
+                        except Exception:
+                            pq_csv = pq.replace('.parquet', '.csv') if pq.endswith('.parquet') else pq + '.csv'
+                            if os.path.exists(pq_csv):
+                                try:
+                                    pdf = pd.read_csv(pq_csv)
+                                except Exception:
+                                    return np.array([])
+                            else:
+                                return np.array([])
                     must = {'sample_id','t','trafo_index','loading_pct'}
                     if not must <= set(pdf.columns):
                         return np.array([])
@@ -2425,7 +3724,7 @@ if __name__ == "__main__":
 
                 det_meta = {}
                 try:
-                    with open(os.path.join(RESULTS_DIR, 'v3_meta_drcc_false.json'),'r',encoding='utf-8') as f:
+                    with open(os.path.join(RESULTS_DIR, 'v4_meta_drcc_false.json'),'r',encoding='utf-8') as f:
                         det_meta = json.load(f)
                 except Exception:
                     pass
@@ -2448,7 +3747,7 @@ if __name__ == "__main__":
                     ax.plot(x, (r_l[x] if isinstance(x, np.ndarray) else r_l), linewidth=1.2, alpha=0.9, label=f"DRCC, ε={lab}")
                 ax.set_title('Evening-window violation probability')
                 ax.set_xlabel('timestep index')
-                ax.set_ylabel(f"P(any trafo > {int(OVERLOAD_THRESHOLD_PCT)}%)")
+                ax.set_ylabel(f"P(any trafo > {OVERLOAD_THRESHOLD_PCT:.2f}%)")
                 ax.set_ylim(0, 1.0)
                 ax.grid(alpha=0.3)
                 ax.legend(fontsize=8, frameon=False)
@@ -2546,13 +3845,13 @@ if __name__ == "__main__":
                     mask = (ns > 0) & np.isfinite(st)
                     return (st[mask] / ns[mask]).to_numpy()
                 # deterministic summary
-                det_sum = os.path.join(RESULTS_DIR, 'v3_summary_drcc_false.csv')
+                det_sum = os.path.join(RESULTS_DIR, 'v4_summary_drcc_false.csv')
                 arr_det_vr = _traj_violation_rates(det_sum)
                 # drcc summaries
                 arr_drcc_vr = []
                 for e in EPSILONS:
                     tok = epsilon_token(e)
-                    sp = os.path.join(RESULTS_DIR, f'v3_summary_drcc_true_epsilon_{tok}.csv')
+                    sp = os.path.join(RESULTS_DIR, f'v4_summary_drcc_true_epsilon_{tok}.csv')
                     arr = _traj_violation_rates(sp)
                     if arr.size:
                         arr_drcc_vr.append((f"{e:.2f}", arr))
@@ -2586,12 +3885,8 @@ if __name__ == "__main__":
                     if not rel:
                         return None
                     pq = os.path.join(RESULTS_DIR, rel)
-                    if not os.path.exists(pq):
-                        return None
-                    try:
-                        return pd.read_parquet(pq)
-                    except Exception:
-                        return None
+                    df = _read_parquet_or_csv(pq)
+                    return df
                 det_pdf = _load_pdf_from_meta(det_meta)
                 vals = []
                 labs = []
