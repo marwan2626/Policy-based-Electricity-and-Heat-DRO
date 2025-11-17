@@ -1,0 +1,1074 @@
+#!/usr/bin/env python3
+"""
+Generate plots from already exported/analyzed data.
+
+First plot: identical to the oos-overview all-in total cost bar plot (second subplot)
+for the aggregated Gaussian + Student-t solution.
+
+It reads the precomputed summary CSV written by oos-analysis in
+v4_oos_agg_gaussian_studentt/oos_overview_summary.csv and reproduces the
+bar plot with the same labels and % delta annotations vs deterministic
+(if present).
+
+Usage:
+  python generate_plots.py
+  python generate_plots.py --src v4_oos_agg_gaussian_studentt --out oos_overview_total_cost.png
+"""
+
+from __future__ import annotations
+
+import os
+import json
+import argparse
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import matplotlib.patheffects as patheffects
+
+DEFAULT_SRC_DIR = "v4_oos_agg_gaussian_studentt"
+DEFAULT_SUMMARY_NAME = "oos_overview_summary.csv"
+DEFAULT_OUT_NAME = "oos_overview_total_cost.png"
+DEFAULT_EXPORT_DIR = "export figures"
+VIOLIN_OUT_NAME = "violin_compare_010_rt_on_vs_off.png"
+THERMAL_STORAGE_OUT_NAME = "thermal_storage_operation_area.png"
+TRAFO_VIOLATION_OUT_NAME = "transformer_violation_probability.png"
+FINAL_SOC_OUT_NAME = "final_bess_soc_median.png"
+OVERLOAD_RT_ON_OFF_OUT_NAME = "overload_energy_compare_010_rt_on_vs_off.png"
+MAX_TRAFO_EPSILON_OUT_NAME = "max_trafo_loading_vs_epsilon_v2.png"
+DA_COST_EPSILON_OUT_NAME = "da_total_cost_vs_epsilon_v2.png"
+
+# Specific injection for transformer violation probability plot (match cost plot naming)
+TRAFO_INJECT_LABEL = "Multi-Energy\nCo-optimization"  # matches INJECT_LABEL defined below
+TRAFO_INJECT_VALUE = 0.0  # user specified value
+
+# Customization: drop specific label(s) and inject a fixed-cost bar
+DROP_LABELS = {"0.15 (RT ON)"}
+INJECT_LABEL = "Multi-Energy\nCo-optimization"
+INJECT_COST = 684.3104378123563
+
+# Match global style
+mpl.rcParams['font.family'] = 'Times New Roman'
+
+# Parameters to compute transformer overload energy per-sample from loading parquet
+OVERLOAD_THRESHOLD_PCT = float(os.getenv('V4_VIOL_THRESHOLD_PCT', '80.09'))
+RATED_TRAFO_MVA = 0.5
+STEP_HOURS = 0.25  # 15-minute steps
+
+
+def load_summary(src_dir: str) -> pd.DataFrame:
+    path = os.path.join(src_dir, DEFAULT_SUMMARY_NAME)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Summary CSV not found: {path}. Run oos-analysis aggregation or set --src to an existing folder.")
+    df = pd.read_csv(path)
+    # Ensure required columns exist (use fallbacks if needed)
+    if 'all_in_total_cost_mean' not in df.columns:
+        # fallback: try to compute from DA + total_rt
+        if {'da_total_cost_eur', 'total_rt_cost_mean'} <= set(df.columns):
+            try:
+                df['all_in_total_cost_mean'] = pd.to_numeric(df['da_total_cost_eur'], errors='coerce') \
+                                               + pd.to_numeric(df['total_rt_cost_mean'], errors='coerce')
+            except Exception:
+                pass
+    return df
+
+
+def _read_parquet_or_csv(path: str) -> pd.DataFrame | None:
+    """Try parquet first if extension matches; otherwise CSV fallback.
+    Returns DataFrame or None.
+    """
+    try:
+        if os.path.exists(path):
+            if path.lower().endswith('.parquet'):
+                try:
+                    return pd.read_parquet(path)
+                except Exception:
+                    csv_path = path[:-8] + 'csv'
+                    if os.path.exists(csv_path):
+                        try:
+                            return pd.read_csv(csv_path)
+                        except Exception:
+                            return None
+                    return None
+            if path.lower().endswith('.csv'):
+                try:
+                    return pd.read_csv(path)
+                except Exception:
+                    return None
+        if path.lower().endswith('.parquet'):
+            csv_path = path[:-8] + 'csv'
+            if os.path.exists(csv_path):
+                try:
+                    return pd.read_csv(csv_path)
+                except Exception:
+                    return None
+        return None
+    except Exception:
+        return None
+
+
+def _load_loading_distribution_from_meta(meta_path: str, base_dir: str) -> np.ndarray:
+    """Load per-(sample_id,t) max transformer loading (%) as 1-D array from meta JSON path.
+    Returns empty array if unavailable.
+    """
+    try:
+        if not os.path.exists(meta_path):
+            return np.array([])
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+        rel = meta.get('trafo_loading_file')
+        if not rel:
+            return np.array([])
+        abs_path = os.path.join(base_dir, rel.replace('/', os.sep))
+        if not os.path.exists(abs_path):
+            if os.path.exists(rel):
+                abs_path = rel
+            else:
+                return np.array([])
+        pdf = _read_parquet_or_csv(abs_path)
+        if pdf is None:
+            return np.array([])
+        must = {'sample_id','t','trafo_index','loading_pct'}
+        if not must <= set(pdf.columns):
+            return np.array([])
+        grp = pdf.groupby(['sample_id','t'])['loading_pct'].max().reset_index()
+        arr = pd.to_numeric(grp['loading_pct'], errors='coerce').to_numpy()
+        arr = arr[np.isfinite(arr)]
+        return arr
+    except Exception:
+        return np.array([])
+
+
+def plot_violin_rt_on_vs_off(src_dir: str, out_path: str) -> str:
+    """Recreate the focused ε=0.10 RT ON vs RT OFF split-violin plot from aggregated data."""
+    # Locate meta files for epsilon 0.10
+    meta_on = os.path.join(src_dir, 'v4_meta_drcc_true_epsilon_0_10_rt_on.json')
+    meta_off = os.path.join(src_dir, 'v4_meta_drcc_true_epsilon_0_10_rt_off.json')
+    vals_on = _load_loading_distribution_from_meta(meta_on, src_dir)
+    vals_off = _load_loading_distribution_from_meta(meta_off, src_dir)
+
+    # Prepare figure
+    # Use same height as other plots but half the previous width (4.0 x 4.2)
+    fig, ax = plt.subplots(figsize=(4.0, 4.2))
+    x0 = 1.0
+    if vals_on.size == 0 and vals_off.size == 0:
+        ax.text(0.5, 0.5, 'No ε=0.10 RT data', ha='center', va='center', transform=ax.transAxes,
+                fontsize=9, color='gray')
+        # Use a symmetric window and center tick labels in each half
+        ax.set_xlim(x0 - 0.5, x0 + 0.5)
+        xmin, xmax = ax.get_xlim()
+        left_center = (xmin + x0) / 2.0
+        right_center = (x0 + xmax) / 2.0
+        ax.set_xticks([left_center, right_center])
+        ax.set_xticklabels(["DRCC without\nRecourse", "DRCC with\nRecourse"], fontsize=14)
+    else:
+        vals_list = []
+        side_tags = []
+        if vals_off.size: vals_list.append(vals_off); side_tags.append('off')
+        if vals_on.size: vals_list.append(vals_on); side_tags.append('on')
+        # Determine y-limits from available data
+        stacked = np.concatenate(vals_list) if vals_list else np.array([])
+        y_min = float(np.nanmin(stacked)) if stacked.size else 0.0
+        y_max = float(np.nanmax(stacked)) if stacked.size else 1.0
+        if not np.isfinite(y_min) or not np.isfinite(y_max) or y_max <= y_min:
+            y_min, y_max = 0.0, 1.0
+        pad = 0.02 * (y_max - y_min + 1e-9)
+        y_min -= pad; y_max += pad
+        # Trim upper axis at 100%
+        y_max = min(y_max, 100.0)
+        if not np.isfinite(y_min) or y_min >= y_max:
+            y_min = max(0.0, y_max - 1.0)
+        ax.set_ylim(y_min, y_max)
+        # Keep symmetric window and slightly narrower violins
+        ax.set_xlim(x0 - 0.5, x0 + 0.5)
+        vp = ax.violinplot(vals_list, positions=[x0 for _ in vals_list], showmeans=False, showmedians=False, showextrema=False, widths=0.6)
+        from matplotlib.patches import Rectangle, Patch
+        xmin, xmax = ax.get_xlim(); ymin, ymax = ax.get_ylim()
+        left_clip = Rectangle((xmin, ymin), width=(x0 - xmin), height=(ymax - ymin), transform=ax.transData)
+        right_clip = Rectangle((x0, ymin), width=(xmax - x0), height=(ymax - ymin), transform=ax.transData)
+        for body, tag in zip(vp['bodies'], side_tags):
+            if tag == 'off':
+                body.set_facecolor('#9ecae1'); body.set_edgecolor('#08519c'); body.set_alpha(0.65); body.set_clip_path(left_clip)
+            else:
+                body.set_facecolor('#fb6a4a'); body.set_edgecolor('#cb181d'); body.set_alpha(0.65); body.set_clip_path(right_clip)
+        # Medians as short horizontal lines
+        if vals_off.size:
+            m_off = float(np.nanmedian(vals_off)); ax.plot([x0 - 0.21, x0], [m_off, m_off], color='#08519c', linewidth=2)
+        if vals_on.size:
+            m_on = float(np.nanmedian(vals_on)); ax.plot([x0, x0 + 0.21], [m_on, m_on], color='#cb181d', linewidth=2)
+        # Place left/right labels centered under respective halves
+        left_center = (xmin + x0) / 2.0
+        right_center = (x0 + xmax) / 2.0
+        ax.set_xticks([left_center, right_center])
+        ax.set_xticklabels(["DRCC without\nRecourse", "DRCC with\nRecourse"], fontsize=14)
+        ax.axvline(x0, color='black', linewidth=0.9, alpha=0.8, zorder=3)
+
+    ax.set_ylabel('Transformer Loading (%)', fontsize=16)
+    ax.tick_params(axis='y', labelsize=14)
+    ax.grid(axis='y', alpha=0.3)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    print(f"✓ Violin RT ON vs OFF saved: {out_path}")
+    return out_path
+
+
+def _compute_overload_energy_kwh_per_sample(parquet_path: str,
+                                            threshold_pct: float = OVERLOAD_THRESHOLD_PCT,
+                                            rated_mva: float = RATED_TRAFO_MVA,
+                                            step_hours: float = STEP_HOURS) -> float:
+    try:
+        pdf = _read_parquet_or_csv(parquet_path)
+    except Exception:
+        pdf = None
+    if pdf is None:
+        return float('nan')
+    must = {'sample_id', 't', 'trafo_index', 'loading_pct'}
+    if not must <= set(pdf.columns):
+        return float('nan')
+    lp = pd.to_numeric(pdf['loading_pct'], errors='coerce').to_numpy()
+    mask = np.isfinite(lp) & (lp > float(threshold_pct))
+    if not np.any(mask):
+        return 0.0
+    excess_pct = lp[mask] - float(threshold_pct)
+    excess_mva = (excess_pct / 100.0) * float(rated_mva)
+    total_mvah = float(np.sum(excess_mva) * float(step_hours))
+    try:
+        n_samples = int(pd.to_numeric(pdf['sample_id'], errors='coerce').dropna().nunique())
+    except Exception:
+        n_samples = 1000
+    n_samples = n_samples if n_samples > 0 else 1000
+    total_kwh_per_sample = (total_mvah * 1000.0) / float(n_samples)
+    return total_kwh_per_sample
+
+
+def plot_overload_energy_rt_on_vs_off(src_dir: str, out_path: str) -> str:
+    """Bar plot comparing total transformer overload energy (kWh per sample)
+    for ε=0.10 RT OFF vs RT ON. Matches violin plot dimensions.
+    """
+    tok = '0_10'
+    meta_on = os.path.join(src_dir, f'v4_meta_drcc_true_epsilon_{tok}_rt_on.json')
+    meta_off = os.path.join(src_dir, f'v4_meta_drcc_true_epsilon_{tok}_rt_off.json')
+
+    def _value_from_meta(mp: str) -> float:
+        try:
+            if not os.path.exists(mp):
+                return float('nan')
+            with open(mp, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+            rel = meta.get('trafo_loading_file') if isinstance(meta, dict) else None
+            if not rel:
+                return float('nan')
+            pq = os.path.join(src_dir, rel.replace('/', os.sep))
+            if not os.path.exists(pq) and os.path.exists(rel):
+                pq = rel
+            if not os.path.exists(pq):
+                return float('nan')
+            return _compute_overload_energy_kwh_per_sample(pq)
+        except Exception:
+            return float('nan')
+
+    val_off = _value_from_meta(meta_off)
+    val_on = _value_from_meta(meta_on)
+
+    # If both missing, try aggregated CSV fallback
+    if not (np.isfinite(val_off) or np.isfinite(val_on)):
+        csv_path = os.path.join(src_dir, 'overload_energy_compare_010_rt_on_vs_off.csv')
+        try:
+            if os.path.exists(csv_path):
+                cdf = pd.read_csv(csv_path)
+                if {'label', 'overload_energy_kwh_per_sample'} <= set(cdf.columns):
+                    for _, row in cdf.iterrows():
+                        lab = str(row['label']).lower()
+                        v = float(pd.to_numeric(pd.Series([row['overload_energy_kwh_per_sample']]), errors='coerce').iloc[0])
+                        if 'without' in lab or 'rt off' in lab:
+                            val_off = v
+                        if 'with' in lab or 'rt on' in lab:
+                            val_on = v
+        except Exception:
+            pass
+
+    # Prepare figure with same size as violin plot
+    fig, ax = plt.subplots(figsize=(4.0, 4.2))
+    labels = []
+    values = []
+    colors = []
+    edges = []
+    if np.isfinite(val_off):
+        labels.append("DRCC without\nRecourse")
+        values.append(val_off)
+        colors.append('#9ecae1')
+        edges.append('#08519c')
+    if np.isfinite(val_on):
+        labels.append("DRCC with\nRecourse")
+        values.append(val_on)
+        colors.append('#fb6a4a')
+        edges.append('#cb181d')
+
+    if not values:
+        ax.text(0.5, 0.5, 'No ε=0.10 RT data', ha='center', va='center', transform=ax.transAxes,
+                fontsize=9, color='gray')
+        fig.tight_layout()
+        os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+        fig.savefig(out_path, dpi=150)
+        print(f"✓ Overload energy RT ON vs OFF saved (empty): {out_path}")
+        return out_path
+
+    x = np.arange(len(labels))
+    bars = ax.bar(x, values, color=colors, edgecolor=edges, alpha=0.85, width=0.6)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=14)
+    ax.set_ylabel('Mean Overload Energy (KWh)', fontsize=16)
+    ax.tick_params(axis='y', labelsize=14)
+    ax.grid(axis='y', alpha=0.3)
+    # Add labels inside bars when possible to avoid clipping
+    ymax = max(values) if values else 1.0
+    pad = 0.02 * ymax
+    for rect, val in zip(bars, values):
+        h = rect.get_height()
+        inside_y = h - pad
+        if inside_y > 0:
+            ax.text(rect.get_x() + rect.get_width()/2, inside_y, f"{val:.2f}",
+                ha='center', va='top', fontsize=10, color='black')
+        else:
+            ax.text(rect.get_x() + rect.get_width()/2, h + pad, f"{val:.2f}",
+                    ha='center', va='bottom', fontsize=10, color='black', clip_on=False)
+    # Slight headroom to ensure small above-bar labels never clip
+    try:
+        ax.margins(y=0.05)
+    except Exception:
+        pass
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"✓ Overload energy RT ON vs OFF saved: {out_path}")
+    return out_path
+
+
+def plot_max_trafo_loading_vs_epsilon_v2(out_path: str, search_dir: str | None = None) -> str:
+    """Two-line plot vs epsilon (x) of max transformer loading (%) (y) from v2 results CSVs.
+
+    - Searches for files named like: `dso_model_v2_results_drcc_true_epsilon_0_XX_rt_on.csv` and `_rt_off.csv`
+    - For each file, computes the maximum across all `transformer_*_loading_pct` columns and all timesteps
+    - Plots two lines: RT OFF (blue) and RT ON (red). Figure size matches violin (4.0 x 4.2)
+    """
+    try:
+        base = search_dir if search_dir else os.path.dirname(os.path.abspath(__file__))
+        if not os.path.isdir(base):
+            base = os.getcwd()
+
+        def _parse_eps(fname: str) -> float | None:
+            # Expect token 'epsilon_0_10_' etc.
+            s = fname
+            if 'epsilon_' not in s:
+                return None
+            try:
+                part = s.split('epsilon_', 1)[1]
+                part = part.split('_rt', 1)[0]
+                eps_str = part.replace('_', '.')
+                return float(eps_str)
+            except Exception:
+                return None
+
+        def _is_on(fname: str) -> bool:
+            return 'rt_on' in fname.lower()
+
+        def _is_off(fname: str) -> bool:
+            return 'rt_off' in fname.lower()
+
+        files = [f for f in os.listdir(base) if f.endswith('.csv') and f.startswith('dso_model_v2_results_drcc_true_epsilon_')]
+        vals_on: dict[float, float] = {}
+        vals_off: dict[float, float] = {}
+
+        for f in files:
+            eps = _parse_eps(f)
+            if eps is None:
+                continue
+            full = os.path.join(base, f)
+            try:
+                df = pd.read_csv(full)
+            except Exception:
+                continue
+            # Identify transformer loading columns
+            cols = [c for c in df.columns if ('transformer' in c.lower() and 'loading' in c.lower() and 'pct' in c.lower())]
+            if not cols:
+                # Fallback to the common single column name
+                if 'transformer_0_loading_pct' in df.columns:
+                    cols = ['transformer_0_loading_pct']
+            if not cols:
+                continue
+            try:
+                sub = df[cols].apply(pd.to_numeric, errors='coerce')
+                max_val = float(np.nanmax(sub.to_numpy()))
+            except Exception:
+                continue
+            if not np.isfinite(max_val):
+                continue
+            if _is_on(f):
+                # If duplicate eps appears, keep the maximum
+                vals_on[eps] = max(max_val, vals_on.get(eps, -np.inf))
+            elif _is_off(f):
+                vals_off[eps] = max(max_val, vals_off.get(eps, -np.inf))
+
+        # Prepare data for plotting (descending epsilon order)
+        xs_on = sorted(vals_on.keys(), reverse=True)
+        ys_on = [vals_on[x] for x in xs_on]
+        xs_off = sorted(vals_off.keys(), reverse=True)
+        ys_off = [vals_off[x] for x in xs_off]
+
+        # 3:2 aspect ratio (width:height) with fixed height 4.2 -> width 6.3
+        xticks = sorted(set(xs_on) | set(xs_off))  # ascending, we'll invert axis next
+        fig, ax = plt.subplots(figsize=(6.3, 4.2))
+        if xs_off:
+            ax.plot(
+                xs_off, ys_off,
+                color='#08519c', linewidth=2.0,
+                marker='o', markerfacecolor='none', markeredgecolor='#08519c',
+                label='DRCC without Recourse')
+        if xs_on:
+            ax.plot(
+                xs_on, ys_on,
+                color='#cb181d', linewidth=2.0,
+                marker='s', markerfacecolor='none', markeredgecolor='#cb181d',
+                label='DRCC with Recourse')
+
+        # X ticks as union of epsilons, formatted to two decimals
+        if xticks:
+            ax.set_xticks(xticks)
+            ax.set_xticklabels([f"{x:.2f}" for x in xticks], fontsize=12)
+        ax.set_xlabel(r'Allowed Violation Probability ($\varepsilon$)', fontsize=14)
+        ax.set_ylabel('Max. Transformer Loading (%)', fontsize=16)
+        ax.tick_params(axis='y', labelsize=14)
+        ax.grid(axis='y', alpha=0.3)
+        # Largest epsilon on the left
+        try:
+            ax.invert_xaxis()
+        except Exception:
+            pass
+        # Reference threshold line at 80% and focus the y-range to [65, 85]
+        ax.axhline(80.0, color='red', linestyle='--', linewidth=1.2, alpha=0.9)
+        ax.set_ylim(70.0, 85.0)
+        ax.legend(fontsize=10, loc='best')
+
+        fig.tight_layout()
+        os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"✓ Max transformer loading vs ε (v2) saved: {out_path}")
+        return out_path
+    except Exception as e:
+        # In case of any unexpected error, still create an empty placeholder figure
+        fig, ax = plt.subplots(figsize=(6.3, 4.2))
+        ax.text(0.5, 0.5, f'Plot failed: {e}', ha='center', va='center', transform=ax.transAxes, fontsize=9, color='gray')
+        fig.tight_layout()
+        os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"[WARN] Max transformer loading vs ε (v2) failed, saved placeholder: {out_path}")
+        return out_path
+
+
+def plot_da_total_cost_vs_epsilon_v2(out_path: str, search_dir: str | None = None) -> str:
+    """Two-line plot vs epsilon (x) of DA total cost (EUR) (y) from v2 results CSVs.
+
+    - Searches for files like `dso_model_v2_results_drcc_true_epsilon_0_XX_rt_on.csv` and `_rt_off.csv`
+    - Extracts a single DA total cost value per file (last finite value of `da_total_cost_eur`)
+    - Plots RT OFF (blue) and RT ON (red) as functions of epsilon
+    - Uses 3:2 aspect with fixed height 4.2 in (6.3 x 4.2)
+    """
+    try:
+        base = search_dir if search_dir else os.path.dirname(os.path.abspath(__file__))
+        if not os.path.isdir(base):
+            base = os.getcwd()
+
+        def _parse_eps(fname: str) -> float | None:
+            if 'epsilon_' not in fname:
+                return None
+            try:
+                part = fname.split('epsilon_', 1)[1]
+                part = part.split('_rt', 1)[0]
+                return float(part.replace('_', '.'))
+            except Exception:
+                return None
+
+        def _is_on(fname: str) -> bool:
+            return 'rt_on' in fname.lower()
+
+        def _is_off(fname: str) -> bool:
+            return 'rt_off' in fname.lower()
+
+        files = [f for f in os.listdir(base) if f.endswith('.csv') and f.startswith('dso_model_v2_results_drcc_true_epsilon_')]
+        vals_on: dict[float, float] = {}
+        vals_off: dict[float, float] = {}
+
+        for f in files:
+            eps = _parse_eps(f)
+            if eps is None:
+                continue
+            full = os.path.join(base, f)
+            try:
+                df = pd.read_csv(full)
+            except Exception:
+                continue
+            if 'da_total_cost_eur' not in df.columns:
+                continue
+            try:
+                series = pd.to_numeric(df['da_total_cost_eur'], errors='coerce').dropna()
+                if series.empty:
+                    continue
+                cost_val = float(series.iloc[-1])
+            except Exception:
+                continue
+            if _is_on(f):
+                vals_on[eps] = cost_val
+            elif _is_off(f):
+                vals_off[eps] = cost_val
+
+        # Build x/y in descending epsilon order for plotting
+        xs_on = sorted(vals_on.keys(), reverse=True)
+        ys_on = [vals_on[x] for x in xs_on]
+        xs_off = sorted(vals_off.keys(), reverse=True)
+        ys_off = [vals_off[x] for x in xs_off]
+
+        xticks = sorted(set(xs_on) | set(xs_off))  # ascending; invert axis for visual
+        fig, ax = plt.subplots(figsize=(6.3, 4.2))
+        if xs_off:
+            ax.plot(
+                xs_off, ys_off,
+                color='#08519c', linewidth=2.0,
+                marker='o', markerfacecolor='none', markeredgecolor='#08519c',
+                label='DRCC without Recourse')
+        if xs_on:
+            ax.plot(
+                xs_on, ys_on,
+                color='#cb181d', linewidth=2.0,
+                marker='s', markerfacecolor='none', markeredgecolor='#cb181d',
+                label='DRCC with Recourse')
+
+        if xticks:
+            ax.set_xticks(xticks)
+            ax.set_xticklabels([f"{x:.2f}" for x in xticks], fontsize=12)
+        ax.set_xlabel('ε', fontsize=14)
+        ax.set_ylabel('DA Cost (EUR)', fontsize=16)
+        ax.tick_params(axis='y', labelsize=14)
+        ax.grid(axis='y', alpha=0.3)
+        try:
+            ax.invert_xaxis()
+        except Exception:
+            pass
+        ax.legend(fontsize=10, loc='best')
+
+        fig.tight_layout()
+        os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"✓ DA total cost vs ε (v2) saved: {out_path}")
+        return out_path
+    except Exception as e:
+        fig, ax = plt.subplots(figsize=(6.3, 4.2))
+        ax.text(0.5, 0.5, f'Plot failed: {e}', ha='center', va='center', transform=ax.transAxes, fontsize=9, color='gray')
+        fig.tight_layout()
+        os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"[WARN] DA total cost vs ε (v2) failed, saved placeholder: {out_path}")
+        return out_path
+
+
+def plot_thermal_storage_operation_area(results_csv: str, out_path: str) -> str:
+    """Duplicate thermal storage operation area plot (originally PGF) using Matplotlib PNG.
+
+    Reads `q_storage_kw` from results CSV (default fully_coordinated_model_results.csv) and, if available,
+    overlays electricity price from `market_prices_15min.csv` (column `price_EUR_MWh`).
+    Styling matches existing figures: Times New Roman font, area fills:
+        Charging (>=0): green (standard) alpha 0.30
+        Discharging (<=0): red (standard) alpha 0.30
+    Secondary y-axis (right) for price in blue (standard matplotlib) including spine.
+    """
+    if not os.path.exists(results_csv):
+        raise FileNotFoundError(f"Results CSV not found: {results_csv}")
+    df = pd.read_csv(results_csv)
+    if 'q_storage_kw' not in df.columns:
+        raise KeyError("Column 'q_storage_kw' not in results CSV")
+    ts = pd.to_numeric(df['q_storage_kw'], errors='coerce').fillna(0.0).to_numpy()
+    x = np.arange(1, len(ts)+1)
+
+    # Attempt to load aligned market price (mirror PGF logic): 24h window starting 2023-01-10
+    price = None
+    try:
+        # Build canonical 24h time window (96 steps of 15min) matching fully coordinated model period
+        start_dt = pd.to_datetime('2023-01-10 00:00:00')
+        duration_hours = 24
+        end_dt = start_dt + pd.Timedelta(hours=duration_hours) - pd.Timedelta(minutes=15)
+        # Read market price file
+        if os.path.exists('market_prices_15min.csv'):
+            pdf = pd.read_csv('market_prices_15min.csv')
+            if 'datetime' in pdf.columns and 'price_EUR_MWh' in pdf.columns:
+                pdf['datetime'] = pd.to_datetime(pdf['datetime'])
+                pdf = pdf.set_index('datetime')
+                window = pdf.loc[start_dt:end_dt]
+                if not window.empty:
+                    price_series = pd.to_numeric(window['price_EUR_MWh'], errors='coerce')
+                    # Ensure length matches ts (pad with last value if shorter, trim if longer)
+                    vals = price_series.to_numpy()
+                    if vals.size < ts.size:
+                        pad_val = float(vals[-1]) if vals.size else 0.0
+                        vals = np.concatenate([vals, np.full(ts.size - vals.size, pad_val)])
+                    price = vals[:ts.size]
+    except Exception:
+        price = None
+    # Fallback: direct column from results CSV if alignment failed
+    if price is None:
+        for cname in ['electricity_price_eur_mwh','price_EUR_MWh','price','price_eur_mwh']:
+            if cname in df.columns:
+                price_series = pd.to_numeric(df[cname], errors='coerce').fillna(method='ffill').fillna(method='bfill')
+                vals = price_series.to_numpy()
+                if vals.size < ts.size:
+                    pad_val = float(vals[-1]) if vals.size else 0.0
+                    vals = np.concatenate([vals, np.full(ts.size - vals.size, pad_val)])
+                price = vals[:ts.size]
+                break
+
+    # Colors (standard matplotlib named colors)
+    gas_green = 'green'
+    heat_red = 'red'
+    electric_blue = 'blue'
+
+    # Match line plots: 3:2 aspect, fixed height 4.2 in
+    fig, ax = plt.subplots(figsize=(6.3, 4.2))
+    ax.plot(x, ts, color='black', linewidth=1.0, zorder=3)
+    ax.axhline(0.0, color='gray', linestyle='--', linewidth=1.0, alpha=0.8)
+    ax.fill_between(x, ts, 0, where=ts>=0, facecolor=gas_green, alpha=0.30, interpolate=True, zorder=1)
+    ax.fill_between(x, ts, 0, where=ts<=0, facecolor=heat_red, alpha=0.30, interpolate=True, zorder=1)
+    ax.set_xlabel('Time Step', fontsize=14)
+    ax.set_ylabel('Thermal Power (kW)', fontsize=16)
+    ax.tick_params(axis='y', labelsize=14)
+    ax.tick_params(axis='x', labelsize=12)
+    ax.set_xlim(0, x[-1])
+    ax.margins(x=0)
+    ax.grid(True, axis='y', color='lightgray', alpha=0.6, linewidth=0.6)
+
+    ax2 = ax.twinx()
+    ax2.patch.set_alpha(0.0)
+    if price is not None:
+        ax2.plot(x, price, color=electric_blue, linewidth=1.4, zorder=4)
+    ax2.set_ylabel('Electricity price (EUR/MWh)', color=electric_blue, fontsize=16)
+    ax2.tick_params(axis='y', colors=electric_blue, labelsize=14)
+    try:
+        ax2.spines['right'].set_color(electric_blue)
+    except Exception:
+        pass
+    # Match tick count roughly
+    try:
+        from matplotlib.ticker import MaxNLocator
+        ax2.yaxis.set_major_locator(MaxNLocator(nbins=len(ax.get_yticks())))
+    except Exception:
+        pass
+    ax2.grid(False)
+
+    # X ticks at 24-step intervals including 0
+    try:
+        ticks_24 = np.arange(0, x[-1]+1, 24)
+        ax.set_xticks(ticks_24)
+    except Exception:
+        pass
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"✓ Thermal storage plot saved: {out_path}")
+    return out_path
+
+
+def plot_all_in_total_cost(df: pd.DataFrame, out_path: str) -> str:
+    # Sort by plot_order if available to match overview ordering
+    if 'plot_order' in df.columns:
+        dfp = df.sort_values('plot_order').reset_index(drop=True)
+    else:
+        dfp = df.copy().reset_index(drop=True)
+
+    # Drop requested labels if present
+    if 'label' in dfp.columns and len(DROP_LABELS) > 0:
+        dfp = dfp[~dfp['label'].astype(str).isin(DROP_LABELS)].reset_index(drop=True)
+
+    labels = dfp['label'].astype(str).tolist() if 'label' in dfp.columns else [str(i) for i in range(len(dfp))]
+    # Use precomputed all-in column if present, else compute fallback again here
+    if 'all_in_total_cost_mean' in dfp.columns:
+        c_allin = pd.to_numeric(dfp['all_in_total_cost_mean'], errors='coerce').to_numpy()
+    else:
+        da = pd.to_numeric(dfp.get('da_total_cost_eur', pd.Series([np.nan]*len(dfp))), errors='coerce').fillna(0.0)
+        rt = pd.to_numeric(dfp.get('total_rt_cost_mean', pd.Series([np.nan]*len(dfp))), errors='coerce').fillna(0.0)
+        c_allin = (da + rt).to_numpy()
+
+    # Inject the fixed-cost bar at the end
+    labels.append(INJECT_LABEL)
+    try:
+        c_allin = np.concatenate([c_allin, np.array([float(INJECT_COST)], dtype=float)])
+    except Exception:
+        # Fallback in unlikely case of dtype issues
+        c_allin = np.array(list(c_allin) + [float(INJECT_COST)], dtype=float)
+
+    # Sort bars by height (descending)
+    try:
+        order = np.argsort(-np.asarray(c_allin, dtype=float))
+        labels = [labels[i] for i in order]
+        c_allin = np.asarray(c_allin, dtype=float)[order]
+    except Exception:
+        pass
+
+    # Build display labels per requested naming scheme
+    def _display_label(raw: str) -> str:
+        if raw == INJECT_LABEL:
+            return raw
+        if raw.lower() == 'deterministic':
+            return raw
+        s = str(raw)
+        # Expect forms like "0.10 (RT ON)" or "0.10 (RT OFF)"
+        try:
+            base = s.split()[0]
+            float(base)  # validate epsilon part
+            if '(RT ON' in s:
+                return f"DRCC with Recourse,\nε = {base}"
+            if '(RT OFF' in s:
+                return f"DRCC without Recourse,\nε = {base}"
+            # legacy unsuffixed
+            return f"DRCC,\nε = {base}"
+        except Exception:
+            return raw
+
+    display_labels = [_display_label(l) for l in labels]
+
+    x = np.arange(len(labels))
+    # Size proportional to case count (slightly wider for readability)
+    fig_width = max(6.5, 1.35 * len(labels) + 2.5)
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+    bars = ax.bar(x, c_allin, width=0.6, color='#4c72b0')
+    ax.set_xticks(x)
+    ax.set_xticklabels(display_labels, rotation=0)
+    ax.set_xlabel('Optimization Model', fontsize=14)
+    ax.set_ylabel('Total Cost (EUR)', fontsize=16)
+    ax.tick_params(axis='y', labelsize=14)
+    # No title to mirror oos-analysis (title commented out there)
+    ax.grid(axis='y', alpha=0.3)
+
+    # Annotate % difference vs deterministic on DRCC bars when available
+    try:
+        # Find deterministic bar in the current (sorted) labels
+        det_idx = None
+        for i, lab in enumerate(labels):
+            if isinstance(lab, str) and lab.lower() == 'deterministic':
+                det_idx = i
+                break
+        if det_idx is not None:
+            det_val = float(c_allin[det_idx]) if np.isfinite(c_allin[det_idx]) else np.nan
+            if np.isfinite(det_val) and det_val != 0.0:
+                for rect, val, lab in zip(bars, c_allin, labels):
+                    if isinstance(lab, str) and lab.lower() == 'deterministic':
+                        continue
+                    if not np.isfinite(val):
+                        continue
+                    pct = (val - det_val) / det_val * 100.0
+                    sgn = '+' if pct >= 0 else ''
+                    txt = f"{sgn}{pct:.1f}%"
+                    y = rect.get_height()
+                    ann = ax.text(rect.get_x() + rect.get_width()/2.0,
+                                   y + max(0.01*y, 0.5),
+                                   txt,
+                                   ha='center', va='bottom', fontsize=8, color='black')
+                    try:
+                        ann.set_path_effects([patheffects.withStroke(linewidth=2.0, foreground='white')])
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    print(f"✓ Total cost plot saved: {out_path}")
+    return out_path
+
+
+def plot_trafo_violation_probability(df: pd.DataFrame, out_path: str) -> str:
+    """Bar plot for transformer violation probability (%), mirroring style of total cost plot.
+
+    Drops 0.15 (RT ON) and injects a 'Co-optimization' bar with value 0, then sorts bars descending.
+    """
+    if 'plot_order' in df.columns:
+        dfp = df.sort_values('plot_order').reset_index(drop=True)
+    else:
+        dfp = df.copy().reset_index(drop=True)
+
+    if 'label' in dfp.columns and len(DROP_LABELS) > 0:
+        dfp = dfp[~dfp['label'].astype(str).isin(DROP_LABELS)].reset_index(drop=True)
+
+    labels = dfp['label'].astype(str).tolist() if 'label' in dfp.columns else [str(i) for i in range(len(dfp))]
+    if 'trafo_violation_probability_pct' in dfp.columns:
+        vals = pd.to_numeric(dfp['trafo_violation_probability_pct'], errors='coerce').fillna(0.0).to_numpy()
+    else:
+        # Fallback: attempt from steps ratio if columns available
+        if {'trafo_steps','horizon_timesteps'} <= set(dfp.columns):
+            num = pd.to_numeric(dfp['trafo_steps'], errors='coerce').fillna(0.0)
+            den = pd.to_numeric(dfp['horizon_timesteps'], errors='coerce').replace(0, np.nan)
+            ratio = (num / den * 100.0).fillna(0.0)
+            vals = ratio.to_numpy()
+        else:
+            vals = np.zeros(len(dfp), dtype=float)
+
+    # Inject custom bar
+    labels.append(TRAFO_INJECT_LABEL)
+    try:
+        vals = np.concatenate([vals, np.array([float(TRAFO_INJECT_VALUE)], dtype=float)])
+    except Exception:
+        vals = np.array(list(vals) + [float(TRAFO_INJECT_VALUE)], dtype=float)
+
+    # Sort descending
+    try:
+        order = np.argsort(-np.asarray(vals, dtype=float))
+        labels = [labels[i] for i in order]
+        vals = np.asarray(vals, dtype=float)[order]
+    except Exception:
+        pass
+
+    def _display_label(raw: str) -> str:
+        if raw == TRAFO_INJECT_LABEL:
+            return raw
+        if raw.lower() == 'deterministic':
+            return raw
+        s = str(raw)
+        try:
+            base = s.split()[0]
+            float(base)
+            if '(RT ON' in s:
+                return f"DRCC with Recourse,\nε = {base}"
+            if '(RT OFF' in s:
+                return f"DRCC without Recourse,\nε = {base}"
+            return f"DRCC,\nε = {base}"
+        except Exception:
+            return raw
+
+    display_labels = [_display_label(l) for l in labels]
+    x = np.arange(len(labels))
+    fig_width = max(6.5, 1.35 * len(labels) + 2.5)
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+    bars = ax.bar(x, vals, width=0.6, color='#dd8452')
+    ax.set_xticks(x)
+    ax.set_xticklabels(display_labels, rotation=0)
+    ax.set_xlabel('Optimization Model', fontsize=14)
+    ax.set_ylabel('Transformer Overload Probability (%)', fontsize=16)
+    ax.tick_params(axis='y', labelsize=14)
+    ax.grid(axis='y', alpha=0.3)
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    print(f"✓ Transformer violation probability plot saved: {out_path}")
+    return out_path
+
+
+def _extract_final_soc_median(label: str, src_dir: str) -> float | None:
+    """Extract final timestep median SOC (soc_p50) given a label.
+    Returns float or None if unavailable.
+    """
+    try:
+        s = str(label)
+        # Deterministic case: no envelope file, treat as missing
+        if s.lower() == 'deterministic':
+            return None
+        parts = s.split()
+        if not parts:
+            return None
+        eps = parts[0]
+        try:
+            float(eps)
+        except Exception:
+            return None
+        rt_tag = None
+        if '(RT' in s:
+            if 'RT ON' in s:
+                rt_tag = 'rt_on'
+            elif 'RT OFF' in s:
+                rt_tag = 'rt_off'
+        if rt_tag is None:
+            return None
+        # Filenames use underscore in epsilon: e.g. 0.10 -> 0_10
+        eps_token = eps.replace('.', '_')
+        fname = f"soc_envelope_drcc_true_epsilon_{eps_token}_{rt_tag}.csv"
+        path = os.path.join(src_dir, fname)
+        if not os.path.exists(path):
+            return None
+        pdf = pd.read_csv(path)
+        if 'soc_p50' not in pdf.columns:
+            return None
+        if 'timestamp' in pdf.columns:
+            try:
+                pdf['timestamp'] = pd.to_datetime(pdf['timestamp'], errors='coerce')
+                pdf = pdf.sort_values('timestamp')
+            except Exception:
+                pass
+        series = pd.to_numeric(pdf['soc_p50'], errors='coerce')
+        series = series[np.isfinite(series)]
+        if series.empty:
+            return None
+        return float(series.iloc[-1])
+    except Exception:
+        return None
+
+
+def plot_final_bess_soc_median(df: pd.DataFrame, out_path: str, src_dir: str) -> str:
+    """Bar plot of median battery SOC at final timestep for each case.
+
+    Drops 0.15 (RT ON) and injects Multi-Energy Co-optimization with value 0.5.
+    Bars sorted descending; no error bars.
+    """
+    if 'plot_order' in df.columns:
+        dfp = df.sort_values('plot_order').reset_index(drop=True)
+    else:
+        dfp = df.copy().reset_index(drop=True)
+
+    if 'label' in dfp.columns and len(DROP_LABELS) > 0:
+        dfp = dfp[~dfp['label'].astype(str).isin(DROP_LABELS)].reset_index(drop=True)
+
+    labels = dfp['label'].astype(str).tolist() if 'label' in dfp.columns else [str(i) for i in range(len(dfp))]
+    vals_list = []
+    for lab in labels:
+        v = _extract_final_soc_median(lab, src_dir)
+        if v is None or not np.isfinite(v):
+            vals_list.append(np.nan)
+        else:
+            vals_list.append(v)
+    vals = np.array(vals_list, dtype=float)
+    # Inject custom bar
+    labels.append(INJECT_LABEL)
+    try:
+        vals = np.concatenate([vals, np.array([0.5], dtype=float)])
+    except Exception:
+        vals = np.array(list(vals) + [0.5], dtype=float)
+
+    # Sort descending (treat NaN as very small)
+    try:
+        sortable = np.where(np.isfinite(vals), vals, -1.0)
+        order = np.argsort(-sortable)
+        labels = [labels[i] for i in order]
+        vals = vals[order]
+    except Exception:
+        pass
+
+    def _display_label(raw: str) -> str:
+        if raw == INJECT_LABEL:
+            return raw
+        if isinstance(raw, str) and raw.lower() == 'deterministic':
+            return raw
+        s = str(raw)
+        try:
+            base = s.split()[0]
+            float(base)
+            if '(RT ON' in s:
+                return f"DRCC with Recourse,\nε = {base}"
+            if '(RT OFF' in s:
+                return f"DRCC without Recourse,\nε = {base}"
+            return f"DRCC,\nε = {base}"
+        except Exception:
+            return raw
+
+    display_labels = [_display_label(l) for l in labels]
+    x = np.arange(len(labels))
+    fig_width = max(6.5, 1.35 * len(labels) + 2.5)
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+    bars = ax.bar(x, vals, width=0.6, color='#55a868')
+    ax.set_xticks(x)
+    ax.set_xticklabels(display_labels, rotation=0)
+    ax.set_xlabel('Optimization Model', fontsize=14)
+    ax.set_ylabel('Median Final BESS SOC', fontsize=16)
+    ax.tick_params(axis='y', labelsize=14)
+    ax.grid(axis='y', alpha=0.3)
+    ax.set_ylim(0.0, 1.05)
+    ax.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
+    # Reference line at SOC 0.5
+    ax.axhline(0.5, color='black', linestyle='--', linewidth=1.0, alpha=0.9)
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    print(f"✓ Final battery SOC median plot saved: {out_path}")
+    return out_path
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Generate plots from aggregated OOS results.")
+    ap.add_argument('--src', default=DEFAULT_SRC_DIR, help="Source directory containing oos_overview_summary.csv")
+    ap.add_argument('--out', default=None, help="Output image path (overrides export dir/name if provided)")
+    ap.add_argument('--export-dir', default=DEFAULT_EXPORT_DIR, help="Directory to write exported figures (default: 'export figures')")
+    args = ap.parse_args()
+
+    src_dir = args.src
+    # Determine output path: explicit --out wins; else export-dir/DEFAULT_OUT_NAME
+    if args.out:
+        out_path = args.out
+    else:
+        out_dir = args.export_dir or DEFAULT_EXPORT_DIR
+        out_path = os.path.join(out_dir, DEFAULT_OUT_NAME)
+
+    df = load_summary(src_dir)
+    plot_all_in_total_cost(df, out_path)
+
+    # Transformer violation probability plot
+    trafo_out = os.path.join(os.path.dirname(out_path), TRAFO_VIOLATION_OUT_NAME)
+    try:
+        plot_trafo_violation_probability(df, trafo_out)
+    except Exception as e:
+        print(f"[WARN] Transformer violation plot skipped: {e}")
+
+    # Final battery SOC median plot
+    final_soc_out = os.path.join(os.path.dirname(out_path), FINAL_SOC_OUT_NAME)
+    try:
+        plot_final_bess_soc_median(df, final_soc_out, src_dir)
+    except Exception as e:
+        print(f"[WARN] Final SOC plot skipped: {e}")
+
+    # Also produce focused ε=0.10 RT ON vs RT OFF split-violin into export folder
+    violin_out = args.out
+    if not violin_out:
+        out_dir = args.export_dir or DEFAULT_EXPORT_DIR
+        violin_out = os.path.join(out_dir, VIOLIN_OUT_NAME)
+    else:
+        # If a single --out was provided for the bar chart, still place violin next to it using default name
+        out_dir = os.path.dirname(args.out) or (args.export_dir or DEFAULT_EXPORT_DIR)
+        violin_out = os.path.join(out_dir, VIOLIN_OUT_NAME)
+    plot_violin_rt_on_vs_off(src_dir, violin_out)
+
+    # Thermal storage area plot (replicated)
+    thermal_out = os.path.join(out_dir if 'out_dir' in locals() else (args.export_dir or DEFAULT_EXPORT_DIR), THERMAL_STORAGE_OUT_NAME)
+    try:
+        plot_thermal_storage_operation_area('fully_coordinated_model_results.csv', thermal_out)
+    except Exception as e:
+        print(f"[WARN] Thermal storage plot skipped: {e}")
+
+    # Overload energy comparison: ε=0.10 RT ON vs RT OFF (same size as violin)
+    overload_out = os.path.join(out_dir if 'out_dir' in locals() else (args.export_dir or DEFAULT_EXPORT_DIR), OVERLOAD_RT_ON_OFF_OUT_NAME)
+    try:
+        plot_overload_energy_rt_on_vs_off(src_dir, overload_out)
+    except Exception as e:
+        print(f"[WARN] Overload energy RT ON vs OFF plot skipped: {e}")
+
+    # Max transformer loading vs epsilon (v2 results): two-line plot
+    max_trafo_out = os.path.join(out_dir if 'out_dir' in locals() else (args.export_dir or DEFAULT_EXPORT_DIR), MAX_TRAFO_EPSILON_OUT_NAME)
+    try:
+        plot_max_trafo_loading_vs_epsilon_v2(max_trafo_out)
+    except Exception as e:
+        print(f"[WARN] Max transformer loading vs ε (v2) plot skipped: {e}")
+
+    # DA total cost vs epsilon (v2 results): two-line plot
+    da_cost_out = os.path.join(out_dir if 'out_dir' in locals() else (args.export_dir or DEFAULT_EXPORT_DIR), DA_COST_EPSILON_OUT_NAME)
+    try:
+        plot_da_total_cost_vs_epsilon_v2(da_cost_out)
+    except Exception as e:
+        print(f"[WARN] DA total cost vs ε (v2) plot skipped: {e}")
+
+
+if __name__ == '__main__':
+    main()

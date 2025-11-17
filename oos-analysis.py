@@ -26,7 +26,7 @@ import math
 # === User config ===
 # Distribution toggle: 'gaussian' (default) -> v4_oos; 'uniform' -> v4_oos_uniform; 'contaminated' -> v4_oos_contaminated; 'studentt' -> v4_oos_studentt
 # Defaulting to 'gaussian' to match dso_model_v4.py's default OUTDIR ('v4_oos')
-DISTRIBUTION: str = os.getenv('V4_SAMPLE_DISTRIBUTION', 'studentt').strip().lower()
+DISTRIBUTION: str = os.getenv('V4_SAMPLE_DISTRIBUTION', 'gaussian').strip().lower()
 # Enable splitting by RT mode suffix (_rt_on / _rt_off) if present in filenames.
 INCLUDE_RT_SPLIT: bool = True  # set False to ignore RT mode suffixes and aggregate silently
 
@@ -128,6 +128,8 @@ SHOW: bool = False  # set True to display interactively
 PLOT_SOC_ENVELOPES: bool = True
 SOC_ENV_FIG = "soc_envelopes.png"
 SOC_FINAL_FIG = "soc_final_envelope.png"  # final timestep summary (median with 5–95% error bars)
+SOC_FINAL_BOXPLOT_FIG = "soc_final_boxplot.png"  # final timestep distribution across cases (boxplot)
+SOC_DAILY_BOXPLOT_FIG = "soc_daily_boxplot.png"  # full-day distribution across cases (boxplot)
 FRONTIER_CSV = "frontier_summary.csv"
 PLOT_FRONTIER_SCATTER: bool = True
 FRONTIER_SCATTER_FIG = "frontier_scatter.png"
@@ -167,6 +169,10 @@ VIOLIN_SPLIT_KDE_BW_ADJ: float = 2.0  # 1.0 ~ Matplotlib default smoothness; <1 
 PLOT_OVERLOAD_ENERGY_COMPARE: bool = True
 OVERLOAD_ENERGY_COMPARE_FIG = "overload_energy_compare_det_vs_005.png"
 OVERLOAD_ENERGY_COMPARE_CSV = "overload_energy_compare_det_vs_005.csv"
+# New: ε=0.10 RT ON vs RT OFF overload energy comparison
+PLOT_OVERLOAD_ENERGY_010_RT_COMPARE: bool = True
+OVERLOAD_ENERGY_010_RT_FIG = "overload_energy_compare_010_rt_on_vs_off.png"
+OVERLOAD_ENERGY_010_RT_CSV = "overload_energy_compare_010_rt_on_vs_off.csv"
 # Parameters per user instruction
 # Effective violation/overload threshold (pct). Allow env override; default to 80.09% to ignore tiny numerical overshoots.
 try:
@@ -1136,12 +1142,33 @@ def _run_dual_aggregation(dist_a: str, dist_b: str, weights: Tuple[float,float] 
 
     # baseline policy/soc
     _copy_if_exists('policy_coeffs_drcc_false.csv')
+    # RT-suffixed policy coeffs (if present)
+    for _tag in ('rt_on','rt_off','rt_unk'):
+        _copy_if_exists(f'policy_coeffs_drcc_false_{_tag}.csv')
+    # baseline SoC envelopes (unsuffixed + RT variants)
     _copy_if_exists('soc_envelope_drcc_false.csv')
+    for _tag in ('rt_on','rt_off','rt_unk'):
+        _copy_if_exists(f'soc_envelope_drcc_false_{_tag}.csv')
+    # baseline SoC raw series (parquet/csv; unsuffixed + RT variants)
+    for _ext in ('parquet','csv'):
+        _copy_if_exists(f'soc_series_drcc_false.{_ext}')
+        for _tag in ('rt_on','rt_off','rt_unk'):
+            _copy_if_exists(f'soc_series_drcc_false_{_tag}.{_ext}')
     # per epsilon
     for e in EPSILONS:
         tok = epsilon_token(e)
         _copy_if_exists(f'policy_coeffs_drcc_true_epsilon_{tok}.csv')
+        for _tag in ('rt_on','rt_off','rt_unk'):
+            _copy_if_exists(f'policy_coeffs_drcc_true_epsilon_{tok}_{_tag}.csv')
+        # SoC envelopes (unsuffixed + RT variants)
         _copy_if_exists(f'soc_envelope_drcc_true_epsilon_{tok}.csv')
+        for _tag in ('rt_on','rt_off','rt_unk'):
+            _copy_if_exists(f'soc_envelope_drcc_true_epsilon_{tok}_{_tag}.csv')
+        # SoC raw series (parquet/csv; unsuffixed + RT variants)
+        for _ext in ('parquet','csv'):
+            _copy_if_exists(f'soc_series_drcc_true_epsilon_{tok}.{_ext}')
+            for _tag in ('rt_on','rt_off','rt_unk'):
+                _copy_if_exists(f'soc_series_drcc_true_epsilon_{tok}_{_tag}.{_ext}')
 
     # Now generate full analyses using the combined dataset by pointing RESULTS_DIR to out_dir
     global RESULTS_DIR, AGGREGATE_DISTS
@@ -2086,6 +2113,106 @@ def main() -> None:
                 print('[INFO] Skipped overload energy comparison (no transformer loading parquet data found).')
         except Exception as e:
             print(f"[WARN] Failed to build overload energy comparison: {e}")
+
+    # --- New: Overload energy comparison (ε=0.10 RT ON vs RT OFF) ---
+    if PLOT_OVERLOAD_ENERGY_010_RT_COMPARE:
+        try:
+            threshold_pct_local = viol_threshold_eff
+            def _compute_overload_energy_from_parquet_rt(parquet_path: str) -> float:
+                try:
+                    pdf = _read_parquet_or_csv(parquet_path)
+                except Exception:
+                    pdf = None
+                if pdf is None:
+                    return float('nan')
+                must = {'sample_id','t','trafo_index','loading_pct'}
+                if not must <= set(pdf.columns):
+                    return float('nan')
+                lp = pd.to_numeric(pdf['loading_pct'], errors='coerce').to_numpy()
+                mask = np.isfinite(lp) & (lp > threshold_pct_local)
+                if not np.any(mask):
+                    return 0.0
+                excess_pct = lp[mask] - threshold_pct_local
+                excess_mva = (excess_pct / 100.0) * RATED_TRAFO_MVA
+                total_mvah = float(np.sum(excess_mva) * STEP_HOURS)
+                try:
+                    n_samples = int(pd.to_numeric(pdf['sample_id'], errors='coerce').dropna().nunique())
+                except Exception:
+                    n_samples = OVERLOAD_SAMPLE_COUNT_DEFAULT
+                n_samples = n_samples if n_samples > 0 else OVERLOAD_SAMPLE_COUNT_DEFAULT
+                total_kwh_per_sample = (total_mvah * 1000.0) / float(n_samples)
+                return total_kwh_per_sample
+
+            tok = epsilon_token(0.10)
+            meta_on_path = os.path.join(RESULTS_DIR, f'v4_meta_drcc_true_epsilon_{tok}_rt_on.json')
+            meta_off_path = os.path.join(RESULTS_DIR, f'v4_meta_drcc_true_epsilon_{tok}_rt_off.json')
+            val_on = float('nan')
+            val_off = float('nan')
+            # RT ON
+            if os.path.exists(meta_on_path):
+                try:
+                    with open(meta_on_path,'r',encoding='utf-8') as f:
+                        m_on = json.load(f)
+                    rel = m_on.get('trafo_loading_file') if isinstance(m_on, dict) else None
+                    if rel:
+                        pq = os.path.join(RESULTS_DIR, rel.replace('/', os.sep))
+                        if not os.path.exists(pq) and os.path.exists(rel):
+                            pq = rel
+                        if os.path.exists(pq):
+                            val_on = _compute_overload_energy_from_parquet_rt(pq)
+                except Exception:
+                    pass
+            # RT OFF
+            if os.path.exists(meta_off_path):
+                try:
+                    with open(meta_off_path,'r',encoding='utf-8') as f:
+                        m_off = json.load(f)
+                    rel = m_off.get('trafo_loading_file') if isinstance(m_off, dict) else None
+                    if rel:
+                        pq = os.path.join(RESULTS_DIR, rel.replace('/', os.sep))
+                        if not os.path.exists(pq) and os.path.exists(rel):
+                            pq = rel
+                        if os.path.exists(pq):
+                            val_off = _compute_overload_energy_from_parquet_rt(pq)
+                except Exception:
+                    pass
+
+            if np.isfinite(val_on) or np.isfinite(val_off):
+                labels = []
+                values = []
+                colors = []
+                # Order: RT OFF (left, blue) then RT ON (right, red) if present
+                if np.isfinite(val_off):
+                    labels.append('DRCC without RT Recourse, ε = 0.10')
+                    values.append(val_off)
+                    colors.append('#9ecae1')
+                if np.isfinite(val_on):
+                    labels.append('DRCC with RT Recourse, ε = 0.10')
+                    values.append(val_on)
+                    colors.append('#fb6a4a')
+                fig_rtovl, ax_rtovl = plt.subplots(figsize=(4.6, 6.0))
+                x = np.arange(len(labels))
+                bars = ax_rtovl.bar(x, values, color=colors, edgecolor=['#08519c' if 'without' in lab else '#cb181d' for lab in labels], alpha=0.85)
+                ax_rtovl.set_xticks(x)
+                ax_rtovl.set_xticklabels(labels, rotation=0)
+                ax_rtovl.set_ylabel('Total overload energy per sample (kWh)')
+                ax_rtovl.grid(axis='y', alpha=0.3)
+                for rect, val in zip(bars, values):
+                    h = rect.get_height()
+                    ax_rtovl.text(rect.get_x() + rect.get_width()/2, h + max(0.01*h, 0.01), f"{val:.2f}", ha='center', va='bottom', fontsize=9)
+                out_fig = os.path.join(RESULTS_DIR, OVERLOAD_ENERGY_010_RT_FIG)
+                fig_rtovl.tight_layout()
+                fig_rtovl.savefig(out_fig, dpi=150)
+                print(f"✓ Overload energy ε=0.10 RT ON vs OFF: {out_fig}")
+                # CSV
+                df_out = pd.DataFrame({'label': labels, 'overload_energy_kwh_per_sample': values})
+                out_csv = os.path.join(RESULTS_DIR, OVERLOAD_ENERGY_010_RT_CSV)
+                df_out.to_csv(out_csv, index=False)
+                print(f"✓ Overload energy ε=0.10 RT CSV: {out_csv}")
+            else:
+                print('[INFO] Skipped ε=0.10 RT ON/OFF overload energy plot (no parquet data).')
+        except Exception as e:
+            print(f"[WARN] Failed to build ε=0.10 RT overload energy comparison: {e}")
 
     # --- New: CVaR90 transformer loading comparison (deterministic vs ε=0.05) ---
     if PLOT_CVAR90_COMPARE:
@@ -3331,64 +3458,216 @@ def main() -> None:
                 except Exception as e:
                     print(f"[WARN] Failed to build K time series plot: {e}")
 
-    # --- SoC envelope plotting (optional) ---
+    # --- SoC envelope plotting (raw trajectory based if available) ---
     if PLOT_SOC_ENVELOPES:
-        # Collect ALL RT mode envelopes per epsilon (strict); ignore unsuffixed unless no RT variant present.
-        cases: List[Tuple[str, str, float | None]] = []  # (display_label, path, epsilon)
-        # Deterministic baseline RT variants
-        det_variants = [
-            ('rt_on', os.path.join(RESULTS_DIR, 'soc_envelope_drcc_false_rt_on.csv')),
-            ('rt_off', os.path.join(RESULTS_DIR, 'soc_envelope_drcc_false_rt_off.csv')),
-            ('rt_unk', os.path.join(RESULTS_DIR, 'soc_envelope_drcc_false_rt_unk.csv')),
-        ]
-        det_added = False
-        for tag, pth in det_variants:
-            if os.path.exists(pth):
-                cases.append((f"{DETERMINISTIC_LABEL} ({_rt_display(tag)})", pth, None))
-                det_added = True
-        if not det_added:  # fall back to unsuffixed deterministic if no RT variants
-            soc_base_unsuff = os.path.join(RESULTS_DIR, 'soc_envelope_drcc_false.csv')
-            if os.path.exists(soc_base_unsuff):
-                cases.append((DETERMINISTIC_LABEL, soc_base_unsuff, None))
-        # Epsilon RT variants
-        for eps in EPSILONS:
-            tok = epsilon_token(eps)
-            per_eps_added = False
+        def _load_raw_soc(meta: Dict) -> pd.DataFrame | None:
+            """Load raw SoC time series from meta if available.
+
+            Returns DataFrame with columns ['timestamp','sample_id','soc_frac'] or None.
+            Supports parquet or CSV; expects file referenced by 'soc_series_file'.
+            """
+            if not isinstance(meta, dict):
+                return None
+            fname = meta.get('soc_series_file') or meta.get('soc_envelope_file')  # fallback legacy
+            if not fname:
+                return None
+            abs_path = os.path.join(RESULTS_DIR, fname)
+            if not os.path.exists(abs_path):
+                # try direct if meta stored absolute
+                if os.path.exists(fname):
+                    abs_path = fname
+                else:
+                    return None
+            try:
+                if abs_path.lower().endswith('.parquet'):
+                    df_raw = _read_parquet_or_csv(abs_path)
+                else:
+                    df_raw = pd.read_csv(abs_path)
+            except Exception:
+                return None
+            if df_raw is None or df_raw.empty:
+                return None
+            # Detect envelope file shape and skip (want raw series). Raw has soc_frac column.
+            if {'soc_p05','soc_p50','soc_p95'} <= set(df_raw.columns):
+                return None  # it's an envelope, not raw series
+            needed = {'timestamp','sample_id','soc_frac'}
+            if not needed <= set(df_raw.columns):
+                return None
+            # Ensure timestamp dtype
+            try:
+                df_raw['timestamp'] = pd.to_datetime(df_raw['timestamp'])
+            except Exception:
+                pass
+            return df_raw
+
+        # Build case list from meta_map (constructed earlier): label -> meta
+        soc_cases: List[Tuple[str, pd.DataFrame]] = []  # (display_label, raw_df or envelope-derived df)
+        for lab, meta in meta_map.items():
+            raw_df = _load_raw_soc(meta)
+            if raw_df is not None:
+                soc_cases.append((lab, raw_df))
+        # Fallback to directory scan for raw series if meta-based load failed
+        if not soc_cases:
+            try:
+                cand_paths: List[str] = []
+                cand_paths += glob.glob(os.path.join(RESULTS_DIR, 'soc_series_drcc_true_epsilon_*.parquet'))
+                cand_paths += glob.glob(os.path.join(RESULTS_DIR, 'soc_series_drcc_true_epsilon_*.csv'))
+                # Include deterministic baseline variants if present
+                cand_paths += glob.glob(os.path.join(RESULTS_DIR, 'soc_series_drcc_false*.parquet'))
+                cand_paths += glob.glob(os.path.join(RESULTS_DIR, 'soc_series_drcc_false*.csv'))
+                for p in sorted(cand_paths):
+                    name = os.path.basename(p)
+                    # Determine label
+                    lab: str
+                    if name.startswith('soc_series_drcc_true_epsilon_'):
+                        # extract epsilon token between prefix and possible RT tag
+                        core = name[len('soc_series_drcc_true_epsilon_'):]  # e.g., 0_10_rt_on.parquet
+                        token = core.split('_rt_')[0].split('.')[0]
+                        try:
+                            eps_val = float(token.replace('_', '.'))
+                        except Exception:
+                            continue
+                        rt_tag = _extract_rt_tag_from_name(name) or ''
+                        disp = f"{eps_val:.2f} ({_rt_display(rt_tag)})" if rt_tag else f"{eps_val:.2f}"
+                        lab = disp
+                    else:
+                        # deterministic baseline
+                        rt_tag = _extract_rt_tag_from_name(name) or ''
+                        lab = f"{DETERMINISTIC_LABEL} ({_rt_display(rt_tag)})" if rt_tag else DETERMINISTIC_LABEL
+                    df_raw = _read_parquet_or_csv(p)
+                    if df_raw is None or df_raw.empty:
+                        continue
+                    cols = set(df_raw.columns)
+                    if {'soc_p05','soc_p50','soc_p95'} <= cols:
+                        # envelope, skip
+                        continue
+                    if not {'timestamp','sample_id','soc_frac'} <= cols:
+                        continue
+                    try:
+                        df_raw['timestamp'] = pd.to_datetime(df_raw['timestamp'])
+                    except Exception:
+                        pass
+                    soc_cases.append((lab, df_raw))
+            except Exception:
+                pass
+        # Fallback to envelope CSVs only if still no raw cases found
+        if not soc_cases:
+            # Reuse previous envelope search logic minimally (legacy fallback)
+            legacy_env_paths: List[Tuple[str,str]] = []
+            # Deterministic variants
             for tag in ('rt_on','rt_off','rt_unk'):
-                pth = os.path.join(RESULTS_DIR, f'soc_envelope_drcc_true_epsilon_{tok}_{tag}.csv')
-                if os.path.exists(pth):
-                    cases.append((f"{eps:.2f} ({_rt_display(tag)})", pth, eps))
-                    per_eps_added = True
-            if not per_eps_added:  # no RT variant; try unsuffixed
-                p_unsuff = os.path.join(RESULTS_DIR, f'soc_envelope_drcc_true_epsilon_{tok}.csv')
-                if os.path.exists(p_unsuff):
-                    cases.append((f"{eps:.2f}", p_unsuff, eps))
-        if cases:
-            cols = len(cases)
+                p_env = os.path.join(RESULTS_DIR, f'soc_envelope_drcc_false_{tag}.csv')
+                if os.path.exists(p_env):
+                    legacy_env_paths.append((f"{DETERMINISTIC_LABEL} ({_rt_display(tag)})", p_env))
+            if not legacy_env_paths:
+                p_env_det = os.path.join(RESULTS_DIR, 'soc_envelope_drcc_false.csv')
+                if os.path.exists(p_env_det):
+                    legacy_env_paths.append((DETERMINISTIC_LABEL, p_env_det))
+            for eps in EPSILONS:
+                tok = epsilon_token(eps)
+                added = False
+                for tag in ('rt_on','rt_off','rt_unk'):
+                    p_env = os.path.join(RESULTS_DIR, f'soc_envelope_drcc_true_epsilon_{tok}_{tag}.csv')
+                    if os.path.exists(p_env):
+                        legacy_env_paths.append((f"{eps:.2f} ({_rt_display(tag)})", p_env))
+                        added = True
+                if not added:
+                    p_env_uns = os.path.join(RESULTS_DIR, f'soc_envelope_drcc_true_epsilon_{tok}.csv')
+                    if os.path.exists(p_env_uns):
+                        legacy_env_paths.append((f"{eps:.2f}", p_env_uns))
+            if legacy_env_paths:
+                cols = len(legacy_env_paths)
+                fig_soc, ax_soc = plt.subplots(1, cols, figsize=(4*cols, 3), constrained_layout=True)
+                if cols == 1:
+                    ax_soc = [ax_soc]
+                final_rows_env = []
+                for ax, (lab, pth) in zip(ax_soc, legacy_env_paths):
+                    try:
+                        env_df = pd.read_csv(pth)
+                    except Exception:
+                        continue
+                    if not {'soc_p05','soc_p50','soc_p95'} <= set(env_df.columns):
+                        continue
+                    p05 = pd.to_numeric(env_df['soc_p05'], errors='coerce')
+                    p50 = pd.to_numeric(env_df['soc_p50'], errors='coerce')
+                    p95 = pd.to_numeric(env_df['soc_p95'], errors='coerce')
+                    t = np.arange(len(env_df))
+                    bw = float(np.nanmax(p95 - p05)) if len(env_df) else 0.0
+                    if not np.isfinite(bw):
+                        bw = 0.0
+                    if bw <= 1e-6:
+                        ax.plot(t, p50, color='#08519c', linewidth=1.5, label='Median (degenerate)')
+                    else:
+                        ax.fill_between(t, p05, p95, color='#c6dbef', alpha=0.6, label='5–95% band')
+                        ax.plot(t, p50, color='#08519c', linewidth=1.5, label='Median')
+                    ax.set_ylim(0, 1.02)
+                    ax.set_title(f"SoC envelope ({_display_label_for_case(lab)})")
+                    ax.set_xlabel('t step')
+                    if ax == ax_soc[0]:
+                        ax.set_ylabel('SoC fraction')
+                    ax.grid(alpha=0.3)
+                    ax.legend(fontsize=8)
+                    last = env_df.iloc[-1]
+                    final_rows_env.append((_display_label_for_case(lab), float(last['soc_p05']), float(last['soc_p50']), float(last['soc_p95'])))
+                soc_fig_path = os.path.join(RESULTS_DIR, SOC_ENV_FIG)
+                fig_soc.savefig(soc_fig_path, dpi=150)
+                print(f"✓ SoC envelopes figure (legacy envelope fallback): {soc_fig_path}")
+                if final_rows_env:
+                    labels = [r[0] for r in final_rows_env]
+                    medians = np.array([r[2] for r in final_rows_env])
+                    low_err = medians - np.array([r[1] for r in final_rows_env])
+                    high_err = np.array([r[3] for r in final_rows_env]) - medians
+                    low_err = np.clip(low_err, 0, None); high_err = np.clip(high_err, 0, None)
+                    fig_final, ax_final = plt.subplots(figsize=(max(6, 0.6*len(final_rows_env)+2), 4))
+                    x = np.arange(len(final_rows_env))
+                    ax_final.bar(x, medians, color='#3182bd', alpha=0.85, label='Median final SoC')
+                    ax_final.errorbar(x, medians, yerr=[low_err, high_err], fmt='none', ecolor='#08306b', elinewidth=1.2, capsize=4, label='5–95% range')
+                    ax_final.set_xticks(x)
+                    ax_final.set_xticklabels(labels, rotation=45, ha='right')
+                    ax_final.set_ylabel('Final timestep SoC fraction')
+                    ax_final.set_ylim(0, 1.05)
+                    ax_final.grid(axis='y', alpha=0.3)
+                    ax_final.legend(fontsize=8)
+                    final_fig_path = os.path.join(RESULTS_DIR, SOC_FINAL_FIG)
+                    fig_final.tight_layout(); fig_final.savefig(final_fig_path, dpi=150)
+                    print(f"✓ Final timestep SoC summary figure (legacy): {final_fig_path}")
+                    print("(Raw series missing; consider re-running v4 with EXPORT_SOC_SERIES=True)")
+            else:
+                print('[INFO] No SoC envelope or raw series files found.')
+        else:
+            # Raw series path: compute envelopes from actual trajectories
+            # Group cases by display label retaining RT tags & epsilon identification
+            case_envelopes: List[Tuple[str, pd.DataFrame]] = []  # (label, env_df with p05/p50/p95)
+            for lab, raw_df in soc_cases:
+                # Ensure ordering by timestamp
+                raw_df = raw_df.sort_values(['timestamp','sample_id'])
+                # Group by timestamp and compute quantiles from raw soc_frac
+                g = raw_df.groupby('timestamp')['soc_frac']
+                q05 = g.quantile(0.05)
+                q50 = g.quantile(0.50)
+                q95 = g.quantile(0.95)
+                env_df = pd.DataFrame({
+                    'timestamp': q05.index,
+                    'soc_p05': q05.to_numpy(),
+                    'soc_p50': q50.to_numpy(),
+                    'soc_p95': q95.to_numpy(),
+                })
+                case_envelopes.append((lab, env_df))
+            # Plot envelopes
+            cols = len(case_envelopes)
             fig_soc, ax_soc = plt.subplots(1, cols, figsize=(4*cols, 3), constrained_layout=True)
             if cols == 1:
                 ax_soc = [ax_soc]
-            for ax, (lab, pth, eps) in zip(ax_soc, cases):
-                try:
-                    df_env = pd.read_csv(pth)
-                except Exception:
-                    continue
-                if not {'soc_p05','soc_p50','soc_p95'}.issubset(df_env.columns):
-                    continue
-                t = np.arange(len(df_env))
-                # Detect degenerate envelopes (e.g., single trajectory -> identical percentiles)
-                try:
-                    p05 = pd.to_numeric(df_env['soc_p05'], errors='coerce')
-                    p50 = pd.to_numeric(df_env['soc_p50'], errors='coerce')
-                    p95 = pd.to_numeric(df_env['soc_p95'], errors='coerce')
-                    band_width = float(np.nanmax(p95 - p05)) if len(df_env) else 0.0
-                except Exception:
-                    p05, p50, p95 = df_env['soc_p05'], df_env['soc_p50'], df_env['soc_p95']
-                    band_width = 0.0
-                if not np.isfinite(band_width):
-                    band_width = 0.0
-                if band_width <= 1e-6:
-                    print(f"[INFO] SoC envelope degenerate for case '{lab}' (p05≈p50≈p95). Likely n_trajectories=1. Plotting median only.")
+            final_rows = []
+            for ax, (lab, env_df) in zip(ax_soc, case_envelopes):
+                p05 = pd.to_numeric(env_df['soc_p05'], errors='coerce')
+                p50 = pd.to_numeric(env_df['soc_p50'], errors='coerce')
+                p95 = pd.to_numeric(env_df['soc_p95'], errors='coerce')
+                t = np.arange(len(env_df))
+                bw = float(np.nanmax(p95 - p05)) if len(env_df) else 0.0
+                if not np.isfinite(bw):
+                    bw = 0.0
+                if bw <= 1e-6:
                     ax.plot(t, p50, color='#08519c', linewidth=1.5, label='Median (degenerate)')
                 else:
                     ax.fill_between(t, p05, p95, color='#c6dbef', alpha=0.6, label='5–95% band')
@@ -3400,33 +3679,16 @@ def main() -> None:
                     ax.set_ylabel('SoC fraction')
                 ax.grid(alpha=0.3)
                 ax.legend(fontsize=8)
+                last = env_df.iloc[-1]
+                final_rows.append((_display_label_for_case(lab), float(last['soc_p05']), float(last['soc_p50']), float(last['soc_p95'])))
             soc_fig_path = os.path.join(RESULTS_DIR, SOC_ENV_FIG)
             fig_soc.savefig(soc_fig_path, dpi=150)
-            print(f"✓ SoC envelopes figure: {soc_fig_path}")
-
-            # Build final timestep summary across cases (median bar with asymmetric error bars to p05/p95)
-            final_rows = []  # (label, p05, p50, p95)
-            for lab, pth, _eps in cases:
-                try:
-                    df_env = pd.read_csv(pth)
-                except Exception:
-                    continue
-                if not {'soc_p05','soc_p50','soc_p95'}.issubset(df_env.columns) or df_env.empty:
-                    continue
-                last = df_env.iloc[-1]
-                try:
-                    p05 = float(last['soc_p05']); p50 = float(last['soc_p50']); p95 = float(last['soc_p95'])
-                except Exception:
-                    continue
-                # clamp to [0,1] to avoid numerical drift
-                p05 = max(0.0, min(1.0, p05)); p50 = max(0.0, min(1.0, p50)); p95 = max(0.0, min(1.0, p95))
-                final_rows.append((_display_label_for_case(lab), p05, p50, p95))
+            print(f"✓ SoC envelopes figure (raw series): {soc_fig_path}")
             if final_rows:
                 labels = [r[0] for r in final_rows]
                 medians = np.array([r[2] for r in final_rows])
                 low_err = medians - np.array([r[1] for r in final_rows])
                 high_err = np.array([r[3] for r in final_rows]) - medians
-                # Ensure non-negative errors
                 low_err = np.clip(low_err, 0, None); high_err = np.clip(high_err, 0, None)
                 fig_final, ax_final = plt.subplots(figsize=(max(6, 0.6*len(final_rows)+2), 4))
                 x = np.arange(len(final_rows))
@@ -3439,11 +3701,69 @@ def main() -> None:
                 ax_final.grid(axis='y', alpha=0.3)
                 ax_final.legend(fontsize=8)
                 final_fig_path = os.path.join(RESULTS_DIR, SOC_FINAL_FIG)
-                fig_final.tight_layout()
-                fig_final.savefig(final_fig_path, dpi=150)
-                print(f"✓ Final timestep SoC summary figure: {final_fig_path}")
-        else:
-            print("[INFO] No SoC envelope files found to plot.")
+                fig_final.tight_layout(); fig_final.savefig(final_fig_path, dpi=150)
+                print(f"✓ Final timestep SoC summary figure (raw series): {final_fig_path}")
+
+            # Also produce a boxplot of final-step SoC across cases using raw trajectories
+            try:
+                final_values: List[np.ndarray] = []
+                box_labels: List[str] = []
+                for lab, raw_df in soc_cases:
+                    if raw_df is None or raw_df.empty:
+                        continue
+                    # final timestamp present in this case
+                    try:
+                        t_final = raw_df['timestamp'].max()
+                        vals = pd.to_numeric(raw_df.loc[raw_df['timestamp'] == t_final, 'soc_frac'], errors='coerce').dropna().to_numpy()
+                    except Exception:
+                        vals = np.array([])
+                    if vals.size == 0:
+                        continue
+                    final_values.append(vals)
+                    box_labels.append(_display_label_for_case(lab))
+                if final_values:
+                    fig_box, ax_box = plt.subplots(figsize=(max(6, 0.8*len(final_values)+2), 4))
+                    ax_box.boxplot(final_values, labels=box_labels, showfliers=False, patch_artist=True,
+                                   boxprops=dict(facecolor='#c6dbef', color='#08519c'),
+                                   medianprops=dict(color='#08306b', linewidth=1.5),
+                                   whiskerprops=dict(color='#08519c'), capprops=dict(color='#08519c'))
+                    ax_box.set_ylabel('Final timestep SoC fraction')
+                    ax_box.set_ylim(0, 1.05)
+                    ax_box.grid(axis='y', alpha=0.3)
+                    plt.setp(ax_box.get_xticklabels(), rotation=45, ha='right')
+                    box_fig_path = os.path.join(RESULTS_DIR, SOC_FINAL_BOXPLOT_FIG)
+                    fig_box.tight_layout(); fig_box.savefig(box_fig_path, dpi=150)
+                    print(f"✓ Final timestep SoC boxplot (raw series): {box_fig_path}")
+            except Exception as e:
+                print(f"[WARN] Could not generate final-step SoC boxplot: {e}")
+
+            # Produce a boxplot of SoC over the whole day (all timesteps) across cases
+            try:
+                daily_values: List[np.ndarray] = []
+                daily_labels: List[str] = []
+                for lab, raw_df in soc_cases:
+                    if raw_df is None or raw_df.empty:
+                        continue
+                    vals = pd.to_numeric(raw_df.get('soc_frac', pd.Series(dtype=float)), errors='coerce').dropna().to_numpy()
+                    if vals.size == 0:
+                        continue
+                    daily_values.append(vals)
+                    daily_labels.append(_display_label_for_case(lab))
+                if daily_values:
+                    fig_day, ax_day = plt.subplots(figsize=(max(6, 0.8*len(daily_values)+2), 4))
+                    ax_day.boxplot(daily_values, labels=daily_labels, showfliers=False, patch_artist=True,
+                                   boxprops=dict(facecolor='#c6dbef', color='#08519c'),
+                                   medianprops=dict(color='#08306b', linewidth=1.5),
+                                   whiskerprops=dict(color='#08519c'), capprops=dict(color='#08519c'))
+                    ax_day.set_ylabel('SoC fraction (all timesteps)')
+                    ax_day.set_ylim(0, 1.05)
+                    ax_day.grid(axis='y', alpha=0.3)
+                    plt.setp(ax_day.get_xticklabels(), rotation=45, ha='right')
+                    daily_fig_path = os.path.join(RESULTS_DIR, SOC_DAILY_BOXPLOT_FIG)
+                    fig_day.tight_layout(); fig_day.savefig(daily_fig_path, dpi=150)
+                    print(f"✓ Whole-day SoC boxplot (raw series): {daily_fig_path}")
+            except Exception as e:
+                print(f"[WARN] Could not generate whole-day SoC boxplot: {e}")
 
     if SHOW:
         plt.show()

@@ -99,7 +99,7 @@ USE_MEAN_CENTERED_POLICY = True  # <--- EDIT ME (base default to match v3)
 # Set to False to lock the above value regardless of CLI/env.
 ALLOW_RT_FLAG_RUNTIME_OVERRIDE = True
 ENABLE_DRCC_RT_BUDGETS = True  # <--- EDIT ME (uses PV/temperature std to size D+ / D-)
-DRCC_EPSILON = 0.05            # chance violation level; k = sqrt((1-eps)/eps)
+DRCC_EPSILON = 0.15            # chance violation level; k = sqrt((1-eps)/eps)
 ## RT budget sizing and cost switches
 # If True, size RT deviation budgets with k_epsilon*σ; if False, use 1*σ even when DRCC tightening is on.
 RT_BUDGETS_USE_K_EPSILON = False

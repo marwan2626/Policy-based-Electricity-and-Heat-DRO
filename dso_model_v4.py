@@ -36,7 +36,7 @@ import pandas as pd
 # ===========================
 # Epsilon used in the v2 filename suffix: dso_model_v2_results_drcc_true_epsilon_{EPSILON_TOKEN}.csv
 # The token uses two decimals with underscore as decimal separator, e.g., 0.05 -> "0_05"
-EPSILON: float = 0.15
+EPSILON: float = 0.05
 # When running the deterministic (no DRCC tightening) case, set RUN_DRCC_FALSE = True.
 # In that mode we ignore EPSILON for locating the v2 results CSV and instead look for
 # files named like: dso_model_v2_results_drcc_false*.csv
@@ -129,6 +129,10 @@ TRAFO_LOADING_FLOAT_DTYPE = "float32"
 # Write transformer loading logs as Parquet so oos-analysis can read them directly
 # (oos-analysis expects Parquet files; CSV fallback is still written only if you set this to False.)
 TRAFO_LOADING_WRITE_PARQUET: bool = True
+
+# Raw SoC time-series export across trajectories (for correct aggregation/mixtures)
+EXPORT_SOC_SERIES: bool = True
+SOC_SERIES_WRITE_PARQUET: bool = True
 
 # Full per-trajectory series export (heavy). When enabled, writes one CSV per trajectory with
 # bus voltages, line & transformer loading/flows, component powers (HP, flex, base load, PV, BESS),
@@ -1826,7 +1830,10 @@ def main() -> None:
         max_trafo_loading_optionA = 0.0
         steps_line_over_thresh = 0; steps_trafo_over_thresh = 0
         pv_curtail_energy = 0.0; bess_rt_energy_throughput = 0.0
+        # New: realized (baseline + recourse) BESS throughput accumulator and cost
+        bess_rt_energy_throughput_realized = 0.0
         pv_rt_curt_cost_eur = 0.0; imbalance_cost_eur = 0.0; bess_cycle_cost_eur = 0.0
+        bess_throughput_cost_eur = 0.0
         # V4: accumulate transformer slack usage over time (percent-hours) and count solver usage
         rt_opt_slack_pct_hours = 0.0
         rt_opt_used_steps = 0
@@ -2411,6 +2418,18 @@ def main() -> None:
             # Metrics accumulation
             pv_curtail_energy += float(extra_curt_used) * dt_hours
             bess_rt_energy_throughput += float(abs(bess_delta)) * dt_hours
+            # Realized BESS power = DA baseline BESS power + recourse delta (bess_delta)
+            try:
+                if baseline_bess_total_series is not None and t < len(baseline_bess_total_series):
+                    _p_base_bess_tot = float(baseline_bess_total_series[t])
+                elif baseline_bess_p_by_bus:
+                    _p_base_bess_tot = float(sum(float(series[t]) if t < len(series) else 0.0 for series in baseline_bess_p_by_bus.values()))
+                else:
+                    _p_base_bess_tot = 0.0
+            except Exception:
+                _p_base_bess_tot = 0.0
+            _p_bess_realized_total = float(_p_base_bess_tot + bess_delta)
+            bess_rt_energy_throughput_realized += float(abs(_p_bess_realized_total)) * dt_hours
             u_plus_energy += float(u_plus) * dt_hours
             u_minus_energy += float(u_minus) * dt_hours
 
@@ -2419,6 +2438,7 @@ def main() -> None:
             pv_rt_curt_cost_eur += float(extra_curt_used) * PV_CURT_PRICE_FACTOR * p_price * dt_hours
             imbalance_cost_eur += (IMB_UP_FACTOR * float(u_plus) + IMB_DN_FACTOR * float(u_minus)) * p_price * dt_hours
             bess_cycle_cost_eur += float(abs(bess_delta)) * float(BESS_THROUGHPUT_COST_EUR_PER_MWH) * dt_hours
+            bess_throughput_cost_eur += float(abs(_p_bess_realized_total)) * float(BESS_THROUGHPUT_COST_EUR_PER_MWH) * dt_hours
 
             # Build P/Q injections per bus for LDF & capture component-wise powers
             P_inj = {b: 0.0 for b in net.bus.index}
@@ -2710,6 +2730,8 @@ def main() -> None:
         summ['steps_voltage_violation'] = int(steps_voltage_violation)
         summ['pv_curtail_mwh'] = pv_curtail_energy
         summ['bess_rt_energy_throughput_mwh'] = bess_rt_energy_throughput
+        # New: realized (baseline + recourse) BESS throughput in MWh
+        summ['bess_rt_energy_throughput_realized_mwh'] = float(bess_rt_energy_throughput_realized)
         summ['imbalance_mwh'] = float(u_plus_energy + u_minus_energy)
         summ['bess_soc_clip_steps'] = int(bess_soc_clip_steps)
         # V4: total transformer slack usage (percent-hours)
@@ -2741,7 +2763,9 @@ def main() -> None:
         summ['rt_pv_curtail_cost_eur'] = float(pv_rt_curt_cost_eur)
         summ['rt_imbalance_cost_eur'] = float(imbalance_cost_eur)
         summ['rt_bess_cycle_cost_eur'] = float(bess_cycle_cost_eur)
-        summ['total_cost_eur'] = float(da_energy_cost_eur_const + pv_rt_curt_cost_eur + imbalance_cost_eur + bess_cycle_cost_eur)
+        # New: realized BESS throughput cost and updated total (Approach A)
+        summ['rt_bess_throughput_cost_eur'] = float(bess_throughput_cost_eur)
+        summ['total_cost_eur'] = float(da_energy_cost_eur_const + pv_rt_curt_cost_eur + imbalance_cost_eur + bess_throughput_cost_eur)
         summ['sample_id'] = sid
         # Store trajectory length and append (inside loop; previously mis-indented causing only last trajectory retained)
         summ['n_steps'] = int(len(index))
@@ -2848,7 +2872,8 @@ def main() -> None:
                     summ['shadow_bess_throughput_cost_eur'] = shadow_bess_throughput_cost_eur
                     summ['shadow_pv_curtail_cost_eur'] = shadow_pv_curtail_cost_eur
                     summ['shadow_total_proxy_cost_eur'] = shadow_bess_throughput_cost_eur + shadow_pv_curtail_cost_eur
-                    realized_bess_throughput_cost_eur = float(bess_cycle_cost_eur)
+                    # Use realized (baseline + recourse) BESS throughput cost for proxy
+                    realized_bess_throughput_cost_eur = float(bess_throughput_cost_eur)
                     realized_pv_curtail_cost_eur = float(pv_rt_curt_cost_eur)
                     summ['realized_bess_throughput_cost_eur'] = realized_bess_throughput_cost_eur
                     summ['realized_pv_curtail_cost_eur'] = realized_pv_curtail_cost_eur
@@ -3082,11 +3107,14 @@ def main() -> None:
         except Exception as e:
             print(f"[WARN] Failed to produce single trajectory plots: {e}")
 
-    # Export SoC envelope (05/50/95) across trajectories with naming consistent to summary/meta
+    # Export SoC envelope (05/50/95) and raw per-trajectory series across trajectories
     soc_env_path = None
+    soc_series_path = None
     if collect_soc_frac:
         try:
+            # Stack to (n_trajectories, horizon)
             soc_mat = np.vstack(collect_soc_frac)
+            # 1) Envelope percentiles
             soc_p05 = np.percentile(soc_mat, 5, axis=0)
             soc_p50 = np.percentile(soc_mat, 50, axis=0)
             soc_p95 = np.percentile(soc_mat, 95, axis=0)
@@ -3103,14 +3131,45 @@ def main() -> None:
             soc_env_path = os.path.join(OUTDIR, soc_env_filename)
             soc_env_df.to_csv(soc_env_path, index=False)
             print(f"[ok] SoC envelope written: {soc_env_path}")
+
+            # 2) Raw SoC time series (long-form): timestamp, sample_id, soc_frac
+            if EXPORT_SOC_SERIES:
+                try:
+                    # Ensure sample_ids alignment with collect_soc_frac order
+                    horizon = len(index)
+                    time_rep = np.tile(index.to_numpy(), len(sample_ids))
+                    sample_rep = np.repeat(sample_ids, horizon)
+                    soc_flat = soc_mat.reshape(-1)
+                    soc_series_df = pd.DataFrame({
+                        'timestamp': time_rep,
+                        'sample_id': sample_rep,
+                        'soc_frac': soc_flat,
+                    })
+                    if drcc_mode == 'drcc_false':
+                        soc_series_filename = f'soc_series_drcc_false{rt_suffix}.parquet' if SOC_SERIES_WRITE_PARQUET else f'soc_series_drcc_false{rt_suffix}.csv'
+                    else:
+                        base = f"soc_series_{drcc_mode}_epsilon_{token}{rt_suffix}"
+                        soc_series_filename = f"{base}.parquet" if SOC_SERIES_WRITE_PARQUET else f"{base}.csv"
+                    soc_series_path = os.path.join(OUTDIR, soc_series_filename)
+                    if SOC_SERIES_WRITE_PARQUET:
+                        soc_series_df.to_parquet(soc_series_path, index=False)
+                        # Also mirror CSV with same basename for convenience
+                        csv_mirror = soc_series_path.replace('.parquet', '.csv')
+                        soc_series_df.to_csv(csv_mirror, index=False)
+                    else:
+                        soc_series_df.to_csv(soc_series_path, index=False)
+                    print(f"[ok] SoC raw series written: {soc_series_path}")
+                except Exception as e:
+                    print(f"[WARN] Failed to write SoC raw series: {e}")
         except Exception as e:
-            print(f"[WARN] Failed to write SoC envelope: {e}")
+            print(f"[WARN] Failed to write SoC envelope/series: {e}")
 
     meta = {
         'v2_results_csv': os.path.abspath(v2_csv),
         'v2_results_rt_tag': rt_tag,
         'epsilon': EPSILON,
         'drcc_mode': drcc_mode,
+        'v4_costs_schema': 2,
         'rt_tag': rt_tag,
         'samples_dir': os.path.abspath(SAMPLES_DIR),
         'sample_distribution': SAMPLE_DISTRIBUTION,
@@ -3145,6 +3204,8 @@ def main() -> None:
     meta['rt_residual_basis'] = 'mean_centered' if USE_MEAN_CENTERED_POLICY else 'schedule'
     if soc_env_path:
         meta['soc_envelope_file'] = os.path.basename(soc_env_path)
+    if soc_series_path:
+        meta['soc_series_file'] = os.path.basename(soc_series_path)
     # Policy coefficients export (raw)
     policy_coeffs_path = None
     policy_cols = [c for c in [

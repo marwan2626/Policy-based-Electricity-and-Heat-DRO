@@ -3,10 +3,122 @@
 Minimize
  
 Subject To
- bess_net_def_79_21: bess_charge_79[21] - bess_discharge_79[21]
-   + bess_net_power_79[21] = 0
- rob_bess_up_79_21: bess_net_power_79[21]
-   + 4.358898943540673 s_bess_rec_t79 <= 0.05
+ bess_energy_update_75_21: - bess_energy_74[21] - 0.95 bess_charge_75[21]
+   + 1.052631578947368 bess_discharge_75[21] + bess_energy_75[21] = 0
+ bess_energy_update_76_21: - bess_energy_75[21] - 0.95 bess_charge_76[21]
+   + 1.052631578947368 bess_discharge_76[21] + bess_energy_76[21] = 0
+ bess_energy_update_77_21: - bess_energy_76[21] - 0.95 bess_charge_77[21]
+   + 1.052631578947368 bess_discharge_77[21] + bess_energy_77[21] = 0
+ bess_energy_update_78_21: - bess_energy_77[21] - 0.95 bess_charge_78[21]
+   + 1.052631578947368 bess_discharge_78[21] + bess_energy_78[21] = 0
+ bess_energy_update_79_21: - bess_energy_78[21] - 0.95 bess_charge_79[21]
+   + 1.052631578947368 bess_discharge_79[21] + bess_energy_79[21] = 0
+ bess_energy_update_80_21: - bess_energy_79[21] - 0.95 bess_charge_80[21]
+   + 1.052631578947368 bess_discharge_80[21] + bess_energy_80[21] = 0
+ P_accumulated_75_15: - pv_gen_75[1] - pv_gen_75[3] - pv_gen_75[4]
+   - pv_gen_75[5] - pv_gen_75[6] - pv_gen_75[7] - pv_gen_75[8]
+   - pv_gen_75[10] - pv_gen_75[11] - pv_gen_75[12] - pv_gen_75[13]
+   - pv_gen_75[16] - pv_gen_75[17] - pv_gen_75[20] - pv_gen_75[22]
+   - pv_gen_75[23] - pv_gen_75[24] - pv_gen_75[25] - pv_gen_75[26]
+   - pv_gen_75[27] - pv_gen_75[28] - pv_gen_75[30] - pv_gen_75[31]
+   - pv_gen_75[32] - pv_gen_75[33] - pv_gen_75[35] - pv_gen_75[36]
+   - pv_gen_75[37] - pv_gen_75[39] - pv_gen_75[40] - pv_gen_75[41]
+   - pv_gen_75[42] - pv_gen_75[43] + bess_charge_75[21]
+   - bess_discharge_75[21] + flexible_load_P_75[1] + flexible_load_P_75[3]
+   + flexible_load_P_75[4] + flexible_load_P_75[5] + flexible_load_P_75[6]
+   + flexible_load_P_75[7] + flexible_load_P_75[8] + flexible_load_P_75[10]
+   + flexible_load_P_75[11] + flexible_load_P_75[12]
+   + flexible_load_P_75[13] + flexible_load_P_75[16]
+   + flexible_load_P_75[17] + flexible_load_P_75[20]
+   + flexible_load_P_75[22] + flexible_load_P_75[23]
+   + flexible_load_P_75[24] + flexible_load_P_75[25]
+   + flexible_load_P_75[26] + flexible_load_P_75[27]
+   + flexible_load_P_75[28] + flexible_load_P_75[30]
+   + flexible_load_P_75[31] + flexible_load_P_75[32]
+   + flexible_load_P_75[33] + flexible_load_P_75[35]
+   + flexible_load_P_75[36] + flexible_load_P_75[37]
+   + flexible_load_P_75[39] + flexible_load_P_75[40]
+   + flexible_load_P_75[41] + flexible_load_P_75[42]
+   + flexible_load_P_75[43] + p_hp_75[29] + P_accumulated[75,15]
+   = -0.1085981884194371
+ P_accumulated_76_15: - pv_gen_76[1] - pv_gen_76[3] - pv_gen_76[4]
+   - pv_gen_76[5] - pv_gen_76[6] - pv_gen_76[7] - pv_gen_76[8]
+   - pv_gen_76[10] - pv_gen_76[11] - pv_gen_76[12] - pv_gen_76[13]
+   - pv_gen_76[16] - pv_gen_76[17] - pv_gen_76[20] - pv_gen_76[22]
+   - pv_gen_76[23] - pv_gen_76[24] - pv_gen_76[25] - pv_gen_76[26]
+   - pv_gen_76[27] - pv_gen_76[28] - pv_gen_76[30] - pv_gen_76[31]
+   - pv_gen_76[32] - pv_gen_76[33] - pv_gen_76[35] - pv_gen_76[36]
+   - pv_gen_76[37] - pv_gen_76[39] - pv_gen_76[40] - pv_gen_76[41]
+   - pv_gen_76[42] - pv_gen_76[43] + bess_charge_76[21]
+   - bess_discharge_76[21] + flexible_load_P_76[1] + flexible_load_P_76[3]
+   + flexible_load_P_76[4] + flexible_load_P_76[5] + flexible_load_P_76[6]
+   + flexible_load_P_76[7] + flexible_load_P_76[8] + flexible_load_P_76[10]
+   + flexible_load_P_76[11] + flexible_load_P_76[12]
+   + flexible_load_P_76[13] + flexible_load_P_76[16]
+   + flexible_load_P_76[17] + flexible_load_P_76[20]
+   + flexible_load_P_76[22] + flexible_load_P_76[23]
+   + flexible_load_P_76[24] + flexible_load_P_76[25]
+   + flexible_load_P_76[26] + flexible_load_P_76[27]
+   + flexible_load_P_76[28] + flexible_load_P_76[30]
+   + flexible_load_P_76[31] + flexible_load_P_76[32]
+   + flexible_load_P_76[33] + flexible_load_P_76[35]
+   + flexible_load_P_76[36] + flexible_load_P_76[37]
+   + flexible_load_P_76[39] + flexible_load_P_76[40]
+   + flexible_load_P_76[41] + flexible_load_P_76[42]
+   + flexible_load_P_76[43] + p_hp_76[29] + P_accumulated[76,15]
+   = -0.1136015348612547
+ P_accumulated_77_15: - pv_gen_77[1] - pv_gen_77[3] - pv_gen_77[4]
+   - pv_gen_77[5] - pv_gen_77[6] - pv_gen_77[7] - pv_gen_77[8]
+   - pv_gen_77[10] - pv_gen_77[11] - pv_gen_77[12] - pv_gen_77[13]
+   - pv_gen_77[16] - pv_gen_77[17] - pv_gen_77[20] - pv_gen_77[22]
+   - pv_gen_77[23] - pv_gen_77[24] - pv_gen_77[25] - pv_gen_77[26]
+   - pv_gen_77[27] - pv_gen_77[28] - pv_gen_77[30] - pv_gen_77[31]
+   - pv_gen_77[32] - pv_gen_77[33] - pv_gen_77[35] - pv_gen_77[36]
+   - pv_gen_77[37] - pv_gen_77[39] - pv_gen_77[40] - pv_gen_77[41]
+   - pv_gen_77[42] - pv_gen_77[43] + bess_charge_77[21]
+   - bess_discharge_77[21] + flexible_load_P_77[1] + flexible_load_P_77[3]
+   + flexible_load_P_77[4] + flexible_load_P_77[5] + flexible_load_P_77[6]
+   + flexible_load_P_77[7] + flexible_load_P_77[8] + flexible_load_P_77[10]
+   + flexible_load_P_77[11] + flexible_load_P_77[12]
+   + flexible_load_P_77[13] + flexible_load_P_77[16]
+   + flexible_load_P_77[17] + flexible_load_P_77[20]
+   + flexible_load_P_77[22] + flexible_load_P_77[23]
+   + flexible_load_P_77[24] + flexible_load_P_77[25]
+   + flexible_load_P_77[26] + flexible_load_P_77[27]
+   + flexible_load_P_77[28] + flexible_load_P_77[30]
+   + flexible_load_P_77[31] + flexible_load_P_77[32]
+   + flexible_load_P_77[33] + flexible_load_P_77[35]
+   + flexible_load_P_77[36] + flexible_load_P_77[37]
+   + flexible_load_P_77[39] + flexible_load_P_77[40]
+   + flexible_load_P_77[41] + flexible_load_P_77[42]
+   + flexible_load_P_77[43] + p_hp_77[29] + P_accumulated[77,15]
+   = -0.1000524981224116
+ P_accumulated_78_15: - pv_gen_78[1] - pv_gen_78[3] - pv_gen_78[4]
+   - pv_gen_78[5] - pv_gen_78[6] - pv_gen_78[7] - pv_gen_78[8]
+   - pv_gen_78[10] - pv_gen_78[11] - pv_gen_78[12] - pv_gen_78[13]
+   - pv_gen_78[16] - pv_gen_78[17] - pv_gen_78[20] - pv_gen_78[22]
+   - pv_gen_78[23] - pv_gen_78[24] - pv_gen_78[25] - pv_gen_78[26]
+   - pv_gen_78[27] - pv_gen_78[28] - pv_gen_78[30] - pv_gen_78[31]
+   - pv_gen_78[32] - pv_gen_78[33] - pv_gen_78[35] - pv_gen_78[36]
+   - pv_gen_78[37] - pv_gen_78[39] - pv_gen_78[40] - pv_gen_78[41]
+   - pv_gen_78[42] - pv_gen_78[43] + bess_charge_78[21]
+   - bess_discharge_78[21] + flexible_load_P_78[1] + flexible_load_P_78[3]
+   + flexible_load_P_78[4] + flexible_load_P_78[5] + flexible_load_P_78[6]
+   + flexible_load_P_78[7] + flexible_load_P_78[8] + flexible_load_P_78[10]
+   + flexible_load_P_78[11] + flexible_load_P_78[12]
+   + flexible_load_P_78[13] + flexible_load_P_78[16]
+   + flexible_load_P_78[17] + flexible_load_P_78[20]
+   + flexible_load_P_78[22] + flexible_load_P_78[23]
+   + flexible_load_P_78[24] + flexible_load_P_78[25]
+   + flexible_load_P_78[26] + flexible_load_P_78[27]
+   + flexible_load_P_78[28] + flexible_load_P_78[30]
+   + flexible_load_P_78[31] + flexible_load_P_78[32]
+   + flexible_load_P_78[33] + flexible_load_P_78[35]
+   + flexible_load_P_78[36] + flexible_load_P_78[37]
+   + flexible_load_P_78[39] + flexible_load_P_78[40]
+   + flexible_load_P_78[41] + flexible_load_P_78[42]
+   + flexible_load_P_78[43] + p_hp_78[29] + P_accumulated[78,15]
+   = -0.0923491354212926
  P_accumulated_79_15: - pv_gen_79[1] - pv_gen_79[3] - pv_gen_79[4]
    - pv_gen_79[5] - pv_gen_79[6] - pv_gen_79[7] - pv_gen_79[8]
    - pv_gen_79[10] - pv_gen_79[11] - pv_gen_79[12] - pv_gen_79[13]
@@ -32,22 +144,203 @@ Subject To
    + flexible_load_P_79[39] + flexible_load_P_79[40]
    + flexible_load_P_79[41] + flexible_load_P_79[42]
    + flexible_load_P_79[43] + p_hp_79[29] + P_accumulated[79,15]
-   = -0.1108661308316967
- R37732: P_trafo[79,0] - P_accumulated[79,15] = 0
- w_tr_cap_affine_def_t79_tr0: 4.358898943540673 s_trafo_t79_tr0
-   + w_tr_cap_affine_t79_tr0 = 0.4
+   = -0.098547671850397
+ P_accumulated_80_15: - pv_gen_80[1] - pv_gen_80[3] - pv_gen_80[4]
+   - pv_gen_80[5] - pv_gen_80[6] - pv_gen_80[7] - pv_gen_80[8]
+   - pv_gen_80[10] - pv_gen_80[11] - pv_gen_80[12] - pv_gen_80[13]
+   - pv_gen_80[16] - pv_gen_80[17] - pv_gen_80[20] - pv_gen_80[22]
+   - pv_gen_80[23] - pv_gen_80[24] - pv_gen_80[25] - pv_gen_80[26]
+   - pv_gen_80[27] - pv_gen_80[28] - pv_gen_80[30] - pv_gen_80[31]
+   - pv_gen_80[32] - pv_gen_80[33] - pv_gen_80[35] - pv_gen_80[36]
+   - pv_gen_80[37] - pv_gen_80[39] - pv_gen_80[40] - pv_gen_80[41]
+   - pv_gen_80[42] - pv_gen_80[43] + bess_charge_80[21]
+   - bess_discharge_80[21] + flexible_load_P_80[1] + flexible_load_P_80[3]
+   + flexible_load_P_80[4] + flexible_load_P_80[5] + flexible_load_P_80[6]
+   + flexible_load_P_80[7] + flexible_load_P_80[8] + flexible_load_P_80[10]
+   + flexible_load_P_80[11] + flexible_load_P_80[12]
+   + flexible_load_P_80[13] + flexible_load_P_80[16]
+   + flexible_load_P_80[17] + flexible_load_P_80[20]
+   + flexible_load_P_80[22] + flexible_load_P_80[23]
+   + flexible_load_P_80[24] + flexible_load_P_80[25]
+   + flexible_load_P_80[26] + flexible_load_P_80[27]
+   + flexible_load_P_80[28] + flexible_load_P_80[30]
+   + flexible_load_P_80[31] + flexible_load_P_80[32]
+   + flexible_load_P_80[33] + flexible_load_P_80[35]
+   + flexible_load_P_80[36] + flexible_load_P_80[37]
+   + flexible_load_P_80[39] + flexible_load_P_80[40]
+   + flexible_load_P_80[41] + flexible_load_P_80[42]
+   + flexible_load_P_80[43] + p_hp_80[29] + P_accumulated[80,15]
+   = -0.0687846812123966
+ R41533: P_trafo[75,0] - P_accumulated[75,15] = 0
+ R41621: P_trafo[76,0] - P_accumulated[76,15] = 0
+ R41709: P_trafo[77,0] - P_accumulated[77,15] = 0
+ R41797: P_trafo[78,0] - P_accumulated[78,15] = 0
+ R41885: P_trafo[79,0] - P_accumulated[79,15] = 0
+ R41973: P_trafo[80,0] - P_accumulated[80,15] = 0
+ predicted_p_hp_t75_bus29: p_hp_75[29] = 0.2608219887859713
+ predicted_p_hp_t76_bus29: p_hp_76[29] = 0.2403353295935706
+ predicted_p_hp_t77_bus29: p_hp_77[29] = 0.2688393914196845
+ predicted_p_hp_t78_bus29: p_hp_78[29] = 0.2443127531581813
  predicted_p_hp_t79_bus29: p_hp_79[29] = 0.2875404367310165
- soc_bess_recourse_t79: [ 1.8232054375557125e-04 K_hp_bess_79 ^2
-   - s_bess_rec_t79 ^2 ] <= 0
- soc_sigma_trafo_t79_tr0: - 0.000364641 K_hp_bess_79
-   + 0.000364641 K_hp_pvcurt_79 + [ 1.8232054375557125e-04 K_hp_bess_79 ^2
-   - 0.000364641 K_hp_bess_79 * K_hp_pvcurt_79
-   + 1.8232054375557095e-04 K_hp_pvcurt_79 ^2 - s_trafo_t79_tr0 ^2 ]
-   <= -1.8602238930269489e-04
- S_trafo_affine_limit_79_0: [ P_trafo[79,0] ^2 + Q_trafo[79,0] ^2
-   - w_tr_cap_affine_t79_tr0 ^2 ] <= 0
+ predicted_p_hp_t80_bus29: p_hp_80[29] = 0.3
+ S_trafo_limit_75_0: [ P_trafo[75,0] ^2 + Q_trafo[75,0] ^2 ]
+   <= 0.1167990432238162
+ S_trafo_limit_76_0: [ P_trafo[76,0] ^2 + Q_trafo[76,0] ^2 ]
+   <= 0.1167314885894337
+ S_trafo_limit_77_0: [ P_trafo[77,0] ^2 + Q_trafo[77,0] ^2 ]
+   <= 0.1164738907097377
+ S_trafo_limit_78_0: [ P_trafo[78,0] ^2 + Q_trafo[78,0] ^2 ]
+   <= 0.1161340095133563
+ S_trafo_limit_79_0: [ P_trafo[79,0] ^2 + Q_trafo[79,0] ^2 ]
+   <= 0.1158876560442687
+ S_trafo_limit_80_0: [ P_trafo[80,0] ^2 + Q_trafo[80,0] ^2 ]
+   <= 0.1159960573414071
 Bounds
- K_hp_bess_79 free
+ -infinity <= bess_energy_74[21] <= 0.125
+ -infinity <= pv_gen_75[1] <= 0
+ -infinity <= pv_gen_75[3] <= 0
+ -infinity <= pv_gen_75[4] <= 0
+ -infinity <= pv_gen_75[5] <= 0
+ -infinity <= pv_gen_75[6] <= 0
+ -infinity <= pv_gen_75[7] <= 0
+ -infinity <= pv_gen_75[8] <= 0
+ -infinity <= pv_gen_75[10] <= 0
+ -infinity <= pv_gen_75[11] <= 0
+ -infinity <= pv_gen_75[12] <= 0
+ -infinity <= pv_gen_75[13] <= 0
+ -infinity <= pv_gen_75[16] <= 0
+ -infinity <= pv_gen_75[17] <= 0
+ -infinity <= pv_gen_75[20] <= 0
+ -infinity <= pv_gen_75[22] <= 0
+ -infinity <= pv_gen_75[23] <= 0
+ -infinity <= pv_gen_75[24] <= 0
+ -infinity <= pv_gen_75[25] <= 0
+ -infinity <= pv_gen_75[26] <= 0
+ -infinity <= pv_gen_75[27] <= 0
+ -infinity <= pv_gen_75[28] <= 0
+ -infinity <= pv_gen_75[30] <= 0
+ -infinity <= pv_gen_75[31] <= 0
+ -infinity <= pv_gen_75[32] <= 0
+ -infinity <= pv_gen_75[33] <= 0
+ -infinity <= pv_gen_75[35] <= 0
+ -infinity <= pv_gen_75[36] <= 0
+ -infinity <= pv_gen_75[37] <= 0
+ -infinity <= pv_gen_75[39] <= 0
+ -infinity <= pv_gen_75[40] <= 0
+ -infinity <= pv_gen_75[41] <= 0
+ -infinity <= pv_gen_75[42] <= 0
+ -infinity <= pv_gen_75[43] <= 0
+ bess_discharge_75[21] free
+ bess_energy_75[21] free
+ p_hp_75[29] free
+ -infinity <= pv_gen_76[1] <= 0
+ -infinity <= pv_gen_76[3] <= 0
+ -infinity <= pv_gen_76[4] <= 0
+ -infinity <= pv_gen_76[5] <= 0
+ -infinity <= pv_gen_76[6] <= 0
+ -infinity <= pv_gen_76[7] <= 0
+ -infinity <= pv_gen_76[8] <= 0
+ -infinity <= pv_gen_76[10] <= 0
+ -infinity <= pv_gen_76[11] <= 0
+ -infinity <= pv_gen_76[12] <= 0
+ -infinity <= pv_gen_76[13] <= 0
+ -infinity <= pv_gen_76[16] <= 0
+ -infinity <= pv_gen_76[17] <= 0
+ -infinity <= pv_gen_76[20] <= 0
+ -infinity <= pv_gen_76[22] <= 0
+ -infinity <= pv_gen_76[23] <= 0
+ -infinity <= pv_gen_76[24] <= 0
+ -infinity <= pv_gen_76[25] <= 0
+ -infinity <= pv_gen_76[26] <= 0
+ -infinity <= pv_gen_76[27] <= 0
+ -infinity <= pv_gen_76[28] <= 0
+ -infinity <= pv_gen_76[30] <= 0
+ -infinity <= pv_gen_76[31] <= 0
+ -infinity <= pv_gen_76[32] <= 0
+ -infinity <= pv_gen_76[33] <= 0
+ -infinity <= pv_gen_76[35] <= 0
+ -infinity <= pv_gen_76[36] <= 0
+ -infinity <= pv_gen_76[37] <= 0
+ -infinity <= pv_gen_76[39] <= 0
+ -infinity <= pv_gen_76[40] <= 0
+ -infinity <= pv_gen_76[41] <= 0
+ -infinity <= pv_gen_76[42] <= 0
+ -infinity <= pv_gen_76[43] <= 0
+ bess_charge_76[21] free
+ bess_energy_76[21] free
+ p_hp_76[29] free
+ -infinity <= pv_gen_77[1] <= 0
+ -infinity <= pv_gen_77[3] <= 0
+ -infinity <= pv_gen_77[4] <= 0
+ -infinity <= pv_gen_77[5] <= 0
+ -infinity <= pv_gen_77[6] <= 0
+ -infinity <= pv_gen_77[7] <= 0
+ -infinity <= pv_gen_77[8] <= 0
+ -infinity <= pv_gen_77[10] <= 0
+ -infinity <= pv_gen_77[11] <= 0
+ -infinity <= pv_gen_77[12] <= 0
+ -infinity <= pv_gen_77[13] <= 0
+ -infinity <= pv_gen_77[16] <= 0
+ -infinity <= pv_gen_77[17] <= 0
+ -infinity <= pv_gen_77[20] <= 0
+ -infinity <= pv_gen_77[22] <= 0
+ -infinity <= pv_gen_77[23] <= 0
+ -infinity <= pv_gen_77[24] <= 0
+ -infinity <= pv_gen_77[25] <= 0
+ -infinity <= pv_gen_77[26] <= 0
+ -infinity <= pv_gen_77[27] <= 0
+ -infinity <= pv_gen_77[28] <= 0
+ -infinity <= pv_gen_77[30] <= 0
+ -infinity <= pv_gen_77[31] <= 0
+ -infinity <= pv_gen_77[32] <= 0
+ -infinity <= pv_gen_77[33] <= 0
+ -infinity <= pv_gen_77[35] <= 0
+ -infinity <= pv_gen_77[36] <= 0
+ -infinity <= pv_gen_77[37] <= 0
+ -infinity <= pv_gen_77[39] <= 0
+ -infinity <= pv_gen_77[40] <= 0
+ -infinity <= pv_gen_77[41] <= 0
+ -infinity <= pv_gen_77[42] <= 0
+ -infinity <= pv_gen_77[43] <= 0
+ bess_discharge_77[21] free
+ bess_energy_77[21] free
+ p_hp_77[29] free
+ -infinity <= pv_gen_78[1] <= 0
+ -infinity <= pv_gen_78[3] <= 0
+ -infinity <= pv_gen_78[4] <= 0
+ -infinity <= pv_gen_78[5] <= 0
+ -infinity <= pv_gen_78[6] <= 0
+ -infinity <= pv_gen_78[7] <= 0
+ -infinity <= pv_gen_78[8] <= 0
+ -infinity <= pv_gen_78[10] <= 0
+ -infinity <= pv_gen_78[11] <= 0
+ -infinity <= pv_gen_78[12] <= 0
+ -infinity <= pv_gen_78[13] <= 0
+ -infinity <= pv_gen_78[16] <= 0
+ -infinity <= pv_gen_78[17] <= 0
+ -infinity <= pv_gen_78[20] <= 0
+ -infinity <= pv_gen_78[22] <= 0
+ -infinity <= pv_gen_78[23] <= 0
+ -infinity <= pv_gen_78[24] <= 0
+ -infinity <= pv_gen_78[25] <= 0
+ -infinity <= pv_gen_78[26] <= 0
+ -infinity <= pv_gen_78[27] <= 0
+ -infinity <= pv_gen_78[28] <= 0
+ -infinity <= pv_gen_78[30] <= 0
+ -infinity <= pv_gen_78[31] <= 0
+ -infinity <= pv_gen_78[32] <= 0
+ -infinity <= pv_gen_78[33] <= 0
+ -infinity <= pv_gen_78[35] <= 0
+ -infinity <= pv_gen_78[36] <= 0
+ -infinity <= pv_gen_78[37] <= 0
+ -infinity <= pv_gen_78[39] <= 0
+ -infinity <= pv_gen_78[40] <= 0
+ -infinity <= pv_gen_78[41] <= 0
+ -infinity <= pv_gen_78[42] <= 0
+ -infinity <= pv_gen_78[43] <= 0
+ bess_discharge_78[21] free
+ bess_energy_78[21] free
+ p_hp_78[29] free
  -infinity <= pv_gen_79[1] <= 0
  -infinity <= pv_gen_79[3] <= 0
  -infinity <= pv_gen_79[4] <= 0
@@ -82,10 +375,59 @@ Bounds
  -infinity <= pv_gen_79[42] <= 0
  -infinity <= pv_gen_79[43] <= 0
  bess_charge_79[21] free
- bess_discharge_79[21] free
- bess_net_power_79[21] free
+ bess_energy_79[21] free
  p_hp_79[29] free
+ -infinity <= pv_gen_80[1] <= 0
+ -infinity <= pv_gen_80[3] <= 0
+ -infinity <= pv_gen_80[4] <= 0
+ -infinity <= pv_gen_80[5] <= 0
+ -infinity <= pv_gen_80[6] <= 0
+ -infinity <= pv_gen_80[7] <= 0
+ -infinity <= pv_gen_80[8] <= 0
+ -infinity <= pv_gen_80[10] <= 0
+ -infinity <= pv_gen_80[11] <= 0
+ -infinity <= pv_gen_80[12] <= 0
+ -infinity <= pv_gen_80[13] <= 0
+ -infinity <= pv_gen_80[16] <= 0
+ -infinity <= pv_gen_80[17] <= 0
+ -infinity <= pv_gen_80[20] <= 0
+ -infinity <= pv_gen_80[22] <= 0
+ -infinity <= pv_gen_80[23] <= 0
+ -infinity <= pv_gen_80[24] <= 0
+ -infinity <= pv_gen_80[25] <= 0
+ -infinity <= pv_gen_80[26] <= 0
+ -infinity <= pv_gen_80[27] <= 0
+ -infinity <= pv_gen_80[28] <= 0
+ -infinity <= pv_gen_80[30] <= 0
+ -infinity <= pv_gen_80[31] <= 0
+ -infinity <= pv_gen_80[32] <= 0
+ -infinity <= pv_gen_80[33] <= 0
+ -infinity <= pv_gen_80[35] <= 0
+ -infinity <= pv_gen_80[36] <= 0
+ -infinity <= pv_gen_80[37] <= 0
+ -infinity <= pv_gen_80[39] <= 0
+ -infinity <= pv_gen_80[40] <= 0
+ -infinity <= pv_gen_80[41] <= 0
+ -infinity <= pv_gen_80[42] <= 0
+ -infinity <= pv_gen_80[43] <= 0
+ bess_charge_80[21] free
+ p_hp_80[29] free
+ P_trafo[75,0] free
+ P_trafo[76,0] free
+ P_trafo[77,0] free
+ P_trafo[78,0] free
  P_trafo[79,0] free
+ P_trafo[80,0] free
+ Q_trafo[75,0] free
+ Q_trafo[76,0] free
+ Q_trafo[77,0] free
+ Q_trafo[78,0] free
  Q_trafo[79,0] free
+ Q_trafo[80,0] free
+ P_accumulated[75,15] free
+ P_accumulated[76,15] free
+ P_accumulated[77,15] free
+ P_accumulated[78,15] free
  P_accumulated[79,15] free
+ P_accumulated[80,15] free
 End
