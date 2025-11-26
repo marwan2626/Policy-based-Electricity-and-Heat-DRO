@@ -46,8 +46,20 @@ try:
 except Exception:
     export_ts_ref = None
 
+# --------------------- Paper Size Toggle ---------------------
+# Set USE_A4 = True to switch to A4 sizing (13.0 cm width, font size 12).
+# When False (A5 mode), defaults remain width 10.89 cm and font size 8.
+USE_A4 = True  # Toggle this flag
+
+# Derived sizing constants based on paper size mode
+if USE_A4:
+    DEFAULT_WIDTH_CM = 13.0
+    DEFAULT_FONT_SIZE = 10
+else:
+    DEFAULT_WIDTH_CM = 10.89
+    DEFAULT_FONT_SIZE = 8
+
 # --------------------- Constants ---------------------
-DEFAULT_WIDTH_CM = 10.89
 DEFAULT_ASPECT = 0.5
 # Per-plot default height ratios (aspect = height/width). Adjust here to tune each plot individually.
 DEFAULT_ASPECT_TS = DEFAULT_ASPECT
@@ -184,7 +196,7 @@ def _configure_pgf(
             "axes.formatter.use_mathtext": False,
             "text.latex.preamble": preamble,
             "pgf.preamble": preamble,
-            "font.size": 8,
+            "font.size": DEFAULT_FONT_SIZE,
         }
     )
 
@@ -639,7 +651,7 @@ def export_hotwater_heating_profiles_pgf(
                 pass
         else:
             hot_ax.text(0.5, 0.5, 'No hotwater columns', ha='center', va='center', transform=hot_ax.transAxes, fontsize=8, color='gray')
-        hot_ax.set_ylabel('Hot Water Demand (kW)')
+        hot_ax.set_ylabel('DHW Demand (kW)')
         hot_ax.grid(alpha=0.3)
         _force_plain_ticks(hot_ax, which="y")
         # Bottom: heating

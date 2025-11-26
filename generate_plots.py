@@ -56,6 +56,22 @@ RATED_TRAFO_MVA = 0.5
 STEP_HOURS = 0.25  # 15-minute steps
 
 
+def _save_png_and_pdf(fig: plt.Figure, out_path: str, dpi_png: int = 150) -> str:
+    """Save a figure to PNG at `out_path` and alongside as PDF.
+
+    Returns the PDF path.
+    """
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    fig.savefig(out_path, dpi=dpi_png)
+    base, _ = os.path.splitext(out_path)
+    pdf_path = base + '.pdf'
+    try:
+        fig.savefig(pdf_path)
+    except Exception:
+        fig.savefig(pdf_path, dpi=dpi_png)
+    return pdf_path
+
+
 def load_summary(src_dir: str) -> pd.DataFrame:
     path = os.path.join(src_dir, DEFAULT_SUMMARY_NAME)
     if not os.path.exists(path):
@@ -150,7 +166,8 @@ def plot_violin_rt_on_vs_off(src_dir: str, out_path: str) -> str:
 
     # Prepare figure
     # Use same height as other plots but half the previous width (4.0 x 4.2)
-    fig, ax = plt.subplots(figsize=(4.0, 4.2))
+    # 3:4 aspect (taller than wide) with fixed height 4.2in -> width 3.15in
+    fig, ax = plt.subplots(figsize=(3.15, 4.2))
     x0 = 1.0
     if vals_on.size == 0 and vals_off.size == 0:
         ax.text(0.5, 0.5, 'No ε=0.10 RT data', ha='center', va='center', transform=ax.transAxes,
@@ -208,9 +225,8 @@ def plot_violin_rt_on_vs_off(src_dir: str, out_path: str) -> str:
     ax.tick_params(axis='y', labelsize=14)
     ax.grid(axis='y', alpha=0.3)
     fig.tight_layout()
-    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-    fig.savefig(out_path, dpi=150)
-    print(f"✓ Violin RT ON vs OFF saved: {out_path}")
+    pdf_path = _save_png_and_pdf(fig, out_path)
+    print(f"✓ Violin RT ON vs OFF saved: {out_path} (PNG) and {pdf_path} (PDF)")
     return out_path
 
 
@@ -290,7 +306,8 @@ def plot_overload_energy_rt_on_vs_off(src_dir: str, out_path: str) -> str:
             pass
 
     # Prepare figure with same size as violin plot
-    fig, ax = plt.subplots(figsize=(4.0, 4.2))
+    # 3:4 aspect (taller than wide) with fixed height 4.2in -> width 3.15in
+    fig, ax = plt.subplots(figsize=(3.15, 4.2))
     labels = []
     values = []
     colors = []
@@ -310,9 +327,8 @@ def plot_overload_energy_rt_on_vs_off(src_dir: str, out_path: str) -> str:
         ax.text(0.5, 0.5, 'No ε=0.10 RT data', ha='center', va='center', transform=ax.transAxes,
                 fontsize=9, color='gray')
         fig.tight_layout()
-        os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-        fig.savefig(out_path, dpi=150)
-        print(f"✓ Overload energy RT ON vs OFF saved (empty): {out_path}")
+        pdf_path = _save_png_and_pdf(fig, out_path)
+        print(f"✓ Overload energy RT ON vs OFF saved (empty): {out_path} (PNG) and {pdf_path} (PDF)")
         return out_path
 
     x = np.arange(len(labels))
@@ -341,10 +357,9 @@ def plot_overload_energy_rt_on_vs_off(src_dir: str, out_path: str) -> str:
         pass
 
     fig.tight_layout()
-    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-    fig.savefig(out_path, dpi=150)
+    pdf_path = _save_png_and_pdf(fig, out_path)
     plt.close(fig)
-    print(f"✓ Overload energy RT ON vs OFF saved: {out_path}")
+    print(f"✓ Overload energy RT ON vs OFF saved: {out_path} (PNG) and {pdf_path} (PDF)")
     return out_path
 
 
@@ -454,20 +469,18 @@ def plot_max_trafo_loading_vs_epsilon_v2(out_path: str, search_dir: str | None =
         ax.legend(fontsize=10, loc='best')
 
         fig.tight_layout()
-        os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-        fig.savefig(out_path, dpi=150)
+        pdf_path = _save_png_and_pdf(fig, out_path)
         plt.close(fig)
-        print(f"✓ Max transformer loading vs ε (v2) saved: {out_path}")
+        print(f"✓ Max transformer loading vs ε (v2) saved: {out_path} (PNG) and {pdf_path} (PDF)")
         return out_path
     except Exception as e:
         # In case of any unexpected error, still create an empty placeholder figure
         fig, ax = plt.subplots(figsize=(6.3, 4.2))
         ax.text(0.5, 0.5, f'Plot failed: {e}', ha='center', va='center', transform=ax.transAxes, fontsize=9, color='gray')
         fig.tight_layout()
-        os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-        fig.savefig(out_path, dpi=150)
+        pdf_path = _save_png_and_pdf(fig, out_path)
         plt.close(fig)
-        print(f"[WARN] Max transformer loading vs ε (v2) failed, saved placeholder: {out_path}")
+        print(f"[WARN] Max transformer loading vs ε (v2) failed, saved placeholder: {out_path} (PNG) and {pdf_path} (PDF)")
         return out_path
 
 
@@ -551,8 +564,8 @@ def plot_da_total_cost_vs_epsilon_v2(out_path: str, search_dir: str | None = Non
         if xticks:
             ax.set_xticks(xticks)
             ax.set_xticklabels([f"{x:.2f}" for x in xticks], fontsize=12)
-        ax.set_xlabel('ε', fontsize=14)
-        ax.set_ylabel('DA Cost (EUR)', fontsize=16)
+        ax.set_xlabel(r'Allowed Violation Probability ($\varepsilon$)', fontsize=14)
+        ax.set_ylabel('Day-ahead Cost (EUR)', fontsize=16)
         ax.tick_params(axis='y', labelsize=14)
         ax.grid(axis='y', alpha=0.3)
         try:
@@ -562,19 +575,17 @@ def plot_da_total_cost_vs_epsilon_v2(out_path: str, search_dir: str | None = Non
         ax.legend(fontsize=10, loc='best')
 
         fig.tight_layout()
-        os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-        fig.savefig(out_path, dpi=150)
+        pdf_path = _save_png_and_pdf(fig, out_path)
         plt.close(fig)
-        print(f"✓ DA total cost vs ε (v2) saved: {out_path}")
+        print(f"✓ DA total cost vs ε (v2) saved: {out_path} (PNG) and {pdf_path} (PDF)")
         return out_path
     except Exception as e:
         fig, ax = plt.subplots(figsize=(6.3, 4.2))
         ax.text(0.5, 0.5, f'Plot failed: {e}', ha='center', va='center', transform=ax.transAxes, fontsize=9, color='gray')
         fig.tight_layout()
-        os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-        fig.savefig(out_path, dpi=150)
+        pdf_path = _save_png_and_pdf(fig, out_path)
         plt.close(fig)
-        print(f"[WARN] DA total cost vs ε (v2) failed, saved placeholder: {out_path}")
+        print(f"[WARN] DA total cost vs ε (v2) failed, saved placeholder: {out_path} (PNG) and {pdf_path} (PDF)")
         return out_path
 
 
@@ -632,10 +643,10 @@ def plot_thermal_storage_operation_area(results_csv: str, out_path: str) -> str:
                 price = vals[:ts.size]
                 break
 
-    # Colors (standard matplotlib named colors)
-    gas_green = 'green'
-    heat_red = 'red'
-    electric_blue = 'blue'
+    # Colors
+    gas_green = '#2ca02c'
+    heat_red = '#d62728'
+    electric_blue = '#08519c'
 
     # Match line plots: 3:2 aspect, fixed height 4.2 in
     fig, ax = plt.subplots(figsize=(6.3, 4.2))
@@ -650,21 +661,36 @@ def plot_thermal_storage_operation_area(results_csv: str, out_path: str) -> str:
     ax.set_xlim(0, x[-1])
     ax.margins(x=0)
     ax.grid(True, axis='y', color='lightgray', alpha=0.6, linewidth=0.6)
+    # Fixed left axis ticks and padding as requested
+    left_ticks = np.array([-200, -100, 0, 100, 200], dtype=float)
+    left_min = left_ticks[0]
+    left_max = left_ticks[-1]
+    left_range = left_max - left_min
+    left_pad = 0.10 * left_range  # 10% padding
+    ax.set_ylim(left_min - left_pad, left_max + left_pad)
+    ax.set_yticks(left_ticks)
 
     ax2 = ax.twinx()
     ax2.patch.set_alpha(0.0)
     if price is not None:
+        # Plot price and enforce fixed right axis ticks with same relative padding (5%).
         ax2.plot(x, price, color=electric_blue, linewidth=1.4, zorder=4)
+        right_ticks = np.array([85, 100, 115, 130, 145], dtype=float)
+        r_min = right_ticks[0]
+        r_max = right_ticks[-1]
+        r_range = r_max - r_min
+        r_pad = 0.10 * r_range  # 10% padding
+        ax2.set_ylim(r_min - r_pad, r_max + r_pad)
+        ax2.set_yticks(right_ticks)
+        try:
+            from matplotlib.ticker import FormatStrFormatter
+            ax2.yaxis.set_major_formatter(FormatStrFormatter('%.0f'))
+        except Exception:
+            pass
     ax2.set_ylabel('Electricity price (EUR/MWh)', color=electric_blue, fontsize=16)
     ax2.tick_params(axis='y', colors=electric_blue, labelsize=14)
     try:
         ax2.spines['right'].set_color(electric_blue)
-    except Exception:
-        pass
-    # Match tick count roughly
-    try:
-        from matplotlib.ticker import MaxNLocator
-        ax2.yaxis.set_major_locator(MaxNLocator(nbins=len(ax.get_yticks())))
     except Exception:
         pass
     ax2.grid(False)
@@ -677,10 +703,9 @@ def plot_thermal_storage_operation_area(results_csv: str, out_path: str) -> str:
         pass
 
     fig.tight_layout()
-    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-    fig.savefig(out_path, dpi=150)
+    pdf_path = _save_png_and_pdf(fig, out_path)
     plt.close(fig)
-    print(f"✓ Thermal storage plot saved: {out_path}")
+    print(f"✓ Thermal storage plot saved: {out_path} (PNG) and {pdf_path} (PDF)")
     return out_path
 
 
@@ -755,30 +780,43 @@ def plot_all_in_total_cost(df: pd.DataFrame, out_path: str) -> str:
     # No title to mirror oos-analysis (title commented out there)
     ax.grid(axis='y', alpha=0.3)
 
-    # Annotate % difference vs deterministic on DRCC bars when available
+    # Annotate % difference vs Multi-Energy Co-optimization; fallback to deterministic if needed
     try:
-        # Find deterministic bar in the current (sorted) labels
-        det_idx = None
+        base_idx = None
+        base_label = None
+        # Prefer Multi-Energy Co-optimization as the baseline
         for i, lab in enumerate(labels):
-            if isinstance(lab, str) and lab.lower() == 'deterministic':
-                det_idx = i
+            if isinstance(lab, str) and lab == INJECT_LABEL:
+                base_idx = i
+                base_label = INJECT_LABEL
                 break
-        if det_idx is not None:
-            det_val = float(c_allin[det_idx]) if np.isfinite(c_allin[det_idx]) else np.nan
-            if np.isfinite(det_val) and det_val != 0.0:
+        # Fallback baseline: deterministic
+        if base_idx is None:
+            for i, lab in enumerate(labels):
+                if isinstance(lab, str) and lab.lower() == 'deterministic':
+                    base_idx = i
+                    base_label = 'deterministic'
+                    break
+
+        if base_idx is not None:
+            base_val = float(c_allin[base_idx]) if np.isfinite(c_allin[base_idx]) else np.nan
+            if np.isfinite(base_val) and base_val != 0.0:
                 for rect, val, lab in zip(bars, c_allin, labels):
-                    if isinstance(lab, str) and lab.lower() == 'deterministic':
-                        continue
                     if not np.isfinite(val):
                         continue
-                    pct = (val - det_val) / det_val * 100.0
+                    if isinstance(lab, str) and lab == base_label:
+                        # Skip annotating the baseline bar itself
+                        continue
+                    pct = (val - base_val) / base_val * 100.0
                     sgn = '+' if pct >= 0 else ''
                     txt = f"{sgn}{pct:.1f}%"
                     y = rect.get_height()
-                    ann = ax.text(rect.get_x() + rect.get_width()/2.0,
-                                   y + max(0.01*y, 0.5),
-                                   txt,
-                                   ha='center', va='bottom', fontsize=8, color='black')
+                    ann = ax.text(
+                        rect.get_x() + rect.get_width()/2.0,
+                        y + max(0.01*y, 0.5),
+                        txt,
+                        ha='center', va='bottom', fontsize=8, color='black'
+                    )
                     try:
                         ann.set_path_effects([patheffects.withStroke(linewidth=2.0, foreground='white')])
                     except Exception:
@@ -787,9 +825,8 @@ def plot_all_in_total_cost(df: pd.DataFrame, out_path: str) -> str:
         pass
 
     fig.tight_layout()
-    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-    fig.savefig(out_path, dpi=150)
-    print(f"✓ Total cost plot saved: {out_path}")
+    pdf_path = _save_png_and_pdf(fig, out_path)
+    print(f"✓ Total cost plot saved: {out_path} (PNG) and {pdf_path} (PDF)")
     return out_path
 
 
@@ -864,9 +901,8 @@ def plot_trafo_violation_probability(df: pd.DataFrame, out_path: str) -> str:
     ax.grid(axis='y', alpha=0.3)
 
     fig.tight_layout()
-    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-    fig.savefig(out_path, dpi=150)
-    print(f"✓ Transformer violation probability plot saved: {out_path}")
+    pdf_path = _save_png_and_pdf(fig, out_path)
+    print(f"✓ Transformer violation probability plot saved: {out_path} (PNG) and {pdf_path} (PDF)")
     return out_path
 
 
@@ -992,9 +1028,8 @@ def plot_final_bess_soc_median(df: pd.DataFrame, out_path: str, src_dir: str) ->
     ax.axhline(0.5, color='black', linestyle='--', linewidth=1.0, alpha=0.9)
 
     fig.tight_layout()
-    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-    fig.savefig(out_path, dpi=150)
-    print(f"✓ Final battery SOC median plot saved: {out_path}")
+    pdf_path = _save_png_and_pdf(fig, out_path)
+    print(f"✓ Final battery SOC median plot saved: {out_path} (PNG) and {pdf_path} (PDF)")
     return out_path
 
 
@@ -1060,7 +1095,7 @@ def main() -> None:
     try:
         plot_max_trafo_loading_vs_epsilon_v2(max_trafo_out)
     except Exception as e:
-        print(f"[WARN] Max transformer loading vs ε (v2) plot skipped: {e}")
+        print(f"[WARN] Max. transformer loading vs ε (v2) plot skipped: {e}")
 
     # DA total cost vs epsilon (v2 results): two-line plot
     da_cost_out = os.path.join(out_dir if 'out_dir' in locals() else (args.export_dir or DEFAULT_EXPORT_DIR), DA_COST_EPSILON_OUT_NAME)
