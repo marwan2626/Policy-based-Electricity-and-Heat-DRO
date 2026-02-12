@@ -25,18 +25,19 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import matplotlib.patheffects as patheffects
+import matplotlib.colors as mcolors
 
 DEFAULT_SRC_DIR = "v4_oos_agg_gaussian_studentt"
 DEFAULT_SUMMARY_NAME = "oos_overview_summary.csv"
-DEFAULT_OUT_NAME = "fig_RT-costs.png"
-DEFAULT_EXPORT_DIR = "export figures"
-VIOLIN_OUT_NAME = "fig_violin.png"
-THERMAL_STORAGE_OUT_NAME = "fig_thermal_storage_operation_area.png"
-TRAFO_VIOLATION_OUT_NAME = "fig_Trafo-constraint.png"
-FINAL_SOC_OUT_NAME = "fig_soc-final.png"
-OVERLOAD_RT_ON_OFF_OUT_NAME = "fig_overload_energy.png"
-MAX_TRAFO_EPSILON_OUT_NAME = "fig_trafo_loading_vs_epsilon.png"
-DA_COST_EPSILON_OUT_NAME = "fig_total_cost_vs_epsilon.png"
+DEFAULT_OUT_NAME = "fig_RT-costs.pgf"
+DEFAULT_EXPORT_DIR = "export pgf"
+VIOLIN_OUT_NAME = "fig_violin.pgf"
+THERMAL_STORAGE_OUT_NAME = "fig_thermal_storage_operation_area.pgf"
+TRAFO_VIOLATION_OUT_NAME = "fig_Trafo-constraint.pgf"
+FINAL_SOC_OUT_NAME = "fig_soc-final.pgf"
+OVERLOAD_RT_ON_OFF_OUT_NAME = "fig_overload_energy.pgf"
+MAX_TRAFO_EPSILON_OUT_NAME = "fig_trafo_loading_vs_epsilon.pgf"
+DA_COST_EPSILON_OUT_NAME = "fig_total_cost_vs_epsilon.pgf"
 
 # Specific injection for transformer violation probability plot (match cost plot naming)
 TRAFO_INJECT_LABEL = "Multi-Energy\nCo-optimization"  # matches INJECT_LABEL defined below
@@ -48,8 +49,115 @@ INJECT_LABEL = "Multi-Energy\nCo-optimization"
 INJECT_COST = 684.3104378123563
 
 # Match global style
-mpl.rcParams['font.family'] = 'Times New Roman'
-mpl.rcParams['font.size'] = mpl.rcParams.get('font.size', 10) + 2
+USE_A4 = True  # Toggle like export_select_pgf_plots
+DEFAULT_WIDTH_CM = 13.0 if USE_A4 else 10.89
+DEFAULT_FONT_SIZE = 11 if USE_A4 else 8
+
+# Derived sizing constants based on paper size mode
+# Figure width and font size are controlled solely by USE_A4
+SOC_ASPECT = 0.774  # height = width * aspect (match fig_soc-final/fig_Trafo-constraint)
+LINE_ASPECT = 0.6667  # height = width * aspect (2:3) for line plots
+BAR_ASPECT = 0.5  # height = width * aspect (1:2) for summary bar plot
+
+# Shared color palette aligned with export_select_pgf_plots
+ELECTRIC_BLUE = '#3445a0'
+LIGHT_BLUE_FILL = '#9ecae1'
+GAS_GREEN = '#3a9d6c'
+GAS_GREEN_FILL = '#b2df8a'
+HEAT_RED = '#d82e1d'
+HEAT_RED_FILL = '#fb6a4a'
+
+def latex_mix_with_white(hex_color, percent):
+    """
+    percent = 65  -> LaTeX !65
+    """
+    rgb = mcolors.to_rgb(hex_color)
+    a = percent / 100.0
+    return tuple(a*c + (1-a) for c in rgb)
+
+def latex_mix_with_black(color, percent, other="black"):
+    """
+    Matplotlib equivalent of xcolor:
+    color!percent!other
+    """
+    rgb1 = mcolors.to_rgb(color)
+    rgb2 = mcolors.to_rgb(other)
+    a = percent / 100.0
+    return tuple(a*c1 + (1-a)*c2 for c1, c2 in zip(rgb1, rgb2))
+
+GAS_GREEN_65 = latex_mix_with_white(GAS_GREEN, 65)
+HEAT_RED_65 = latex_mix_with_white(HEAT_RED, 65)
+ELECTRIC_BLUE_65 = latex_mix_with_white(ELECTRIC_BLUE, 65)
+
+GAS_GREEN_80 = latex_mix_with_black(GAS_GREEN, 80)
+HEAT_RED_80 = latex_mix_with_black(HEAT_RED, 80)
+ELECTRIC_BLUE_80 = latex_mix_with_black(ELECTRIC_BLUE, 80)
+
+def _cm_to_inch(cm: float) -> float:
+    return cm / 2.54
+
+def _configure_pgf(texsystem: str = "pdflatex", use_sfmath: bool = True) -> None:
+    # Ensure LaTeX renders all text in sans-serif consistently
+    preamble_lines = []
+    if use_sfmath:
+        preamble_lines.append(r"\usepackage{sfmath}")
+        preamble_lines.append(r"\renewcommand{\familydefault}{\sfdefault}")
+    # Provide no-op definitions for mathtext commands emitted by Matplotlib's PGF
+    # This avoids Undefined control sequence errors (e.g., \mathdefault) while preserving appearance.
+    preamble_lines.append(r"\providecommand{\mathdefault}[1]{#1}")
+    preamble_lines.append(r"\providecommand{\mathregular}[1]{#1}")
+    preamble = "\n".join(preamble_lines)
+    mpl.rcParams.update({
+        "pgf.texsystem": texsystem,
+        "font.family": "sans-serif",
+        "font.sans-serif": [
+            "Helvetica",
+            "DejaVu Sans",
+            "CMU Sans Serif",
+            "Computer Modern Sans Serif",
+            "Arial",
+        ],
+        "text.usetex": True,
+        "pgf.rcfonts": False,
+        "axes.formatter.use_mathtext": False,
+        "text.latex.preamble": preamble,
+        "pgf.preamble": preamble,
+        "font.size": DEFAULT_FONT_SIZE,
+    })
+
+def _save_pgf(fig: plt.Figure, out_path: str) -> str:
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    fig.savefig(out_path, bbox_inches='tight', pad_inches=0.02)
+    return out_path
+
+def _save_pgf_and_png(fig: plt.Figure, out_path: str, png_dpi: int = 300) -> tuple[str, str]:
+    """Save PGF and a sidecar PNG for quick visual debugging."""
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    fig.savefig(out_path, bbox_inches='tight', pad_inches=0.02)
+    base, _ = os.path.splitext(out_path)
+    png_path = base + '.png'
+    try:
+        fig.savefig(png_path, dpi=int(png_dpi), bbox_inches='tight', pad_inches=0.02)
+    except Exception as e:
+        print(f"[WARN] Failed to save PNG for {out_path}: {e}")
+    return out_path, png_path
+
+# Tick formatter helpers to avoid serif math and \mathdefault in PGF
+def _force_sans_ticks(ax: plt.Axes, which: str = "both") -> None:
+    from matplotlib.ticker import FuncFormatter
+    if which in ("y", "both"):
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, pos: rf"\textsf{{{v:g}}}"))
+    if which in ("x", "both"):
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, pos: (lambda s: rf"\textsf{{{s}}}")(
+            f"{int(v) if abs(v-round(v))<1e-9 else v:g}"
+        )))
+
+def _force_plain_ticks(ax: plt.Axes, which: str = "both") -> None:
+    from matplotlib.ticker import FuncFormatter
+    if which in ("y", "both"):
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, pos: f"{v:g}"))
+    if which in ("x", "both"):
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, pos: f"{int(v) if abs(v-round(v))<1e-9 else v:g}"))
 
 # Parameters to compute transformer overload energy per-sample from loading parquet
 OVERLOAD_THRESHOLD_PCT = float(os.getenv('V4_VIOL_THRESHOLD_PCT', '80.09'))
@@ -195,11 +303,11 @@ def plot_violin_rt_on_vs_off(src_dir: str, out_path: str) -> str:
     vals_on = _load_loading_distribution_from_meta(meta_on, src_dir)
     vals_off = _load_loading_distribution_from_meta(meta_off, src_dir)
 
-    # Prepare figure
-    # Use same height as other plots but half the previous width (4.0 x 4.2)
-    # 3:4 aspect (taller than wide) with fixed height 4.2in -> width 3.15in
-    # Slightly widen to accommodate larger fonts and labels
-    fig, ax = plt.subplots(figsize=(3.15, 4.2))
+    # Prepare figure (match export_select_pgf_plots narrow violin sizing)
+    _configure_pgf()
+    width_cm = DEFAULT_WIDTH_CM / 1.9
+    # Reduce height by 25% while keeping width the same (2.0 -> 1.5)
+    fig, ax = plt.subplots(figsize=(_cm_to_inch(width_cm), _cm_to_inch(width_cm * 1.2)))
     # Ensure bottom margin is sufficient for multi-line x tick labels
     try:
         fig.subplots_adjust(bottom=0.18)
@@ -208,14 +316,14 @@ def plot_violin_rt_on_vs_off(src_dir: str, out_path: str) -> str:
     x0 = 1.0
     if vals_on.size == 0 and vals_off.size == 0:
         ax.text(0.5, 0.5, 'No ε=0.10 RT data', ha='center', va='center', transform=ax.transAxes,
-                fontsize=9, color='gray')
+                color='gray')
         # Use a symmetric window and center tick labels in each half
         ax.set_xlim(x0 - 0.5, x0 + 0.5)
         xmin, xmax = ax.get_xlim()
         left_center = (xmin + x0) / 2.0
         right_center = (x0 + xmax) / 2.0
         ax.set_xticks([left_center, right_center])
-        ax.set_xticklabels(["No Recourse,\nDRCC", "DRCC"], fontsize=16)
+        ax.set_xticklabels(["No Recourse,\nDRCC $\\varepsilon$ = 0.10", "DRCC $\\varepsilon$ = 0.10"])
     else:
         vals_list = []
         side_tags = []
@@ -233,6 +341,8 @@ def plot_violin_rt_on_vs_off(src_dir: str, out_path: str) -> str:
         y_max = min(y_max, 100.0)
         if not np.isfinite(y_min) or y_min >= y_max:
             y_min = max(0.0, y_max - 1.0)
+        # Ensure the bottom includes 0 so a '0' tick is visible
+        y_min = 0.0
         ax.set_ylim(y_min, y_max)
         # Keep symmetric window and slightly narrower violins
         ax.set_xlim(x0 - 0.5, x0 + 0.5)
@@ -243,27 +353,32 @@ def plot_violin_rt_on_vs_off(src_dir: str, out_path: str) -> str:
         right_clip = Rectangle((x0, ymin), width=(xmax - x0), height=(ymax - ymin), transform=ax.transData)
         for body, tag in zip(vp['bodies'], side_tags):
             if tag == 'off':
-                body.set_facecolor('#9ecae1'); body.set_edgecolor('#08519c'); body.set_alpha(0.65); body.set_clip_path(left_clip)
+                body.set_facecolor(ELECTRIC_BLUE_65); body.set_edgecolor(ELECTRIC_BLUE_80); body.set_alpha(1.0); body.set_clip_path(left_clip)
             else:
-                body.set_facecolor('#fb6a4a'); body.set_edgecolor('#cb181d'); body.set_alpha(0.65); body.set_clip_path(right_clip)
+                body.set_facecolor(HEAT_RED_65); body.set_edgecolor(HEAT_RED_80);body.set_alpha(1.0); body.set_clip_path(right_clip)
         # Medians as short horizontal lines
         if vals_off.size:
-            m_off = float(np.nanmedian(vals_off)); ax.plot([x0 - 0.21, x0], [m_off, m_off], color='#08519c', linewidth=2)
+            m_off = float(np.nanmedian(vals_off)); ax.plot([x0 - 0.21, x0], [m_off, m_off], color=ELECTRIC_BLUE_80, linewidth=2)
         if vals_on.size:
-            m_on = float(np.nanmedian(vals_on)); ax.plot([x0, x0 + 0.21], [m_on, m_on], color='#cb181d', linewidth=2)
+            m_on = float(np.nanmedian(vals_on)); ax.plot([x0, x0 + 0.21], [m_on, m_on], color=HEAT_RED_80, linewidth=2)
         # Place left/right labels centered under respective halves
         left_center = (xmin + x0) / 2.0
         right_center = (x0 + xmax) / 2.0
         ax.set_xticks([left_center, right_center])
-        ax.set_xticklabels(["No Recourse,\nDRCC", "DRCC"], fontsize=16)
-        ax.axvline(x0, color='black', linewidth=0.9, alpha=0.8, zorder=3)
+        ax.set_xticklabels(["No Recourse,\nDRCC $\\varepsilon$ = 0.10", "DRCC $\\varepsilon$ = 0.10"])
+        ax.axvline(x0, color='black', linewidth=0.9, zorder=3)
 
-    ax.set_ylabel('Transformer Loading (%)', fontsize=18)
-    ax.tick_params(axis='y', labelsize=16)
+    ax.set_ylabel('Transformer Loading (%)')
+    ax.tick_params(axis='y')
     ax.grid(axis='y', alpha=0.3)
+    # Ensure sans/plain numeric ticks to avoid serif/math
+    try:
+        _force_plain_ticks(ax, which='y')
+    except Exception:
+        pass
     fig.tight_layout()
-    pdf_path = _save_png_and_pdf(fig, out_path)
-    print(f"✓ Violin RT ON vs OFF saved: {out_path} (PNG) and {pdf_path} (PDF)")
+    pgf_path, png_path = _save_pgf_and_png(fig, out_path)
+    print(f"✓ Violin RT ON vs OFF saved: {pgf_path} (+ PNG)")
     return out_path
 
 
@@ -342,38 +457,40 @@ def plot_overload_energy_rt_on_vs_off(src_dir: str, out_path: str) -> str:
         except Exception:
             pass
 
-    # Prepare figure with same size as violin plot
-    # 3:4 aspect (taller than wide) with fixed height 4.2in -> width 3.15in
-    fig, ax = plt.subplots(figsize=(3.15, 4.2))
+    # Prepare figure with same size as violin plot (narrow width)
+    _configure_pgf()
+    width_cm = DEFAULT_WIDTH_CM / 1.9
+    # Reduce height by 25% while keeping width the same (2.0 -> 1.5)
+    fig, ax = plt.subplots(figsize=(_cm_to_inch(width_cm), _cm_to_inch(width_cm * 1.2)))
     labels = []
     values = []
     colors = []
     edges = []
     if np.isfinite(val_off):
-        labels.append("No Recourse,\nDRCC")
+        labels.append("No Recourse,\nDRCC $\\varepsilon$ = 0.10")
         values.append(val_off)
-        colors.append('#9ecae1')
-        edges.append('#08519c')
+        colors.append(ELECTRIC_BLUE_65)
+        edges.append(ELECTRIC_BLUE_80)
     if np.isfinite(val_on):
-        labels.append("DRCC")
+        labels.append("DRCC $\\varepsilon$ = 0.10")
         values.append(val_on)
-        colors.append('#fb6a4a')
-        edges.append('#cb181d')
+        colors.append(HEAT_RED_65)
+        edges.append(HEAT_RED_80)
 
     if not values:
         ax.text(0.5, 0.5, 'No ε=0.10 RT data', ha='center', va='center', transform=ax.transAxes,
-                fontsize=9, color='gray')
+                color='gray')
         fig.tight_layout()
-        pdf_path = _save_png_and_pdf(fig, out_path)
-        print(f"✓ Overload energy RT ON vs OFF saved (empty): {out_path} (PNG) and {pdf_path} (PDF)")
+        pgf_path, png_path = _save_pgf_and_png(fig, out_path)
+        print(f"✓ Overload energy RT ON vs OFF saved (empty): {pgf_path} (+ PNG)")
         return out_path
 
     x = np.arange(len(labels))
-    bars = ax.bar(x, values, color=colors, edgecolor=edges, alpha=0.85, width=0.6)
+    bars = ax.bar(x, values, color=colors, edgecolor=edges, width=0.6)
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=16)
-    ax.set_ylabel('Mean Overload Energy (KWh)', fontsize=18)
-    ax.tick_params(axis='y', labelsize=16)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel('Mean Overload Energy (KWh)')
+    ax.tick_params(axis='y')
     ax.grid(axis='y', alpha=0.3)
     # Add labels inside bars when possible to avoid clipping
     ymax = max(values) if values else 1.0
@@ -382,21 +499,34 @@ def plot_overload_energy_rt_on_vs_off(src_dir: str, out_path: str) -> str:
         h = rect.get_height()
         inside_y = h - pad
         if inside_y > 0:
-            ax.text(rect.get_x() + rect.get_width()/2, inside_y, f"{val:.2f}",
-                ha='center', va='top', fontsize=12, color='black')
+            ax.text(
+                rect.get_x() + rect.get_width()/2,
+                inside_y,
+                f"{val:.2f}",
+                ha='center', va='top', color='black'
+            )
         else:
-                ax.text(rect.get_x() + rect.get_width()/2, h + pad, f"{val:.2f}",
-                    ha='center', va='bottom', fontsize=12, color='black', clip_on=False)
+            ax.text(
+                rect.get_x() + rect.get_width()/2,
+                h + pad,
+                f"{val:.2f}",
+                ha='center', va='bottom', color='black', clip_on=False
+            )
     # Slight headroom to ensure small above-bar labels never clip
     try:
         ax.margins(y=0.05)
     except Exception:
         pass
+    # Force sans/plain numeric ticks on y
+    try:
+        _force_sans_ticks(ax, which='y')
+    except Exception:
+        pass
 
     fig.tight_layout()
-    pdf_path = _save_png_and_pdf(fig, out_path)
+    pgf_path, png_path = _save_pgf_and_png(fig, out_path)
     plt.close(fig)
-    print(f"✓ Overload energy RT ON vs OFF saved: {out_path} (PNG) and {pdf_path} (PDF)")
+    print(f"✓ Overload energy RT ON vs OFF saved: {pgf_path} (+ PNG)")
     return out_path
 
 
@@ -473,27 +603,29 @@ def plot_max_trafo_loading_vs_epsilon_v2(out_path: str, search_dir: str | None =
 
         # 3:2 aspect ratio (width:height) with fixed height 4.2 -> width 6.3
         xticks = sorted(set(xs_on) | set(xs_off))  # ascending, we'll invert axis next
-        fig, ax = plt.subplots(figsize=(6.2, 4.8))
+        _configure_pgf()
+        width_cm = DEFAULT_WIDTH_CM
+        fig, ax = plt.subplots(figsize=(_cm_to_inch(width_cm), _cm_to_inch(width_cm * LINE_ASPECT)))
         if xs_off:
             ax.plot(
                 xs_off, ys_off,
-                color='#08519c', linewidth=2.0,
-                marker='o', markerfacecolor='none', markeredgecolor='#08519c',
+                color=ELECTRIC_BLUE, linewidth=2.0,
+                marker='o', markerfacecolor='none', markeredgecolor=ELECTRIC_BLUE,
                 label='DRCC without Recourse')
         if xs_on:
             ax.plot(
                 xs_on, ys_on,
-                color='#cb181d', linewidth=2.0,
-                marker='s', markerfacecolor='none', markeredgecolor='#cb181d',
+                color=HEAT_RED, linewidth=2.0,
+                marker='s', markerfacecolor='none', markeredgecolor=HEAT_RED,
                 label='DRCC with Recourse')
 
         # X ticks as union of epsilons, formatted to two decimals
         if xticks:
             ax.set_xticks(xticks)
-            ax.set_xticklabels([f"{x:.2f}" for x in xticks], fontsize=14)
-        ax.set_xlabel(r'Allowed Violation Probability ($\varepsilon$)', fontsize=16)
-        ax.set_ylabel('Max. Transformer Loading (%)', fontsize=18)
-        ax.tick_params(axis='y', labelsize=16)
+            ax.set_xticklabels([f"{x:.2f}" for x in xticks])
+        ax.set_xlabel(r'Allowed Violation Probability ($\varepsilon$)')
+        ax.set_ylabel('Max. Transformer Loading (%)')
+        ax.tick_params(axis='y')
         ax.grid(axis='y', alpha=0.3)
         # Largest epsilon on the left
         try:
@@ -503,17 +635,25 @@ def plot_max_trafo_loading_vs_epsilon_v2(out_path: str, search_dir: str | None =
         # Reference threshold line at 80% and focus the y-range to [65, 85]
         ax.axhline(80.0, color='red', linestyle='--', linewidth=1.2, alpha=0.9)
         ax.set_ylim(70.0, 85.0)
-        ax.legend(fontsize=14, loc='best')
+        ax.legend(loc='best')
+        # Plain numeric ticks for both axes to avoid LaTeX math macros
+        try:
+            _force_plain_ticks(ax, which='both')
+        except Exception:
+            pass
 
         fig.tight_layout()
-        pdf_path = _save_png_and_pdf(fig, out_path)
+        pgf_path, png_path = _save_pgf_and_png(fig, out_path)
         plt.close(fig)
-        print(f"✓ Max transformer loading vs ε (v2) saved: {out_path} (PNG) and {pdf_path} (PDF)")
+        print(f"✓ Max transformer loading vs ε (v2) saved: {pgf_path} (+ PNG)")
         return out_path
     except Exception as e:
         # In case of any unexpected error, still create an empty placeholder figure
-        fig, ax = plt.subplots(figsize=(6.2, 4.8))
-        ax.text(0.5, 0.5, f'Plot failed: {e}', ha='center', va='center', transform=ax.transAxes, fontsize=9, color='gray')
+        _configure_pgf()
+        width_cm = DEFAULT_WIDTH_CM
+        width_cm = DEFAULT_WIDTH_CM
+        fig, ax = plt.subplots(figsize=(_cm_to_inch(width_cm), _cm_to_inch(width_cm * SOC_ASPECT)))
+        ax.text(0.5, 0.5, f'Plot failed: {e}', ha='center', va='center', transform=ax.transAxes, color='gray')
         fig.tight_layout()
         pdf_path = _save_png_and_pdf(fig, out_path)
         plt.close(fig)
@@ -585,41 +725,48 @@ def plot_da_total_cost_vs_epsilon_v2(out_path: str, search_dir: str | None = Non
 
         xticks = sorted(set(xs_on) | set(xs_off))  # ascending; invert axis for visual
         # Match dimensions with fig_trafo_loading_vs_epsilon.png and fig_RT-costs.png
-        fig, ax = plt.subplots(figsize=(6.2, 4.8))
+        _configure_pgf()
+        width_cm = DEFAULT_WIDTH_CM
+        fig, ax = plt.subplots(figsize=(_cm_to_inch(width_cm), _cm_to_inch(width_cm * LINE_ASPECT)))
         if xs_off:
             ax.plot(
                 xs_off, ys_off,
-                color='#08519c', linewidth=2.0,
-                marker='o', markerfacecolor='none', markeredgecolor='#08519c',
+                color=ELECTRIC_BLUE, linewidth=2.0,
+                marker='o', markerfacecolor='none', markeredgecolor=ELECTRIC_BLUE,
                 label='DRCC without Recourse')
         if xs_on:
             ax.plot(
                 xs_on, ys_on,
-                color='#cb181d', linewidth=2.0,
-                marker='s', markerfacecolor='none', markeredgecolor='#cb181d',
+                color=HEAT_RED, linewidth=2.0,
+                marker='s', markerfacecolor='none', markeredgecolor=HEAT_RED,
                 label='DRCC with Recourse')
 
         if xticks:
             ax.set_xticks(xticks)
-            ax.set_xticklabels([f"{x:.2f}" for x in xticks], fontsize=12)
-        ax.set_xlabel(r'Allowed Violation Probability ($\varepsilon$)', fontsize=16)
-        ax.set_ylabel('Day-ahead Cost (EUR)', fontsize=18)
-        ax.tick_params(axis='y', labelsize=16)
+            ax.set_xticklabels([f"{x:.2f}" for x in xticks])
+        ax.set_xlabel(r'Allowed Violation Probability ($\varepsilon$)')
+        ax.set_ylabel('Day-ahead Cost (EUR)')
+        ax.tick_params(axis='y')
         ax.grid(axis='y', alpha=0.3)
         try:
             ax.invert_xaxis()
         except Exception:
             pass
-        ax.legend(fontsize=14, loc='best')
+        ax.legend(loc='best')
+        # Plain numeric ticks for both axes
+        try:
+            _force_plain_ticks(ax, which='both')
+        except Exception:
+            pass
 
         fig.tight_layout()
-        pdf_path = _save_png_and_pdf(fig, out_path)
+        pgf_path, png_path = _save_pgf_and_png(fig, out_path)
         plt.close(fig)
-        print(f"✓ DA total cost vs ε (v2) saved: {out_path} (PNG) and {pdf_path} (PDF)")
+        print(f"✓ DA total cost vs ε (v2) saved: {pgf_path} (+ PNG)")
         return out_path
     except Exception as e:
         fig, ax = plt.subplots(figsize=(6.2, 4.8))
-        ax.text(0.5, 0.5, f'Plot failed: {e}', ha='center', va='center', transform=ax.transAxes, fontsize=9, color='gray')
+        ax.text(0.5, 0.5, f'Plot failed: {e}', ha='center', va='center', transform=ax.transAxes, color='gray')
         fig.tight_layout()
         pdf_path = _save_png_and_pdf(fig, out_path)
         plt.close(fig)
@@ -681,21 +828,25 @@ def plot_thermal_storage_operation_area(results_csv: str, out_path: str) -> str:
                 price = vals[:ts.size]
                 break
 
-    # Colors
-    gas_green = '#2ca02c'
-    heat_red = '#d62728'
-    electric_blue = '#08519c'
+    # Colors aligned with export_select_pgf_plots / oos-analysis palette
+    electric_blue = ELECTRIC_BLUE
+    green_fill = GAS_GREEN_FILL
+    green_edge = GAS_GREEN
+    red_fill = HEAT_RED_FILL
+    red_edge = HEAT_RED
 
     # Match line plots: 3:2 aspect, fixed height 4.2 in
-    fig, ax = plt.subplots(figsize=(6.3, 4.2))
+    _configure_pgf()
+    width_cm = DEFAULT_WIDTH_CM
+    fig, ax = plt.subplots(figsize=(_cm_to_inch(width_cm), _cm_to_inch(width_cm * LINE_ASPECT)))
     ax.plot(x, ts, color='black', linewidth=1.0, zorder=3)
     ax.axhline(0.0, color='gray', linestyle='--', linewidth=1.0, alpha=0.8)
-    ax.fill_between(x, ts, 0, where=ts>=0, facecolor=gas_green, alpha=0.30, interpolate=True, zorder=1)
-    ax.fill_between(x, ts, 0, where=ts<=0, facecolor=heat_red, alpha=0.30, interpolate=True, zorder=1)
-    ax.set_xlabel('Time Step', fontsize=18)
-    ax.set_ylabel('Thermal Power (kW)', fontsize=20)
-    ax.tick_params(axis='y', labelsize=18)
-    ax.tick_params(axis='x', labelsize=16)
+    ax.fill_between(x, ts, 0, where=ts>=0, facecolor=GAS_GREEN_65, interpolate=True, zorder=1)
+    ax.fill_between(x, ts, 0, where=ts<=0, facecolor=HEAT_RED_65, interpolate=True, zorder=1)
+    ax.set_xlabel('Time Step')
+    ax.set_ylabel('Thermal Power (kW)')
+    ax.tick_params(axis='y')
+    ax.tick_params(axis='x')
     ax.set_xlim(0, x[-1])
     ax.margins(x=0)
     ax.grid(True, axis='y', color='lightgray', alpha=0.6, linewidth=0.6)
@@ -713,7 +864,7 @@ def plot_thermal_storage_operation_area(results_csv: str, out_path: str) -> str:
     try:
         # Charging annotation
         charge_x, charge_y = 32, 200
-        ax.text(charge_x, charge_y, 'Charging', fontsize=12, color='black',
+        ax.text(charge_x, charge_y, 'Charging', color='black',
                 ha='center', va='bottom')
         for dx, dy in [(17, -17), (-17, -17)]:
             ax.annotate('', xy=(charge_x + dx, charge_y + dy), xytext=(charge_x, charge_y),
@@ -721,7 +872,7 @@ def plot_thermal_storage_operation_area(results_csv: str, out_path: str) -> str:
 
         # Discharging annotation
         discharge_x, discharge_y = 52, -200
-        ax.text(discharge_x, discharge_y, 'Discharging', fontsize=12, color='black',
+        ax.text(discharge_x, discharge_y, 'Discharging', color='black',
                 ha='center', va='top')
         for dx, dy in [(17, 17), (-17, 17)]:
             ax.annotate('', xy=(discharge_x + dx, discharge_y + dy), xytext=(discharge_x, discharge_y),
@@ -746,13 +897,19 @@ def plot_thermal_storage_operation_area(results_csv: str, out_path: str) -> str:
             ax2.yaxis.set_major_formatter(FormatStrFormatter('%.0f'))
         except Exception:
             pass
-    ax2.set_ylabel('Electricity price (EUR/MWh)', color=electric_blue, fontsize=20)
-    ax2.tick_params(axis='y', colors=electric_blue, labelsize=18)
+    ax2.set_ylabel('Electricity price (EUR/MWh)', color=electric_blue)
+    ax2.tick_params(axis='y', colors=electric_blue)
     try:
         ax2.spines['right'].set_color(electric_blue)
     except Exception:
         pass
     ax2.grid(False)
+    # Enforce sans-serif ticks on both axes; right y in sans
+    try:
+        _force_sans_ticks(ax, which='both')
+        _force_sans_ticks(ax2, which='y')
+    except Exception:
+        pass
 
     # X ticks at 24-step intervals including 0
     try:
@@ -762,9 +919,9 @@ def plot_thermal_storage_operation_area(results_csv: str, out_path: str) -> str:
         pass
 
     fig.tight_layout()
-    pdf_path = _save_png_and_pdf(fig, out_path)
+    pgf_path, png_path = _save_pgf_and_png(fig, out_path)
     plt.close(fig)
-    print(f"✓ Thermal storage plot saved: {out_path} (PNG) and {pdf_path} (PDF)")
+    print(f"✓ Thermal storage plot saved: {pgf_path} (+ PNG)")
     return out_path
 
 
@@ -816,11 +973,11 @@ def plot_all_in_total_cost(df: pd.DataFrame, out_path: str) -> str:
             base = s.split()[0]
             float(base)  # validate epsilon part
             if '(RT ON' in s:
-                return f"DRCC \nε = {base}"
+                return rf"DRCC $\varepsilon$ = {base}"
             if '(RT OFF' in s:
-                return f"No Recourse,\nDRCC ε = {base}"
+                return f"No Recourse,\nDRCC $\\varepsilon$ = {base}"
             # legacy unsuffixed
-            return f"DRCC \nε = {base}"
+            return rf"DRCC $\varepsilon$ = {base}"
         except Exception:
             return raw
 
@@ -829,63 +986,83 @@ def plot_all_in_total_cost(df: pd.DataFrame, out_path: str) -> str:
     x = np.arange(len(labels))
     # Size proportional to case count (slightly wider for readability)
     fig_width = max(6.5, 1.35 * len(labels) + 2.5)
-    fig, ax = plt.subplots(figsize=(6.2, 4.8))
-    bars = ax.bar(x, c_allin, width=0.6, color='#4c72b0')
+    _configure_pgf()
+    width_cm = DEFAULT_WIDTH_CM
+    fig, ax = plt.subplots(figsize=(_cm_to_inch(width_cm), _cm_to_inch(width_cm * BAR_ASPECT)))
+    bars = ax.bar(x, c_allin, width=0.35, color=ELECTRIC_BLUE_65, edgecolor=ELECTRIC_BLUE_80)
     ax.set_xticks(x)
     ax.set_xticklabels(display_labels, rotation=0)
-    ax.set_xlabel('Optimization Model', fontsize=16)
-    ax.set_ylabel('Total Cost (EUR)', fontsize=18)
-    ax.tick_params(axis='y', labelsize=16)
+    ax.set_xlabel('Optimization Model')
+    ax.set_ylabel('Total Cost (EUR)')
+    ax.tick_params(axis='y')
+    # Explicit y-axis headroom for bar-top labels (5%)
+    try:
+        ymax = float(np.nanmax(c_allin)) if len(c_allin) else 1.0
+        if np.isfinite(ymax) and ymax > 0:
+            ax.set_ylim(0.0, ymax * 1.10)
+    except Exception:
+        pass
     # No title to mirror oos-analysis (title commented out there)
     ax.grid(axis='y', alpha=0.3)
-
-    # Annotate % difference vs Multi-Energy Co-optimization; fallback to deterministic if needed
+    # Sans-serif numeric y ticks
     try:
-        base_idx = None
-        base_label = None
-        # Prefer Multi-Energy Co-optimization as the baseline
-        for i, lab in enumerate(labels):
-            if isinstance(lab, str) and lab == INJECT_LABEL:
-                base_idx = i
-                base_label = INJECT_LABEL
-                break
-        # Fallback baseline: deterministic
-        if base_idx is None:
-            for i, lab in enumerate(labels):
-                if isinstance(lab, str) and lab.lower() == 'deterministic':
-                    base_idx = i
-                    base_label = 'deterministic'
-                    break
-
-        if base_idx is not None:
-            base_val = float(c_allin[base_idx]) if np.isfinite(c_allin[base_idx]) else np.nan
-            if np.isfinite(base_val) and base_val != 0.0:
-                for rect, val, lab in zip(bars, c_allin, labels):
-                    if not np.isfinite(val):
-                        continue
-                    if isinstance(lab, str) and lab == base_label:
-                        # Skip annotating the baseline bar itself
-                        continue
-                    pct = (val - base_val) / base_val * 100.0
-                    sgn = '+' if pct >= 0 else ''
-                    txt = f"{sgn}{pct:.1f}%"
-                    y = rect.get_height()
-                    ann = ax.text(
-                        rect.get_x() + rect.get_width()/2.0,
-                        y + max(0.01*y, 0.5),
-                        txt,
-                        ha='center', va='bottom', fontsize=10, color='black'
-                    )
-                    try:
-                        ann.set_path_effects([patheffects.withStroke(linewidth=2.0, foreground='white')])
-                    except Exception:
-                        pass
+        _force_sans_ticks(ax, which='y')
     except Exception:
         pass
 
+    # Add % difference labels (placed like overload energy labels)
+    try:
+        # Determine baseline (prefer injected Multi-Energy Co-optimization; else deterministic)
+        base_idx = None
+        base_label = None
+        for i, lab in enumerate(labels):
+            if isinstance(lab, str) and lab == INJECT_LABEL:
+                base_idx = i; base_label = INJECT_LABEL; break
+        if base_idx is None:
+            for i, lab in enumerate(labels):
+                if isinstance(lab, str) and lab.lower() == 'deterministic':
+                    base_idx = i; base_label = 'deterministic'; break
+
+        if base_idx is not None and np.isfinite(c_allin[base_idx]) and c_allin[base_idx] != 0.0:
+            base_val = float(c_allin[base_idx])
+            ymax = float(np.nanmax(c_allin)) if len(c_allin) else 1.0
+            pad = 0.02 * ymax
+            for rect, val, lab in zip(bars, c_allin, labels):
+                if not np.isfinite(val):
+                    continue
+                if isinstance(lab, str) and lab == base_label:
+                    # Skip annotating the baseline bar itself
+                    continue
+                pct = (val - base_val) / base_val * 100.0
+                sgn = '+' if pct >= 0 else ''
+                txt = f"{sgn}{pct:.1f}\\%"
+                h = rect.get_height()
+                inside_y = h - pad
+                if inside_y > 0:
+                    ax.text(
+                        rect.get_x() + rect.get_width()/2,
+                        h + pad,
+                        txt,
+                        ha='center', va='bottom', color='black'
+                    )
+                else:
+                    ax.text(
+                        rect.get_x() + rect.get_width()/2,
+                        h + pad,
+                        txt,
+                        ha='center', va='bottom', color='black', clip_on=False
+                    )
+    except Exception:
+        pass
+
+    # Add a bit of top padding for bar labels
+    try:
+        ax.margins(y=0.05)
+    except Exception:
+        pass
     fig.tight_layout()
-    pdf_path = _save_png_and_pdf(fig, out_path)
-    print(f"✓ Total cost plot saved: {out_path} (PNG) and {pdf_path} (PDF)")
+    pgf_path, png_path = _save_pgf_and_png(fig, out_path)
+    print(f"✓ Total cost plot saved: {pgf_path} (+ PNG)")
     return out_path
 
 
@@ -940,28 +1117,33 @@ def plot_trafo_violation_probability(df: pd.DataFrame, out_path: str) -> str:
             base = s.split()[0]
             float(base)
             if '(RT ON' in s:
-                return f"DRCC \nε = {base}"
+                return rf"DRCC $\varepsilon$ = {base}"
             if '(RT OFF' in s:
-                return f"No Recourse,\nDRCC ε = {base}"
-            return f"DRCC \nε = {base}"
+                return f"No Recourse,\nDRCC $\\varepsilon$ = {base}"
+            return rf"DRCC \\$\varepsilon$ = {base}"
         except Exception:
             return raw
 
     display_labels = [_display_label(l) for l in labels]
     x = np.arange(len(labels))
     fig_width = max(6.5, 1.35 * len(labels) + 2.5)
-    fig, ax = plt.subplots(figsize=(6.2, 4.8))
-    bars = ax.bar(x, vals, width=0.6, color='#dd8452')
+    width_cm = DEFAULT_WIDTH_CM
+    fig, ax = plt.subplots(figsize=(_cm_to_inch(width_cm), _cm_to_inch(width_cm * LINE_ASPECT)))
+    bars = ax.bar(x, vals, width=0.35, color=HEAT_RED_65, edgecolor=HEAT_RED_80)
     ax.set_xticks(x)
     ax.set_xticklabels(display_labels, rotation=0)
-    ax.set_xlabel('Optimization Model', fontsize=16)
-    ax.set_ylabel('Transformer Overload Probability (%)', fontsize=18)
-    ax.tick_params(axis='y', labelsize=16)
+    ax.set_xlabel('Optimization Model')
+    ax.set_ylabel('Transformer Overload Probability (%)')
+    ax.tick_params(axis='y')
     ax.grid(axis='y', alpha=0.3)
+    try:
+        _force_sans_ticks(ax, which='y')
+    except Exception:
+        pass
 
     fig.tight_layout()
-    pdf_path = _save_png_and_pdf(fig, out_path)
-    print(f"✓ Transformer violation probability plot saved: {out_path} (PNG) and {pdf_path} (PDF)")
+    pgf_path, png_path = _save_pgf_and_png(fig, out_path)
+    print(f"✓ Transformer violation probability plot saved: {pgf_path} (+ PNG)")
     return out_path
 
 
@@ -1063,32 +1245,37 @@ def plot_final_bess_soc_median(df: pd.DataFrame, out_path: str, src_dir: str) ->
             base = s.split()[0]
             float(base)
             if '(RT ON' in s:
-                return f"DRCC \nε = {base}"
+                return rf"DRCC $\varepsilon$ = {base}"
             if '(RT OFF' in s:
-                return f"No Recourse,\nDRCC ε = {base}"
-            return f"DRCC \nε = {base}"
+                return f"No Recourse,\nDRCC $\\varepsilon$ = {base}"
+            return rf"DRCC \\$\varepsilon$ = {base}"
         except Exception:
             return raw
 
     display_labels = [_display_label(l) for l in labels]
     x = np.arange(len(labels))
     fig_width = max(6.5, 1.35 * len(labels) + 2.5)
-    fig, ax = plt.subplots(figsize=(6.2, 4.8))
-    bars = ax.bar(x, vals, width=0.6, color='#55a868')
+    width_cm = DEFAULT_WIDTH_CM
+    fig, ax = plt.subplots(figsize=(_cm_to_inch(width_cm), _cm_to_inch(width_cm * BAR_ASPECT)))
+    bars = ax.bar(x, vals, width=0.35, color=GAS_GREEN_65, edgecolor=GAS_GREEN_80)
     ax.set_xticks(x)
     ax.set_xticklabels(display_labels, rotation=0)
-    ax.set_xlabel('Optimization Model', fontsize=16)
-    ax.set_ylabel('Median Final BESS SOC', fontsize=18)
-    ax.tick_params(axis='y', labelsize=16)
+    ax.set_xlabel('Optimization Model')
+    ax.set_ylabel('Median Final BESS SOC')
+    ax.tick_params(axis='y')
     ax.grid(axis='y', alpha=0.3)
     ax.set_ylim(0.0, 1.05)
     ax.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
     # Reference line at SOC 0.5
     ax.axhline(0.5, color='black', linestyle='--', linewidth=1.0, alpha=0.9)
+    try:
+        _force_sans_ticks(ax, which='y')
+    except Exception:
+        pass
 
     fig.tight_layout()
-    pdf_path = _save_png_and_pdf(fig, out_path)
-    print(f"✓ Final battery SOC median plot saved: {out_path} (PNG) and {pdf_path} (PDF)")
+    pgf_path, png_path = _save_pgf_and_png(fig, out_path)
+    print(f"✓ Final battery SOC median plot saved: {pgf_path} (+ PNG)")
     return out_path
 
 

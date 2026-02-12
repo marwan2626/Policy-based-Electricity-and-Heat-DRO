@@ -54,7 +54,7 @@ USE_A4 = True  # Toggle this flag
 # Derived sizing constants based on paper size mode
 if USE_A4:
     DEFAULT_WIDTH_CM = 13.0
-    DEFAULT_FONT_SIZE = 10
+    DEFAULT_FONT_SIZE = 11
 else:
     DEFAULT_WIDTH_CM = 10.89
     DEFAULT_FONT_SIZE = 8
@@ -1457,7 +1457,7 @@ def export_pv_temperature_uncertainty_pgf(
         temp_color = '#D82E1D'  # distinct orange for temperature
         temp_ax.fill_between(x_steps, t_mean - t_std, t_mean + t_std, facecolor=temp_color, alpha=0.35, linewidth=0.0)
         temp_ax.plot(x_steps, t_mean, color=temp_color, linewidth=1.4)
-        temp_ax.set_ylabel('Temperature [°C]')
+        temp_ax.set_ylabel('Temperature (°C)')
         temp_ax.set_xlabel('Time Step')
         temp_ax.grid(alpha=0.3)
         _apply_max_ticks(temp_ax, max_ticks_x=max_ticks_x, max_ticks_y=max_ticks_y, integer_x=True, integer_y=False)
